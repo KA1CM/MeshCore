@@ -1821,13 +1821,12 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
   char response[BOT_MAX_RESPONSE_LEN + 1];
   BotCommandResult result;
   bool result_ready = false;
-  if (command.id == BOT_COMMAND_TRACE || command.id == BOT_COMMAND_TRACER) {
+  if (command.id == BOT_COMMAND_TRACE) {
     if (handleBotTraceCommand(message, direct_recipient, channel_idx, command)) {
       return;
     }
     if (command.args_len > 0) {
-      result = botWriteFormatted(response, sizeof(response), "Usage: %s [path]",
-                                 command.id == BOT_COMMAND_TRACER ? "tracer" : "trace");
+      result = botWriteFormatted(response, sizeof(response), "Usage: trace [path]");
       result_ready = true;
     }
   }
@@ -1837,7 +1836,7 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
   if (message.sender_name[0]) {
     StrHelper::strzcpy(context.response_target, message.sender_name, sizeof(context.response_target));
   }
-  if (command.id == BOT_COMMAND_PATH || command.id == BOT_COMMAND_TRACE || command.id == BOT_COMMAND_TRACER ||
+  if (command.id == BOT_COMMAND_PATH || command.id == BOT_COMMAND_TRACE ||
       command.id == BOT_COMMAND_SIG) {
     context.path_len = message.path_len;
     context.path_hash_size = command.args_len > 0 ? botConfiguredTraceHashSize(_prefs.path_hash_mode) : message.path_hash_size;

@@ -200,7 +200,7 @@ BotCommandId commandIdForName(const char* name, size_t len) {
 }
 
 static BotCommandId cooldownKeyFor(BotCommandId command_id) {
-  return command_id == BOT_COMMAND_TRACER ? BOT_COMMAND_TRACE : command_id;
+  return command_id;
 }
 
 size_t maxResponseLenForChannel(BotChannelKind channel_kind) {

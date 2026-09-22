@@ -56,8 +56,6 @@ const BotCommandMetadata kCommands[] = {
     BOT_COMMAND_CONTEXT_TRACE, "Show or decode path", "path [hex-path]", "Show or decode bounded packet path hashes using comma-separated or contiguous hex." },
   { BOT_COMMAND_TRACE, "trace", NULL, 0, BOT_COMMAND_MASK_TRACE, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_TRACE, "Run link trace", "trace [path]", "Run link trace using local MeshCore state." },
-  { BOT_COMMAND_TRACER, "tracer", NULL, 0, BOT_COMMAND_MASK_TRACER, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
-    BOT_COMMAND_CONTEXT_TRACE, "Run link trace", "tracer [path]", "Run link trace using reciprocal local MeshCore state." },
   { BOT_COMMAND_PREFIX, "prefix", kPrefixAliases, 1, BOT_COMMAND_MASK_PREFIX, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_LOCAL_CONTACT, "Look up local prefix", "prefix <hex>", "Look up a local contact by public-key prefix using local firmware contacts only." },
   { BOT_COMMAND_TIME, "time", NULL, 0, BOT_COMMAND_MASK_TIME, BOT_COMMAND_VISIBILITY_DISCOVERABLE,

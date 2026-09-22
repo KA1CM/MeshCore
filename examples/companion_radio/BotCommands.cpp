@@ -461,8 +461,6 @@ BotCommandResult executeCommand(const BotCommand& command, const BotCommandConte
       return executePath(command, context, output, output_len);
     case BOT_COMMAND_TRACE:
       return executeTraceLike(command, context, "Trace", "trace", output, output_len);
-    case BOT_COMMAND_TRACER:
-      return executeTraceLike(command, context, "Tracer", "tracer", output, output_len);
     case BOT_COMMAND_PREFIX:
       return writeText(output, output_len, "Prefix lookup requires local contacts");
     case BOT_COMMAND_UNSUPPORTED:
