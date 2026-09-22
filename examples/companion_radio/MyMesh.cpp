@@ -1142,10 +1142,6 @@ void MyMesh::buildBotCommandContext(BotCommandContext &context, BotCommandId com
   context.pending_responses = bot_stats.pending_responses;
   context.emergency_forwards = bot_stats.emergency_forwards;
   context.emergency_forward_failures = bot_stats.emergency_forward_failures;
-  if (command_id == BOT_COMMAND_ROLL || command_id == BOT_COMMAND_DICE || command_id == BOT_COMMAND_MAGIC8 ||
-      command_id == BOT_COMMAND_COIN) {
-    getRNG()->random((uint8_t *)&context.random_seed, sizeof(context.random_seed));
-  }
   if (command_id == BOT_COMMAND_STATUS || command_id == BOT_COMMAND_STATS) {
     context.battery_millivolts = board.getBattMilliVolts();
     context.storage_used_kb = _store->getStorageUsedKb();

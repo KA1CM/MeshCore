@@ -9,26 +9,12 @@
 
 namespace {
 
-const uint16_t kRollMax = 10000;
-const uint8_t kMaxDiceTerms = 10;
 
 struct ParsedPathArg {
   uint8_t bytes[BOT_MAX_PATH_BYTES];
   uint8_t byte_len;
   uint8_t hash_size;
   uint8_t hash_count;
-};
-
-struct DiceTerm {
-  uint8_t count;
-  uint16_t sides;
-};
-
-struct ParsedDice {
-  DiceTerm terms[kMaxDiceTerms];
-  uint8_t term_count;
-  uint8_t total_count;
-  bool decade;
 };
 
 BotCommandResult makeResult(BotCommandResultCode code, size_t text_len) {
@@ -81,15 +67,6 @@ void appendText(char* output, size_t output_len, size_t* pos, const char* text) 
   output[*pos < output_len ? *pos : output_len - 1] = 0;
 }
 
-void appendFormatted(char* output, size_t output_len, size_t* pos, const char* format, ...) {
-  char temp[32];
-  va_list args;
-  va_start(args, format);
-  int n = vsnprintf(temp, sizeof(temp), format, args);
-  va_end(args);
-  if (n < 0) return;
-  appendText(output, output_len, pos, temp);
-}
 
 BotCommandResult resultForAppend(char* output, size_t output_len, size_t pos) {
   if (!output || output_len == 0) return makeResult(BOT_COMMAND_RESULT_NO_SPACE, 0);
@@ -97,18 +74,6 @@ BotCommandResult resultForAppend(char* output, size_t output_len, size_t pos) {
   return makeResult(pos >= output_len ? BOT_COMMAND_RESULT_TRUNCATED : BOT_COMMAND_RESULT_OK, actual);
 }
 
-bool parseUInt(const char* text, size_t len, size_t* pos, uint16_t max_value, uint16_t* value) {
-  uint32_t parsed = 0;
-  size_t start = *pos;
-  while (*pos < len && isdigit((unsigned char)text[*pos])) {
-    parsed = parsed * 10 + (uint32_t)(text[*pos] - '0');
-    if (parsed > max_value) return false;
-    (*pos)++;
-  }
-  if (*pos == start) return false;
-  *value = (uint16_t)parsed;
-  return true;
-}
 
 bool textEqualsIgnoreCase(const char* text, size_t len, const char* expected) {
   size_t expected_len = boundedStrLen(expected, BOT_MAX_COMMAND_ARGS_LEN + 1);
@@ -119,102 +84,6 @@ bool textEqualsIgnoreCase(const char* text, size_t len, const char* expected) {
   return true;
 }
 
-bool isSupportedDiceSides(uint16_t sides) {
-  return sides == 4 || sides == 6 || sides == 8 || sides == 10 || sides == 12 || sides == 20 || sides == 100;
-}
-
-void skipSpaces(const char* text, size_t len, size_t* pos) {
-  while (*pos < len && text[*pos] == ' ') (*pos)++;
-}
-
-bool parseRoll(const BotCommand& command, uint16_t* low, uint16_t* high) {
-  *low = 1;
-  *high = 100;
-  if (command.args_len == 0) return true;
-
-  const char* text = command.args;
-  size_t len = command.args_len;
-  size_t pos = 0;
-  uint16_t first = 0;
-  if (!parseUInt(text, len, &pos, kRollMax, &first) || first == 0) return false;
-
-  skipSpaces(text, len, &pos);
-  if (pos == len) {
-    *high = first;
-    return true;
-  }
-
-  uint16_t second = 0;
-  if (!parseUInt(text, len, &pos, kRollMax, &second) || second == 0) return false;
-  skipSpaces(text, len, &pos);
-  if (pos != len || first > second) return false;
-
-  *low = first;
-  *high = second;
-  return true;
-}
-
-bool parseDiceTerm(const char* text, size_t len, size_t* pos, DiceTerm* term) {
-  uint16_t first = 0;
-  term->count = 1;
-  term->sides = 6;
-
-  if (*pos >= len) return false;
-  if (text[*pos] == 'd' || text[*pos] == 'D') {
-    (*pos)++;
-    if (!parseUInt(text, len, pos, 1000, &term->sides)) return false;
-  } else {
-    if (!parseUInt(text, len, pos, kRollMax, &first)) return false;
-    if (*pos < len && (text[*pos] == 'd' || text[*pos] == 'D')) {
-      if (first == 0 || first > 10) return false;
-      term->count = (uint8_t)first;
-      (*pos)++;
-      if (!parseUInt(text, len, pos, 1000, &term->sides)) return false;
-    } else {
-      term->sides = first;
-    }
-  }
-
-  return term->count >= 1 && term->count <= 10 && isSupportedDiceSides(term->sides);
-}
-
-bool parseDice(const BotCommand& command, ParsedDice* parsed) {
-  memset(parsed, 0, sizeof(*parsed));
-  if (command.args_len == 0) {
-    parsed->terms[0].count = 1;
-    parsed->terms[0].sides = 6;
-    parsed->term_count = 1;
-    parsed->total_count = 1;
-    return true;
-  }
-
-  const char* text = command.args;
-  size_t len = command.args_len;
-  if (textEqualsIgnoreCase(text, len, "decade")) {
-    parsed->decade = true;
-    return true;
-  }
-
-  size_t pos = 0;
-  while (pos < len) {
-    skipSpaces(text, len, &pos);
-    if (pos >= len) break;
-    if (parsed->term_count >= kMaxDiceTerms) return false;
-    DiceTerm* term = &parsed->terms[parsed->term_count];
-    if (!parseDiceTerm(text, len, &pos, term)) return false;
-    parsed->total_count = (uint8_t)(parsed->total_count + term->count);
-    if (parsed->total_count > 10) return false;
-    parsed->term_count++;
-    if (pos < len && text[pos] != ' ') return false;
-  }
-
-  return parsed->term_count > 0;
-}
-
-uint16_t rollOnce(uint32_t* state, uint16_t sides) {
-  *state = (*state * 1664525UL) + 1013904223UL;
-  return (uint16_t)((*state >> 16) % sides) + 1;
-}
 
 int hexValue(char c) {
   if (c >= '0' && c <= '9') return c - '0';
@@ -373,16 +242,6 @@ BotCommandResult executeHelp(const BotCommand& command, char* output, size_t out
   return writeFormatted(output, output_len, "%s: %s. Usage: %s", metadata->name, metadata->details, metadata->usage);
 }
 
-BotCommandResult executeMagic8(const BotCommandContext& context, char* output, size_t output_len) {
-  static const char* responses[] = {
-    "It is certain", "Looks good", "Ask again later", "Cannot predict now", "Doubtful", "Very likely",
-    "Signs point yes", "No", "Reply hazy", "Absolutely"
-  };
-  uint32_t seed = context.random_seed ? context.random_seed : 1;
-  seed = seed * 1664525UL + 1013904223UL;
-  return writeFormatted(output, output_len, "Magic 8-ball: %s", responses[(seed >> 16) % (sizeof(responses) / sizeof(responses[0]))]);
-}
-
 BotCommandResult executePathLike(const BotCommandContext& context, char* output, size_t output_len, const char* label) {
   if (context.path_hash_size == 0) return writeFormatted(output, output_len, "%s unavailable", label);
   if (!output || output_len == 0) return makeResult(BOT_COMMAND_RESULT_NO_SPACE, 0);
@@ -442,77 +301,6 @@ BotCommandResult executeTraceLike(const BotCommand& command, const BotCommandCon
   return writeFormatted(output, output_len, "%s ready: %u-hop route", label, (unsigned)path.hash_count);
 }
 
-BotCommandResult executeRoll(const BotCommand& command, const BotCommandContext& context, char* output, size_t output_len) {
-  uint16_t low = 1;
-  uint16_t high = 100;
-  if (!parseRoll(command, &low, &high)) {
-    return writeText(output, output_len, "Invalid number. Use roll, roll X, or roll low high (max 10000)");
-  }
-
-  uint32_t state = context.random_seed ^ ((uint32_t)low << 16) ^ high;
-  if (state == 0) state = 1;
-  uint16_t span = (uint16_t)(high - low + 1);
-  uint16_t value = (uint16_t)(low + rollOnce(&state, span) - 1);
-  return writeFormatted(output, output_len, "Roll %u-%u: %u", (unsigned)low, (unsigned)high, (unsigned)value);
-}
-
-void appendDiceRolls(char* output, size_t output_len, size_t* pos, uint32_t* state, const DiceTerm& term, uint16_t* total) {
-  if (term.count == 1) {
-    uint16_t roll = rollOnce(state, term.sides);
-    *total = (uint16_t)(*total + roll);
-    appendFormatted(output, output_len, pos, "d%u: %u", (unsigned)term.sides, (unsigned)roll);
-    return;
-  }
-
-  appendFormatted(output, output_len, pos, "%ud%u: [", (unsigned)term.count, (unsigned)term.sides);
-  for (uint8_t i = 0; i < term.count; i++) {
-    uint16_t roll = rollOnce(state, term.sides);
-    *total = (uint16_t)(*total + roll);
-    if (i != 0) appendText(output, output_len, pos, ", ");
-    appendFormatted(output, output_len, pos, "%u", (unsigned)roll);
-  }
-  appendText(output, output_len, pos, "]");
-}
-
-BotCommandResult executeDice(const BotCommand& command, const BotCommandContext& context, char* output, size_t output_len) {
-  ParsedDice parsed;
-  if (!parseDice(command, &parsed)) {
-    return writeText(output, output_len, "Invalid dice type. Use dice, dice d20, dice 2d6, or dice decade");
-  }
-
-  uint32_t state = context.random_seed ^ 0x9E3779B9UL;
-  if (state == 0) state = 1;
-
-  if (parsed.decade) {
-    uint16_t value = (uint16_t)(rollOnce(&state, 10) * 10);
-    return writeFormatted(output, output_len, "Dice decade: %u", (unsigned)value);
-  }
-
-  if (!output || output_len == 0) return makeResult(BOT_COMMAND_RESULT_NO_SPACE, 0);
-  output[0] = 0;
-  size_t pos = 0;
-  uint16_t total = 0;
-  appendText(output, output_len, &pos, "Dice ");
-
-  if (parsed.term_count == 1 && parsed.terms[0].count == 1) {
-    uint16_t roll = rollOnce(&state, parsed.terms[0].sides);
-    return writeFormatted(output, output_len, "Dice d%u: %u", (unsigned)parsed.terms[0].sides, (unsigned)roll);
-  }
-
-  if (parsed.term_count == 1) {
-    appendDiceRolls(output, output_len, &pos, &state, parsed.terms[0], &total);
-    appendFormatted(output, output_len, &pos, " = %u", (unsigned)total);
-    return resultForAppend(output, output_len, pos);
-  }
-
-  for (uint8_t i = 0; i < parsed.term_count; i++) {
-    if (i != 0) appendText(output, output_len, &pos, " + ");
-    appendDiceRolls(output, output_len, &pos, &state, parsed.terms[i], &total);
-  }
-  appendFormatted(output, output_len, &pos, " | Total: %u", (unsigned)total);
-  return resultForAppend(output, output_len, pos);
-}
-
 void formatSecondsHms(uint32_t timestamp, char* output, size_t output_len) {
   if (!output || output_len == 0) return;
   if (timestamp == 0) {
@@ -558,12 +346,6 @@ BotCommandResult executeAir(const BotCommandContext& context, char* output, size
                         (unsigned long)context.tx_airtime_seconds, (unsigned long)context.rx_airtime_seconds,
                         (unsigned long)context.flood_recv, (unsigned long)context.direct_recv,
                         (unsigned long)context.flood_sent, (unsigned long)context.direct_sent);
-}
-
-BotCommandResult executeCoin(const BotCommandContext& context, char* output, size_t output_len) {
-  uint32_t state = context.random_seed ^ 0x636F696EUL;
-  if (state == 0) state = 1;
-  return writeFormatted(output, output_len, "Coin: %s", rollOnce(&state, 2) == 1 ? "Heads" : "Tails");
 }
 
 BotCommandResult executeTest(const BotCommand& command, const BotCommandContext& context, char* output, size_t output_len) {
@@ -639,10 +421,6 @@ BotCommandResult executeCommand(const BotCommand& command, const BotCommandConte
     }
     case BOT_COMMAND_ABOUT:
       return writeText(output, output_len, "Colorado Mesh firmware bot: local commands only, no internet required.");
-    case BOT_COMMAND_ROLL:
-      return executeRoll(command, context, output, output_len);
-    case BOT_COMMAND_DICE:
-      return executeDice(command, context, output, output_len);
     case BOT_COMMAND_STATUS: {
       char up_str[20];
       formatUptime(context.uptime_seconds, up_str, sizeof(up_str));
@@ -675,14 +453,10 @@ BotCommandResult executeCommand(const BotCommand& command, const BotCommandConte
                             (unsigned long)context.sent_messages, (unsigned long)context.send_failures,
                             (unsigned long)context.packets_recv, (unsigned long)context.packets_sent,
                             (unsigned long)context.packets_recv_errors, (unsigned)context.queue_depth);
-    case BOT_COMMAND_MAGIC8:
-      return executeMagic8(context, output, output_len);
     case BOT_COMMAND_SIG:
       return executeSig(context, output, output_len);
     case BOT_COMMAND_AIR:
       return executeAir(context, output, output_len);
-    case BOT_COMMAND_COIN:
-      return executeCoin(context, output, output_len);
     case BOT_COMMAND_PATH:
       return executePath(command, context, output, output_len);
     case BOT_COMMAND_TRACE:

@@ -9,14 +9,12 @@ const char* const kCmdAliases[] = { "commands" };
 const char* const kTestAliases[] = { "t" };
 const char* const kHelloAliases[] = { "hi" };
 const char* const kVersionAliases[] = { "ver" };
-const char* const kMagic8Aliases[] = { "8ball", "eightball" };
 const char* const kChannelsAliases[] = { "channel" };
 const char* const kPathAliases[] = { "p", "decode", "route" };
 const char* const kPrefixAliases[] = { "lookup" };
 const char* const kNeighborsAliases[] = { "near" };
 const char* const kSigAliases[] = { "snr", "rssi", "signal" };
 const char* const kAirAliases[] = { "airtime" };
-const char* const kCoinAliases[] = { "flip", "coinflip" };
 
 size_t boundedStrLen(const char* value, size_t max_len) {
   size_t len = 0;
@@ -46,10 +44,6 @@ const BotCommandMetadata kCommands[] = {
     BOT_COMMAND_CONTEXT_NORMAL, "Greet from the node", "hello", "Reply with the local bot node name." },
   { BOT_COMMAND_ABOUT, "about", NULL, 0, BOT_COMMAND_MASK_ABOUT, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_NORMAL, "Describe this bot", "about", "Describe the local firmware bot." },
-  { BOT_COMMAND_ROLL, "roll", NULL, 0, BOT_COMMAND_MASK_ROLL, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
-    BOT_COMMAND_CONTEXT_NORMAL, "Roll a number", "roll [max|low high]", "Roll a random number between 1 and X, or between low and high." },
-  { BOT_COMMAND_DICE, "dice", NULL, 0, BOT_COMMAND_MASK_DICE, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
-    BOT_COMMAND_CONTEXT_NORMAL, "Roll dice", "dice [NdX|dX|decade]", "Roll dice for tabletop games using bounded D&D-style notation." },
   { BOT_COMMAND_STATUS, "status", NULL, 0, BOT_COMMAND_MASK_STATUS, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_DIAGNOSTIC, "Show node status", "status", "Show local uptime, battery, storage, and bot send counters." },
   { BOT_COMMAND_CHANNELS, "channels", kChannelsAliases, 1, BOT_COMMAND_MASK_CHANNELS, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
@@ -58,8 +52,6 @@ const BotCommandMetadata kCommands[] = {
     BOT_COMMAND_CONTEXT_NORMAL, "Show firmware version", "version", "Show local firmware version and build date." },
   { BOT_COMMAND_STATS, "stats", NULL, 0, BOT_COMMAND_MASK_STATS, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_DIAGNOSTIC, "Show bot counters", "stats", "Show local bot and RF counters." },
-  { BOT_COMMAND_MAGIC8, "magic8", kMagic8Aliases, 2, BOT_COMMAND_MASK_MAGIC8, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
-    BOT_COMMAND_CONTEXT_NORMAL, "Ask the magic 8-ball", "magic8 <question>", "Return a short pseudo-random magic 8-ball answer." },
   { BOT_COMMAND_PATH, "path", kPathAliases, 3, BOT_COMMAND_MASK_PATH, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_TRACE, "Show or decode path", "path [hex-path]", "Show or decode bounded packet path hashes using comma-separated or contiguous hex." },
   { BOT_COMMAND_TRACE, "trace", NULL, 0, BOT_COMMAND_MASK_TRACE, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
@@ -83,9 +75,6 @@ const BotCommandMetadata kCommands[] = {
   { BOT_COMMAND_AIR, "air", kAirAliases, 1, BOT_COMMAND_MASK_AIR, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_DIAGNOSTIC, "Show radio airtime", "air",
     "Show local TX/RX airtime and flood/direct packet counters." },
-  { BOT_COMMAND_COIN, "coin", kCoinAliases, 2, BOT_COMMAND_MASK_COIN, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
-    BOT_COMMAND_CONTEXT_NORMAL, "Flip a coin", "coin",
-    "Flip a coin and report heads or tails." },
   { BOT_COMMAND_UNKNOWN, "unknown", NULL, 0, 0, BOT_COMMAND_VISIBILITY_INTERNAL,
     BOT_COMMAND_CONTEXT_INTERNAL, "Unknown command", "unknown", "Internal unknown-command handler." }
 };
