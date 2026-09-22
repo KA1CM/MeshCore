@@ -169,7 +169,7 @@ void appendPathHex(char* output, size_t output_len, size_t* pos, const uint8_t* 
 void appendPathHops(char* output, size_t output_len, size_t* pos, const uint8_t* path, uint8_t hash_size,
                     uint8_t hash_count) {
   for (uint8_t hop = 0; hop < hash_count; hop++) {
-    if (hop != 0) appendText(output, output_len, pos, " -> ");
+    if (hop != 0) appendText(output, output_len, pos, ", ");
     appendPathHex(output, output_len, pos, &path[(size_t)hop * hash_size], hash_size);
   }
 }
@@ -212,22 +212,20 @@ BotCommandResult executePathLike(const BotCommandContext& context, char* output,
   if (context.path_hash_size == 0) return writeFormatted(output, output_len, "%s unavailable", label);
   if (!output || output_len == 0) return makeResult(BOT_COMMAND_RESULT_NO_SPACE, 0);
 
-  char snr[8];
-  formatQuarters(context.path_snr_quarters, snr, sizeof(snr));
   const char* target = context.response_target[0] ? context.response_target : NULL;
   if (context.path_hash_count == 0 || context.path_len == 0) {
-    if (target) return writeFormatted(output, output_len, "%s @[%s] direct zero-hop, SNR %s", label, target, snr);
-    return writeFormatted(output, output_len, "%s direct zero-hop, SNR %s", label, snr);
+    if (target) return writeFormatted(output, output_len, "@[%s] Direct", target);
+    return writeText(output, output_len, "Direct");
   }
   if (!context.path) return writeFormatted(output, output_len, "%s unavailable", label);
 
-  int written = target
-                    ? snprintf(output, output_len, "%s @[%s] %u hops, %u-byte hashes, SNR %s | ", label, target,
-                               (unsigned)context.path_hash_count, (unsigned)context.path_hash_size, snr)
-                    : snprintf(output, output_len, "%s %u hops, %u-byte hashes, SNR %s | ", label,
-                               (unsigned)context.path_hash_count, (unsigned)context.path_hash_size, snr);
-  if (written < 0) return makeResult(BOT_COMMAND_RESULT_NO_SPACE, 0);
-  size_t pos = (size_t)written;
+  output[0] = 0;
+  size_t pos = 0;
+  if (target) {
+    appendText(output, output_len, &pos, "@[");
+    appendText(output, output_len, &pos, target);
+    appendText(output, output_len, &pos, "] ");
+  }
   appendPathHops(output, output_len, &pos, context.path, context.path_hash_size, context.path_hash_count);
   size_t actual = boundedStrLen(output, output_len);
   return makeResult(pos >= output_len ? BOT_COMMAND_RESULT_TRUNCATED : BOT_COMMAND_RESULT_OK, actual);
@@ -237,9 +235,9 @@ BotCommandResult executePathArg(const BotCommand& command, const BotCommandConte
   ParsedPathArg path;
   if (!parsePathArgument(command.args, command.args_len, context.path_hash_size, &path)) return writeText(output, output_len, "Usage: path [path]");
   if (!output || output_len == 0) return makeResult(BOT_COMMAND_RESULT_NO_SPACE, 0);
-  int written = snprintf(output, output_len, "Path %u hops, %u-byte hashes | ", (unsigned)path.hash_count, (unsigned)path.hash_size);
-  if (written < 0) return makeResult(BOT_COMMAND_RESULT_NO_SPACE, 0);
-  size_t pos = (size_t)written;
+
+  output[0] = 0;
+  size_t pos = 0;
   appendPathHops(output, output_len, &pos, path.bytes, path.hash_size, path.hash_count);
   size_t actual = boundedStrLen(output, output_len);
   return makeResult(pos >= output_len ? BOT_COMMAND_RESULT_TRUNCATED : BOT_COMMAND_RESULT_OK, actual);
@@ -405,11 +403,9 @@ BotCommandResult executeCommand(const BotCommand& command, const BotCommandConte
                             (unsigned long)context.sent_messages, (unsigned long)context.send_failures);
     }
     case BOT_COMMAND_CHANNELS:
-      return writeFormatted(output, output_len, "Channels: bot %s | testing %s | emergency %s | public %s (%u total)",
-                            context.bot_channel[0] ? context.bot_channel : "#bot",
-                            context.testing_channel[0] ? context.testing_channel : "#test",
-                            context.emergency_channel[0] ? context.emergency_channel : "#emergency",
-                            context.public_channel[0] ? context.public_channel : "Public", (unsigned)context.channel_count);
+      return writeText(output, output_len,
+                       "I will respond only on these Channels:\n"
+                       "#test #fairfield-county and Direct Message");
     case BOT_COMMAND_VERSION:
       return writeFormatted(output, output_len, "Firmware %s built %s", context.firmware_version[0] ? context.firmware_version : "unknown",
                             context.firmware_build_date[0] ? context.firmware_build_date : "unknown");
