@@ -6,10 +6,6 @@
 #include <stdio.h>
 #include <string.h>
 
-#ifndef BOT_LOCAL_TIME_OFFSET_SECONDS
-#define BOT_LOCAL_TIME_OFFSET_SECONDS -21600
-#endif
-
 namespace {
 
 uint64_t fnv1aUpdate(uint64_t hash, uint8_t value) {
@@ -78,7 +74,8 @@ void formatTimestampHms(uint32_t timestamp, char* output, size_t output_len) {
     snprintf(output, output_len, "Unknown");
     return;
   }
-  int64_t adjusted = (int64_t)timestamp + (int64_t)BOT_LOCAL_TIME_OFFSET_SECONDS;
+  int64_t adjusted = (int64_t)timestamp +
+                     (int64_t)FirmwareBot::easternUtcOffsetSeconds(timestamp);
   uint32_t seconds = (uint32_t)((adjusted % 86400LL + 86400LL) % 86400LL);
   snprintf(output, output_len, "%02lu:%02lu:%02lu", (unsigned long)(seconds / 3600UL),
            (unsigned long)((seconds / 60UL) % 60UL), (unsigned long)(seconds % 60UL));
@@ -87,6 +84,77 @@ void formatTimestampHms(uint32_t timestamp, char* output, size_t output_len) {
 }
 
 namespace FirmwareBot {
+
+// Return the UTC offset for U.S. Eastern Time.
+//
+// Since 2007:
+//   DST starts: second Sunday in March at 07:00 UTC
+//   DST ends:   first Sunday in November at 06:00 UTC
+//
+// Standard time = UTC-5
+// Daylight time = UTC-4
+int32_t easternUtcOffsetSeconds(uint32_t timestamp) {
+  // Convert Unix time to whole days since 1970-01-01.
+  int64_t days = timestamp / 86400UL;
+
+  // Howard Hinnant civil-date conversion.
+  int64_t z = days + 719468;
+  int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+  unsigned doe = (unsigned)(z - era * 146097);
+  unsigned yoe =
+      (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  int year = (int)yoe + (int)(era * 400);
+  unsigned doy =
+      doe - (365 * yoe + yoe / 4 - yoe / 100);
+  unsigned mp = (5 * doy + 2) / 153;
+  unsigned day = doy - (153 * mp + 2) / 5 + 1;
+  unsigned month = mp + (mp < 10 ? 3 : -9);
+  year += (month <= 2);
+
+  // Return weekday for a civil date:
+  // Sunday=0 ... Saturday=6.
+  auto weekday = [](int y, unsigned m, unsigned d) -> unsigned {
+    if (m < 3) {
+      y--;
+      m += 12;
+    }
+    int64_t k = y % 100;
+    int64_t j = y / 100;
+    int64_t h =
+        (d + (13 * (m + 1)) / 5 + k + k / 4 + j / 4 + 5 * j) % 7;
+    // Zeller: 0=Saturday. Convert to 0=Sunday.
+    return (unsigned)((h + 6) % 7);
+  };
+
+  // Outside the transition months the answer is immediate.
+  if (month < 3 || month > 11) return -5 * 3600;
+  if (month > 3 && month < 11) return -4 * 3600;
+
+  uint32_t seconds_of_day = timestamp % 86400UL;
+
+  if (month == 3) {
+    // Second Sunday in March.
+    unsigned first_weekday = weekday(year, 3, 1);
+    unsigned first_sunday = 1 + ((7 - first_weekday) % 7);
+    unsigned second_sunday = first_sunday + 7;
+
+    if (day < second_sunday) return -5 * 3600;
+    if (day > second_sunday) return -4 * 3600;
+
+    // 02:00 EST == 07:00 UTC.
+    return seconds_of_day >= 7UL * 3600UL ? -4 * 3600 : -5 * 3600;
+  }
+
+  // First Sunday in November.
+  unsigned first_weekday = weekday(year, 11, 1);
+  unsigned first_sunday = 1 + ((7 - first_weekday) % 7);
+
+  if (day < first_sunday) return -4 * 3600;
+  if (day > first_sunday) return -5 * 3600;
+
+  // 02:00 EDT == 06:00 UTC.
+  return seconds_of_day >= 6UL * 3600UL ? -5 * 3600 : -4 * 3600;
+}
 
 BotWriteResult normalizeText(const char* input, size_t input_len, char* output, size_t output_len, size_t* written) {
   if (written) *written = 0;

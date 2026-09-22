@@ -2,6 +2,12 @@
 #include <Mesh.h>
 #include "MyMesh.h"
 
+#if defined(ESP32) && defined(BOT_NTP_SYNC)
+  #include <WiFi.h>
+  #include <time.h>
+  #include <esp_sntp.h>
+#endif
+
 // Believe it or not, this std C function is busted on some platforms!
 static uint32_t _atoi(const char* sp) {
   uint32_t n = 0;
@@ -104,6 +110,112 @@ MyMesh the_mesh(radio_driver, fast_rng, rtc_clock, tables, store
 void halt() {
   while (1) ;
 }
+
+/* BOT NTP TIME SYNC */
+#if defined(ESP32) && defined(BOT_NTP_SYNC)
+
+enum BotNtpState {
+  BOT_NTP_IDLE,
+  BOT_NTP_WIFI_CONNECTING,
+  BOT_NTP_WAITING_FOR_TIME
+};
+
+static BotNtpState bot_ntp_state = BOT_NTP_IDLE;
+
+static unsigned long bot_ntp_started_at = 0;
+static unsigned long bot_ntp_last_sync = 0;
+static unsigned long bot_ntp_last_attempt = 0;
+
+static const unsigned long BOT_NTP_INTERVAL_MS = 24UL * 60UL * 60UL * 1000UL;
+static const unsigned long BOT_NTP_WIFI_TIMEOUT_MS = 15000UL;
+static const unsigned long BOT_NTP_TIME_TIMEOUT_MS = 15000UL;
+static const unsigned long BOT_NTP_RETRY_MS = 5UL * 60UL * 1000UL;
+
+// Anything after 2025-01-01 is clearly a valid NTP result for this firmware.
+static const time_t BOT_NTP_VALID_TIME = 1735689600;
+
+static void botNtpWifiOff() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+}
+
+static void botNtpStart() {
+  Serial.println("[NTP] Starting WiFi");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(BOT_NTP_SSID, BOT_NTP_PASSWORD);
+
+  bot_ntp_started_at = millis();
+  bot_ntp_last_attempt = bot_ntp_started_at;
+  bot_ntp_state = BOT_NTP_WIFI_CONNECTING;
+}
+
+static void botNtpLoop() {
+  unsigned long now_ms = millis();
+
+  if (bot_ntp_state == BOT_NTP_IDLE) {
+    bool never_synced = (bot_ntp_last_sync == 0);
+
+    if ((never_synced && (bot_ntp_last_attempt == 0 ||
+                          now_ms - bot_ntp_last_attempt >= BOT_NTP_RETRY_MS)) ||
+        (!never_synced &&
+         now_ms - bot_ntp_last_sync >= BOT_NTP_INTERVAL_MS)) {
+      botNtpStart();
+    }
+
+    return;
+  }
+
+  if (bot_ntp_state == BOT_NTP_WIFI_CONNECTING) {
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("[NTP] WiFi connected, IP: ");
+      Serial.println(WiFi.localIP());
+
+      // UTC only. MeshCore stores Unix time, so timezone/DST is irrelevant here.
+      configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
+      bot_ntp_started_at = now_ms;
+      bot_ntp_state = BOT_NTP_WAITING_FOR_TIME;
+      return;
+    }
+
+    if (now_ms - bot_ntp_started_at >= BOT_NTP_WIFI_TIMEOUT_MS) {
+      Serial.println("[NTP] WiFi connection timed out");
+      botNtpWifiOff();
+      bot_ntp_state = BOT_NTP_IDLE;
+    }
+
+    return;
+  }
+
+  if (bot_ntp_state == BOT_NTP_WAITING_FOR_TIME) {
+    // Do not trust time(nullptr) merely because it contains a plausible
+    // timestamp. The ESP32 clock may already contain MeshCore's previous
+    // time. Wait until SNTP explicitly confirms a fresh synchronization.
+    if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+      time_t ntp_now = time(nullptr);
+
+      if (ntp_now >= BOT_NTP_VALID_TIME) {
+        rtc_clock.setCurrentTime((uint32_t)ntp_now);
+        bot_ntp_last_sync = now_ms;
+
+        Serial.print("[NTP] RTC synchronized: ");
+        Serial.println((unsigned long)ntp_now);
+
+        botNtpWifiOff();
+        bot_ntp_state = BOT_NTP_IDLE;
+        return;
+      }
+    }
+
+    if (now_ms - bot_ntp_started_at >= BOT_NTP_TIME_TIMEOUT_MS) {
+      Serial.println("[NTP] Time synchronization timed out");
+      botNtpWifiOff();
+      bot_ntp_state = BOT_NTP_IDLE;
+    }
+  }
+}
+#endif
 
 /* WIFI RECONNECT TRACKERS */
 #if defined(ESP32) && defined(WIFI_SSID)
@@ -249,6 +361,10 @@ void loop() {
   ui_task.loop();
 #endif
   rtc_clock.tick();
+
+#if defined(ESP32) && defined(BOT_NTP_SYNC)
+  botNtpLoop();
+#endif
 
   if (!the_mesh.hasPendingWork()) {
 #if defined(NRF52_PLATFORM)

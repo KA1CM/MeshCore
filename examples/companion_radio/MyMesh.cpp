@@ -1266,7 +1266,8 @@ BotCommandResult MyMesh::executeBotTimeCommand(const BotMessage &message, char *
   if (now == 0) {
     snprintf(time_str, sizeof(time_str), "not set");
   } else {
-    int64_t adjusted = (int64_t)now + (int64_t)BOT_LOCAL_TIME_OFFSET_SECONDS;
+    int64_t adjusted = (int64_t)now +
+                       (int64_t)FirmwareBot::easternUtcOffsetSeconds(now);
     uint32_t seconds_of_day = (uint32_t)((adjusted % 86400LL + 86400LL) % 86400LL);
     snprintf(time_str, sizeof(time_str), "%02lu:%02lu:%02lu", (unsigned long)(seconds_of_day / 3600UL),
              (unsigned long)((seconds_of_day / 60UL) % 60UL), (unsigned long)(seconds_of_day % 60UL));
