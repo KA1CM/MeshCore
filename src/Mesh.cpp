@@ -55,12 +55,22 @@ DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
       uint16_t offset = (uint16_t)pkt->path_len << path_sz;
       if (offset >= len) {   // TRACE has reached end of given path
         onTraceRecv(pkt, trace_tag, auth_code, flags, pkt->path, &pkt->payload[i], len);
-      } else if (self_id.isHashMatch(&pkt->payload[i + offset], 1 << path_sz) && allowPacketForward(pkt) && !_tables->hasSeen(pkt)) {
+      } else if (self_id.isHashMatch(&pkt->payload[i + offset], 1 << path_sz) && !_tables->hasSeen(pkt)) {
         // append SNR (Not hash!)
         pkt->path[pkt->path_len++] = (int8_t) (pkt->getSNR()*4);
 
-        uint32_t d = getDirectRetransmitDelay(pkt);
-        return ACTION_RETRANSMIT_DELAYED(5, d);  // schedule with priority 5 (for now), maybe make configurable?
+        uint8_t new_offset = pkt->path_len << path_sz;
+        if (new_offset >= len) {
+          // We are the last hop in the path; fire onTraceRecv locally so a node
+          // that originated the trace can receive its own collected SNR data.
+          onTraceRecv(pkt, trace_tag, auth_code, flags, pkt->path, &pkt->payload[i], len);
+          return ACTION_RELEASE;
+        }
+
+        if (allowPacketForward(pkt)) {
+          uint32_t d = getDirectRetransmitDelay(pkt);
+          return ACTION_RETRANSMIT_DELAYED(5, d);  // schedule with priority 5 (for now), maybe make configurable?
+        }
       }
     }
     return ACTION_RELEASE;

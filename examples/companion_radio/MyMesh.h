@@ -4,6 +4,15 @@
 #include <Mesh.h>
 #include "AbstractUITask.h"
 
+#ifndef CMESH_BOT_ENABLED
+#define CMESH_BOT_ENABLED 0
+#endif
+#if CMESH_BOT_ENABLED
+#include "BotTypes.h"
+#define BOT_PENDING_RESPONSE_SLOTS BOT_COORDINATOR_PENDING_SLOTS
+#define BOT_COMMAND_COOLDOWN_SLOTS 9
+#endif
+
 /*------------ Frame Protocol --------------*/
 #define FIRMWARE_VER_CODE 13
 
@@ -195,6 +204,53 @@ private:
     return _store->putBlobByKey(key, key_len, src_buf, len);
   }
 
+#if CMESH_BOT_ENABLED
+  struct PendingBotTrace;
+
+  void applyBotPrefs();
+  bool saveBotPrefs();
+  void printBotPrefs();
+  bool handleBotCLI(const char *args);
+  void observeBotDirectMessage(const ContactInfo &from, uint32_t sender_timestamp, const uint8_t *sender_prefix,
+                               size_t sender_prefix_len, const char *text, const mesh::Packet *packet);
+  void observeBotChannelMessage(uint8_t channel_idx, const char *channel_name, const char *text,
+                                uint32_t sender_timestamp, const mesh::Packet *packet);
+  void recordBotObservation(const BotMessage &message, const ContactInfo *direct_recipient, uint8_t channel_idx);
+  bool observeKnownBotResponse(const BotMessage &message, bool authoritative_sender);
+  bool observeBotGroupResponse(const BotMessage &message);
+  void buildBotCommandContext(BotCommandContext &context, BotCommandId command_id);
+  bool enqueueBotResponse(const BotMessage &message, const ContactInfo *direct_recipient, uint8_t channel_idx,
+                          const char *text, size_t text_len, BotFingerprint request_fingerprint,
+                          BotFingerprint response_fingerprint);
+  bool handleBotTraceCommand(const BotMessage &message, const ContactInfo *direct_recipient, uint8_t channel_idx,
+                             const BotCommand &command);
+  bool dispatchBotTraceDirectLink(const BotMessage &message, const ContactInfo *direct_recipient, uint8_t channel_idx,
+                                  const BotCommand &command);
+  BotCommandResult executeBotPrefixCommand(const BotCommand &command, char *output, size_t output_len);
+  BotCommandResult executeBotTimeCommand(const BotMessage &message, char *output, size_t output_len);
+  BotCommandResult executeBotLoraCommand(const BotMessage &message, char *output, size_t output_len);
+  BotCommandResult executeBotIdCommand(const BotMessage &message, char *output, size_t output_len);
+  BotCommandResult executeBotNeighborsCommand(const BotMessage &message, char *output, size_t output_len);
+  void recordBotNeighbor(const uint8_t *pub_key, int16_t rssi_dbm, int8_t snr_quarters);
+  bool enqueueBotTrace(const BotMessage &message, const ContactInfo *direct_recipient, uint8_t channel_idx,
+                       const uint8_t *path, uint8_t path_len, uint8_t flags, BotFingerprint request_fingerprint,
+                       BotFingerprint response_fingerprint, uint32_t tag, uint32_t auth_code);
+  bool sendBotTraceText(const PendingBotTrace &pending, const char *text, size_t text_len,
+                        BotFingerprint response_fingerprint, uint32_t now_millis);
+  BotFingerprint traceResponseFingerprintFor(const PendingBotTrace &pending, const char *text, size_t text_len);
+  bool sendPendingBotTrace(PendingBotTrace &pending, uint32_t now_millis);
+  void expirePendingBotTraces(uint32_t now_millis);
+  bool enqueueEmergencyForward(const BotMessage &message);
+  bool findBotChannel(BotChannelKind kind, uint8_t &channel_idx);
+  bool sendBotGroupMessage(uint8_t channel_idx, const char *text, size_t text_len);
+  void sendQueuedBotResponses();
+  void sendQueuedEmergencyForwards();
+  void tickBot();
+  void scheduleBotLocalAdvert(unsigned long interval_millis);
+  void scheduleBotFloodAdvert(unsigned long interval_millis);
+  bool sendBotSelfAdvert(bool flood);
+#endif
+
   void checkCLIRescueCmd();
   void checkSerialInterface();
   bool isValidClientRepeatFreq(uint32_t f) const;
@@ -226,6 +282,59 @@ private:
   unsigned long dirty_contacts_expiry;
 
   TransportKey send_scope;
+
+#if CMESH_BOT_ENABLED
+  struct PendingBotResponse {
+    bool active;
+    bool direct;
+    uint8_t recipient_pub_key[PUB_KEY_SIZE];
+    uint8_t channel_idx;
+    BotFingerprint request_fingerprint;
+    BotFingerprint response_fingerprint;
+    char text[BOT_MAX_RESPONSE_LEN + 1];
+    size_t text_len;
+  };
+
+  struct PendingEmergencyForward {
+    bool active;
+    char text[BOT_MAX_GROUP_RESPONSE_LEN + 1];
+    size_t text_len;
+  };
+
+  struct PendingBotTrace {
+    bool active;
+    bool direct;
+    bool sent;
+    BotChannelKind channel_kind;
+    uint8_t recipient_pub_key[PUB_KEY_SIZE];
+    uint8_t channel_idx;
+    char channel_name[BOT_MAX_CHANNEL_NAME_LEN + 1];
+    char target_name[BOT_MAX_SENDER_NAME_LEN + 1];
+    uint8_t sender_key_prefix[BOT_SENDER_KEY_PREFIX_LEN];
+    uint8_t sender_key_prefix_len;
+    BotFingerprint request_fingerprint;
+    BotFingerprint response_fingerprint;
+    uint32_t tag;
+    uint32_t auth_code;
+    uint32_t expires_at_millis;
+    uint8_t flags;
+    uint8_t path_len;
+    uint8_t path[MAX_PATH_SIZE];
+  };
+
+  BotPrefs bot_prefs;
+  BotStats bot_stats;
+  PendingBotResponse pending_bot_responses[BOT_PENDING_RESPONSE_SLOTS];
+  PendingBotTrace pending_bot_traces[BOT_PENDING_TRACE_SLOTS];
+  PendingEmergencyForward pending_emergency_forwards[BOT_PENDING_EMERGENCY_SLOTS];
+  BotCommandCooldown bot_command_cooldowns[BOT_COMMAND_COOLDOWN_SLOTS];
+  BotCoordinatorPending bot_coordinator_pending[BOT_COORDINATOR_PENDING_SLOTS];
+  BotCoordinatorRecent bot_coordinator_recent[BOT_COORDINATOR_RECENT_SLOTS];
+  BotKnownBotEntry known_bot_entries[BOT_KNOWN_BOT_SLOTS];
+  BotNeighbor bot_neighbors[BOT_NEIGHBOR_SLOTS];
+  unsigned long next_bot_local_advert;
+  unsigned long next_bot_flood_advert;
+#endif
 
   uint8_t cmd_frame[MAX_FRAME_SIZE + 1];
   uint8_t out_frame[MAX_FRAME_SIZE + 1];

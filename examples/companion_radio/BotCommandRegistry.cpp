@@ -1,0 +1,138 @@
+#include "BotCommandRegistry.h"
+
+#include <ctype.h>
+#include <string.h>
+
+namespace {
+
+const char* const kCmdAliases[] = { "commands" };
+const char* const kTestAliases[] = { "t" };
+const char* const kHelloAliases[] = { "hi" };
+const char* const kVersionAliases[] = { "ver" };
+const char* const kMagic8Aliases[] = { "8ball", "eightball" };
+const char* const kChannelsAliases[] = { "channel" };
+const char* const kPathAliases[] = { "p", "decode", "route" };
+const char* const kPrefixAliases[] = { "lookup" };
+const char* const kNeighborsAliases[] = { "near" };
+const char* const kSigAliases[] = { "snr", "rssi", "signal" };
+const char* const kAirAliases[] = { "airtime" };
+const char* const kCoinAliases[] = { "flip", "coinflip" };
+
+size_t boundedStrLen(const char* value, size_t max_len) {
+  size_t len = 0;
+  while (value && len < max_len && value[len] != 0) len++;
+  return len;
+}
+
+bool namesEqual(const char* name, size_t len, const char* expected) {
+  size_t expected_len = boundedStrLen(expected, BOT_MAX_COMMAND_NAME_LEN + 1);
+  if (len != expected_len) return false;
+  for (size_t i = 0; i < len; i++) {
+    if (tolower((unsigned char)name[i]) != tolower((unsigned char)expected[i])) return false;
+  }
+  return true;
+}
+
+const BotCommandMetadata kCommands[] = {
+  { BOT_COMMAND_HELP, "help", NULL, 0, BOT_COMMAND_MASK_HELP, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_NORMAL, "Show bot help", "help [command]", "Show available commands or details for one command." },
+  { BOT_COMMAND_CMD, "cmd", kCmdAliases, 1, BOT_COMMAND_MASK_CMD, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_NORMAL, "List commands", "cmd", "List compact command names supported by this firmware bot." },
+  { BOT_COMMAND_PING, "ping", NULL, 0, BOT_COMMAND_MASK_PING, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_NORMAL, "Check bot response", "ping", "Reply with Pong when the bot is alive." },
+  { BOT_COMMAND_TEST, "test", kTestAliases, 1, BOT_COMMAND_MASK_TEST, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_NORMAL, "Test connection", "test [phrase]", "Get test response with connection info" },
+  { BOT_COMMAND_HELLO, "hello", kHelloAliases, 1, BOT_COMMAND_MASK_HELLO, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_NORMAL, "Greet from the node", "hello", "Reply with the local bot node name." },
+  { BOT_COMMAND_ABOUT, "about", NULL, 0, BOT_COMMAND_MASK_ABOUT, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_NORMAL, "Describe this bot", "about", "Describe the local firmware bot." },
+  { BOT_COMMAND_ROLL, "roll", NULL, 0, BOT_COMMAND_MASK_ROLL, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_NORMAL, "Roll a number", "roll [max|low high]", "Roll a random number between 1 and X, or between low and high." },
+  { BOT_COMMAND_DICE, "dice", NULL, 0, BOT_COMMAND_MASK_DICE, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_NORMAL, "Roll dice", "dice [NdX|dX|decade]", "Roll dice for tabletop games using bounded D&D-style notation." },
+  { BOT_COMMAND_STATUS, "status", NULL, 0, BOT_COMMAND_MASK_STATUS, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_DIAGNOSTIC, "Show node status", "status", "Show local uptime, battery, storage, and bot send counters." },
+  { BOT_COMMAND_CHANNELS, "channels", kChannelsAliases, 1, BOT_COMMAND_MASK_CHANNELS, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_DIAGNOSTIC, "Show configured channels", "channels", "Show local bot, testing, emergency, and public channel names." },
+  { BOT_COMMAND_VERSION, "version", kVersionAliases, 1, BOT_COMMAND_MASK_VERSION, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_NORMAL, "Show firmware version", "version", "Show local firmware version and build date." },
+  { BOT_COMMAND_STATS, "stats", NULL, 0, BOT_COMMAND_MASK_STATS, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_DIAGNOSTIC, "Show bot counters", "stats", "Show local bot and RF counters." },
+  { BOT_COMMAND_MAGIC8, "magic8", kMagic8Aliases, 2, BOT_COMMAND_MASK_MAGIC8, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_NORMAL, "Ask the magic 8-ball", "magic8 <question>", "Return a short pseudo-random magic 8-ball answer." },
+  { BOT_COMMAND_PATH, "path", kPathAliases, 3, BOT_COMMAND_MASK_PATH, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_TRACE, "Show or decode path", "path [hex-path]", "Show or decode bounded packet path hashes using comma-separated or contiguous hex." },
+  { BOT_COMMAND_TRACE, "trace", NULL, 0, BOT_COMMAND_MASK_TRACE, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_TRACE, "Run link trace", "trace [path]", "Run link trace using local MeshCore state." },
+  { BOT_COMMAND_TRACER, "tracer", NULL, 0, BOT_COMMAND_MASK_TRACER, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_TRACE, "Run link trace", "tracer [path]", "Run link trace using reciprocal local MeshCore state." },
+  { BOT_COMMAND_PREFIX, "prefix", kPrefixAliases, 1, BOT_COMMAND_MASK_PREFIX, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_LOCAL_CONTACT, "Look up local prefix", "prefix <hex>", "Look up a local contact by public-key prefix using local firmware contacts only." },
+  { BOT_COMMAND_TIME, "time", NULL, 0, BOT_COMMAND_MASK_TIME, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_DIAGNOSTIC, "Show bot time and uptime", "time", "Show local bot wall-clock time and uptime." },
+  { BOT_COMMAND_LORA, "lora", NULL, 0, BOT_COMMAND_MASK_LORA, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_DIAGNOSTIC, "Show LoRa radio settings", "lora", "Show local LoRa frequency, spreading factor, bandwidth, coding rate, and TX power." },
+  { BOT_COMMAND_ID, "id", NULL, 0, BOT_COMMAND_MASK_ID, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_DIAGNOSTIC, "Show bot public-key prefix", "id", "Show local bot public-key prefix and node name." },
+  { BOT_COMMAND_NEIGHBORS, "neighbors", kNeighborsAliases, 1, BOT_COMMAND_MASK_NEIGHBORS, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_DIAGNOSTIC, "Show recent direct neighbors", "neighbors",
+    "Show nodes heard directly within the last hour with RSSI and SNR." },
+  { BOT_COMMAND_SIG, "sig", kSigAliases, 3, BOT_COMMAND_MASK_SIG, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_DIAGNOSTIC, "Report received signal", "sig",
+    "Show how the bot heard your request: SNR plus local RSSI and noise floor." },
+  { BOT_COMMAND_AIR, "air", kAirAliases, 1, BOT_COMMAND_MASK_AIR, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_DIAGNOSTIC, "Show radio airtime", "air",
+    "Show local TX/RX airtime and flood/direct packet counters." },
+  { BOT_COMMAND_COIN, "coin", kCoinAliases, 2, BOT_COMMAND_MASK_COIN, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+    BOT_COMMAND_CONTEXT_NORMAL, "Flip a coin", "coin",
+    "Flip a coin and report heads or tails." },
+  { BOT_COMMAND_UNKNOWN, "unknown", NULL, 0, 0, BOT_COMMAND_VISIBILITY_INTERNAL,
+    BOT_COMMAND_CONTEXT_INTERNAL, "Unknown command", "unknown", "Internal unknown-command handler." }
+};
+
+}
+
+namespace BotCommandRegistry {
+
+size_t commandCount() {
+  return sizeof(kCommands) / sizeof(kCommands[0]);
+}
+
+const BotCommandMetadata* commandAt(size_t index) {
+  return index < commandCount() ? &kCommands[index] : NULL;
+}
+
+const BotCommandMetadata* findById(BotCommandId id) {
+  for (size_t i = 0; i < commandCount(); i++) {
+    if (kCommands[i].id == id) return &kCommands[i];
+  }
+  return NULL;
+}
+
+const BotCommandMetadata* findByName(const char* name, size_t len) {
+  if (!name || len == 0 || len > BOT_MAX_COMMAND_NAME_LEN) return NULL;
+  for (size_t i = 0; i < commandCount(); i++) {
+    if (namesEqual(name, len, kCommands[i].name)) return &kCommands[i];
+    for (uint8_t j = 0; j < kCommands[i].alias_count; j++) {
+      if (namesEqual(name, len, kCommands[i].aliases[j])) return &kCommands[i];
+    }
+  }
+  return NULL;
+}
+
+const char* commandName(BotCommandId id) {
+  const BotCommandMetadata* command = findById(id);
+  return command ? command->name : "";
+}
+
+uint32_t commandMask(BotCommandId id) {
+  const BotCommandMetadata* command = findById(id);
+  return command ? command->mask : 0;
+}
+
+bool isDiscoverable(BotCommandId id) {
+  const BotCommandMetadata* command = findById(id);
+  return command && command->visibility == BOT_COMMAND_VISIBILITY_DISCOVERABLE;
+}
+
+}

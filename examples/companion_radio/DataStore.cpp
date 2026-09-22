@@ -1,6 +1,10 @@
 #include <Arduino.h>
 #include "DataStore.h"
 
+#if CMESH_BOT_ENABLED
+#include "BotPrefs.h"
+#endif
+
 #if defined(EXTRAFS) || defined(QSPIFLASH)
   #define MAX_BLOBRECS 100
 #else
@@ -198,6 +202,38 @@ void DataStore::loadPrefs(NodePrefs& prefs, double& node_lat, double& node_lon) 
     _fs->remove("/node_prefs"); // remove old
   }
 }
+
+#if CMESH_BOT_ENABLED
+bool DataStore::loadBotPrefs(BotPrefs& prefs) {
+  if (!_fs->exists("/bot_prefs_v1")) {
+    BotPrefsCodec::defaults(prefs);
+    return false;
+  }
+
+  uint8_t data[BOT_PREFS_SERIALIZED_SIZE];
+  File file = openRead(_fs, "/bot_prefs_v1");
+  bool success = false;
+  if (file) {
+    success = file.size() == sizeof(data) && file.read(data, sizeof(data)) == sizeof(data) &&
+              BotPrefsCodec::deserialize(data, sizeof(data), prefs);
+    file.close();
+  }
+  if (!success) BotPrefsCodec::defaults(prefs);
+  return success;
+}
+
+bool DataStore::saveBotPrefs(const BotPrefs& prefs) {
+  uint8_t data[BOT_PREFS_SERIALIZED_SIZE];
+  if (!BotPrefsCodec::serialize(prefs, data, sizeof(data))) return false;
+
+  File file = openWrite(_fs, "/bot_prefs_v1");
+  if (!file) return false;
+  bool success = file.write(data, sizeof(data)) == sizeof(data);
+  file.close();
+  if (!success) _fs->remove("/bot_prefs_v1");
+  return success;
+}
+#endif
 
 void DataStore::loadPrefsInt(const char *filename, NodePrefs& _prefs, double& node_lat, double& node_lon) {
   File file = openRead(_fs, filename);

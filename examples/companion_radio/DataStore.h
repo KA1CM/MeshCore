@@ -5,6 +5,13 @@
 #include <helpers/ChannelDetails.h>
 #include "NodePrefs.h"
 
+#ifndef CMESH_BOT_ENABLED
+#define CMESH_BOT_ENABLED 0
+#endif
+#if CMESH_BOT_ENABLED
+#include "BotTypes.h"
+#endif
+
 class DataStoreHost {
 public:
   virtual bool onContactLoaded(const ContactInfo& contact) =0;
@@ -35,6 +42,10 @@ public:
   bool saveMainIdentity(const mesh::LocalIdentity &identity);
   void loadPrefs(NodePrefs& prefs, double& node_lat, double& node_lon);
   void savePrefs(const NodePrefs& prefs, double node_lat, double node_lon);
+#if CMESH_BOT_ENABLED
+  bool loadBotPrefs(BotPrefs& prefs);
+  bool saveBotPrefs(const BotPrefs& prefs);
+#endif
   void loadContacts(DataStoreHost* host);
   void saveContacts(DataStoreHost* host, bool (*filter)(const ContactInfo& c) = NULL);
   void loadChannels(DataStoreHost* host);
