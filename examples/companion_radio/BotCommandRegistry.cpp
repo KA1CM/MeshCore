@@ -5,15 +5,6 @@
 
 namespace {
 
-const char* const kCmdAliases[] = { "commands" };
-const char* const kTestAliases[] = { "t" };
-const char* const kHelloAliases[] = { "hi" };
-const char* const kVersionAliases[] = { "ver" };
-const char* const kChannelsAliases[] = { "channel" };
-const char* const kPathAliases[] = { "p", "decode", "route" };
-const char* const kNeighborsAliases[] = { "near" };
-const char* const kSigAliases[] = { "snr", "rssi", "signal" };
-const char* const kAirAliases[] = { "airtime" };
 
 size_t boundedStrLen(const char* value, size_t max_len) {
   size_t len = 0;
@@ -33,25 +24,25 @@ bool namesEqual(const char* name, size_t len, const char* expected) {
 const BotCommandMetadata kCommands[] = {
   { BOT_COMMAND_HELP, "help", NULL, 0, BOT_COMMAND_MASK_HELP, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_NORMAL, "Show bot help", "help [command]", "Show available commands or details for one command." },
-  { BOT_COMMAND_CMD, "cmd", kCmdAliases, 1, BOT_COMMAND_MASK_CMD, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+  { BOT_COMMAND_CMD, "cmd", NULL, 0, BOT_COMMAND_MASK_CMD, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_NORMAL, "List commands", "cmd", "List compact command names supported by this firmware bot." },
   { BOT_COMMAND_PING, "ping", NULL, 0, BOT_COMMAND_MASK_PING, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_NORMAL, "Check bot response", "ping", "Reply with Pong when the bot is alive." },
-  { BOT_COMMAND_TEST, "test", kTestAliases, 1, BOT_COMMAND_MASK_TEST, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+  { BOT_COMMAND_TEST, "test", NULL, 0, BOT_COMMAND_MASK_TEST, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_NORMAL, "Test connection", "test [phrase]", "Get test response with connection info" },
-  { BOT_COMMAND_HELLO, "hello", kHelloAliases, 1, BOT_COMMAND_MASK_HELLO, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+  { BOT_COMMAND_HELLO, "hello", NULL, 0, BOT_COMMAND_MASK_HELLO, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_NORMAL, "Greet from the node", "hello", "Reply with the local bot node name." },
   { BOT_COMMAND_ABOUT, "about", NULL, 0, BOT_COMMAND_MASK_ABOUT, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_NORMAL, "Describe this bot", "about", "Describe the local firmware bot." },
   { BOT_COMMAND_STATUS, "status", NULL, 0, BOT_COMMAND_MASK_STATUS, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_DIAGNOSTIC, "Show node status", "status", "Show local uptime, battery, storage, and bot send counters." },
-  { BOT_COMMAND_CHANNELS, "channels", kChannelsAliases, 1, BOT_COMMAND_MASK_CHANNELS, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+  { BOT_COMMAND_CHANNELS, "channels", NULL, 0, BOT_COMMAND_MASK_CHANNELS, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_DIAGNOSTIC, "Show configured channels", "channels", "Show local bot, testing, emergency, and public channel names." },
-  { BOT_COMMAND_VERSION, "version", kVersionAliases, 1, BOT_COMMAND_MASK_VERSION, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+  { BOT_COMMAND_VERSION, "version", NULL, 0, BOT_COMMAND_MASK_VERSION, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_NORMAL, "Show firmware version", "version", "Show local firmware version and build date." },
   { BOT_COMMAND_STATS, "stats", NULL, 0, BOT_COMMAND_MASK_STATS, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_DIAGNOSTIC, "Show bot counters", "stats", "Show local bot and RF counters." },
-  { BOT_COMMAND_PATH, "path", kPathAliases, 3, BOT_COMMAND_MASK_PATH, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+  { BOT_COMMAND_PATH, "path", NULL, 0, BOT_COMMAND_MASK_PATH, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_TRACE, "Show or decode path", "path [hex-path]", "Show or decode bounded packet path hashes using comma-separated or contiguous hex." },
   { BOT_COMMAND_TRACE, "trace", NULL, 0, BOT_COMMAND_MASK_TRACE, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_TRACE, "Run link trace", "trace [path]", "Run link trace using local MeshCore state." },
@@ -61,13 +52,13 @@ const BotCommandMetadata kCommands[] = {
     BOT_COMMAND_CONTEXT_DIAGNOSTIC, "Show LoRa radio settings", "lora", "Show local LoRa frequency, spreading factor, bandwidth, coding rate, and TX power." },
   { BOT_COMMAND_ID, "id", NULL, 0, BOT_COMMAND_MASK_ID, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_DIAGNOSTIC, "Show bot public-key prefix", "id", "Show local bot public-key prefix and node name." },
-  { BOT_COMMAND_NEIGHBORS, "neighbors", kNeighborsAliases, 1, BOT_COMMAND_MASK_NEIGHBORS, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+  { BOT_COMMAND_NEIGHBORS, "neighbors", NULL, 0, BOT_COMMAND_MASK_NEIGHBORS, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_DIAGNOSTIC, "Show recent direct neighbors", "neighbors",
     "Show nodes heard directly within the last hour with RSSI and SNR." },
-  { BOT_COMMAND_SIG, "sig", kSigAliases, 3, BOT_COMMAND_MASK_SIG, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+  { BOT_COMMAND_SIG, "sig", NULL, 0, BOT_COMMAND_MASK_SIG, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_DIAGNOSTIC, "Report received signal", "sig",
     "Show how the bot heard your request: SNR plus local RSSI and noise floor." },
-  { BOT_COMMAND_AIR, "air", kAirAliases, 1, BOT_COMMAND_MASK_AIR, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
+  { BOT_COMMAND_AIR, "air", NULL, 0, BOT_COMMAND_MASK_AIR, BOT_COMMAND_VISIBILITY_DISCOVERABLE,
     BOT_COMMAND_CONTEXT_DIAGNOSTIC, "Show radio airtime", "air",
     "Show local TX/RX airtime and flood/direct packet counters." },
   { BOT_COMMAND_UNKNOWN, "unknown", NULL, 0, 0, BOT_COMMAND_VISIBILITY_INTERNAL,
