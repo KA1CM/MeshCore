@@ -298,28 +298,44 @@ BotCommandResult executeSig(const BotCommandContext& context, char* output, size
   formatQuarters(context.path_snr_quarters, snr, sizeof(snr));
   const char* target = context.response_target[0] ? context.response_target : NULL;
   if (target) {
-    return writeFormatted(output, output_len, "Sig @[%s]: heard you at SNR %s | last RSSI %d dBm, noise %d dBm", target,
+    return writeFormatted(output, output_len, "@[%s]: heard you near Trumbull Mall | SNR %s | RSSI %d dBm | noise %d dBm", target,
                           snr, (int)context.last_rssi, (int)context.noise_floor);
   }
-  return writeFormatted(output, output_len, "Sig: heard you at SNR %s | last RSSI %d dBm, noise %d dBm", snr,
+  return writeFormatted(output, output_len, "heard you near Trumbull Mall | SNR %s | RSSI %d dBm | noise %d dBm", snr,
                         (int)context.last_rssi, (int)context.noise_floor);
 }
 
 BotCommandResult executeAir(const BotCommandContext& context, char* output, size_t output_len) {
-  return writeFormatted(output, output_len, "Air: tx %lus rx %lus | rx flood %lu direct %lu | tx flood %lu direct %lu",
+  const char* target = context.response_target[0] ? context.response_target : NULL;
+  if (target) {
+    return writeFormatted(output, output_len, "@[%s]: tx %lus rx %lus | rx flood %lu direct %lu | tx flood %lu direct %lu",
+                          target, (unsigned long)context.tx_airtime_seconds, (unsigned long)context.rx_airtime_seconds,
+                          (unsigned long)context.flood_recv, (unsigned long)context.direct_recv,
+                          (unsigned long)context.flood_sent, (unsigned long)context.direct_sent);
+  }
+  return writeFormatted(output, output_len, "tx %lus rx %lus | rx flood %lu direct %lu | tx flood %lu direct %lu",
                         (unsigned long)context.tx_airtime_seconds, (unsigned long)context.rx_airtime_seconds,
                         (unsigned long)context.flood_recv, (unsigned long)context.direct_recv,
                         (unsigned long)context.flood_sent, (unsigned long)context.direct_sent);
 }
 
 BotCommandResult executeTest(const BotCommand& command, const BotCommandContext& context, char* output, size_t output_len) {
-  const char* name = context.node_name[0] ? context.node_name : "local";
+  char snr[8];
+  formatQuarters(context.path_snr_quarters, snr, sizeof(snr));
+
   char received_at[9];
   formatSecondsHms(context.uptime_seconds, received_at, sizeof(received_at));
-  if (command.args_len == 0) {
-    return writeFormatted(output, output_len, "@[%s] local | recv %s", name, received_at);
+
+  const char* target = context.response_target[0] ? context.response_target : NULL;
+  unsigned hops = (unsigned)context.path_hash_count;
+
+  if (target) {
+    return writeFormatted(output, output_len, "@[%s] | %u %s, SNR %s | received at %s",
+                          target, hops, hops == 1 ? "hop" : "hops", snr, received_at);
   }
-  return writeFormatted(output, output_len, "@[%s] local | recv %s | %s", name, received_at, command.args);
+
+  return writeFormatted(output, output_len, "%u %s, SNR %s | received at %s",
+                        hops, hops == 1 ? "hop" : "hops", snr, received_at);
 }
 
 }
@@ -336,7 +352,7 @@ size_t formatTraceResult(char* output, size_t output_len, const char* target, ui
   int written;
   if (hop_count == 0 || hash_size == 0) {
     written = has_target
-                  ? snprintf(output, output_len, "Trace @[%s] %08lx direct zero-hop tail %s", target,
+                  ? snprintf(output, output_len, "@[%s] %08lx direct zero-hop tail %s", target,
                              (unsigned long)tag, tail_snr)
                   : snprintf(output, output_len, "Trace %08lx direct zero-hop tail %s", (unsigned long)tag, tail_snr);
     if (written < 0) {
@@ -346,7 +362,7 @@ size_t formatTraceResult(char* output, size_t output_len, const char* target, ui
     return boundedStrLen(output, output_len);
   }
   written = has_target
-                ? snprintf(output, output_len, "Trace @[%s] %08lx %uh tail %s | ", target, (unsigned long)tag,
+                ? snprintf(output, output_len, "@[%s] %08lx %uh tail %s | ", target, (unsigned long)tag,
                            (unsigned)hop_count, tail_snr)
                 : snprintf(output, output_len, "Trace %08lx %uh tail %s | ", (unsigned long)tag,
                            (unsigned)hop_count, tail_snr);
@@ -374,25 +390,30 @@ BotCommandResult executeCommand(const BotCommand& command, const BotCommandConte
     case BOT_COMMAND_CMD:
       return executeCmd(command, output, output_len);
     case BOT_COMMAND_PING:
-      return writeText(output, output_len, "Pong!");
+      return writeText(output, output_len,
+                       "Pong!\n"
+                       "If you\'re in Fairfield County, check out #fairfield-county");
     case BOT_COMMAND_TEST:
       return executeTest(command, context, output, output_len);
     case BOT_COMMAND_HELLO: {
       const char* node = context.node_name[0] ? context.node_name : "MeshCore bot";
       const char* target = context.response_target[0] ? context.response_target : NULL;
-      if (target) return writeFormatted(output, output_len, "Hello @[%s], from %s", target, node);
-      return writeFormatted(output, output_len, "Hello from %s", node);
+      if (target) return writeFormatted(output, output_len, "Hello @[%s], I'm %s", target, node);
+      return writeFormatted(output, output_len, "Hello, I'm %s", node);
     }
     case BOT_COMMAND_ABOUT:
-      return writeText(output, output_len, "Colorado Mesh firmware bot: local commands only, no internet required.");
+      return writeText(output, output_len,
+                       "I'm a Heltec V4 running modified Colorado Mesh Bot firmware.\n"
+                       "Located near Trumbull Mall, CT [FN31jf] [06606]");
     case BOT_COMMAND_STATUS: {
       char up_str[20];
       formatUptime(context.uptime_seconds, up_str, sizeof(up_str));
       const char* name = context.node_name[0] ? context.node_name : "bot";
       if (context.battery_millivolts > 0) {
         uint8_t pct = batteryPercentFromMillivolts(context.battery_millivolts);
-        return writeFormatted(output, output_len, "%s | up %s | batt %umV %u%% | storage %lu/%luKB | seen %lu sent %lu fail %lu",
-                              name, up_str, (unsigned)context.battery_millivolts, (unsigned)pct,
+        return writeFormatted(output, output_len, "%s | up %s | batt %u.%02uV %u%% | storage %lu/%luKB | seen %lu sent %lu fail %lu",
+                              name, up_str, (unsigned)(context.battery_millivolts / 1000),
+                              (unsigned)((context.battery_millivolts % 1000) / 10), (unsigned)pct,
                               (unsigned long)context.storage_used_kb, (unsigned long)context.storage_total_kb,
                               (unsigned long)context.observed_messages, (unsigned long)context.sent_messages,
                               (unsigned long)context.send_failures);
@@ -405,16 +426,25 @@ BotCommandResult executeCommand(const BotCommand& command, const BotCommandConte
     case BOT_COMMAND_CHANNELS:
       return writeText(output, output_len,
                        "I will respond only on these Channels:\n"
-                       "#test #fairfield-county and Direct Message");
+                       "#bot #test #fairfield-county and Direct Message");
     case BOT_COMMAND_VERSION:
       return writeFormatted(output, output_len, "Firmware %s built %s", context.firmware_version[0] ? context.firmware_version : "unknown",
                             context.firmware_build_date[0] ? context.firmware_build_date : "unknown");
-    case BOT_COMMAND_STATS:
-      return writeFormatted(output, output_len, "Bot: %lu seen, %lu ok, %lu sent, %lu fail | RF: %lu rx, %lu tx, %lu err, q %u",
+    case BOT_COMMAND_STATS: {
+      const char* target = context.response_target[0] ? context.response_target : NULL;
+      if (target) {
+        return writeFormatted(output, output_len, "@[%s]: %lu seen | %lu ok | %lu sent | %lu fail | RF %lu rx | %lu tx | %lu err | q %u",
+                              target, (unsigned long)context.observed_messages, (unsigned long)context.eligible_messages,
+                              (unsigned long)context.sent_messages, (unsigned long)context.send_failures,
+                              (unsigned long)context.packets_recv, (unsigned long)context.packets_sent,
+                              (unsigned long)context.packets_recv_errors, (unsigned)context.queue_depth);
+      }
+      return writeFormatted(output, output_len, "%lu seen | %lu ok | %lu sent | %lu fail | RF %lu rx | %lu tx | %lu err | q %u",
                             (unsigned long)context.observed_messages, (unsigned long)context.eligible_messages,
                             (unsigned long)context.sent_messages, (unsigned long)context.send_failures,
                             (unsigned long)context.packets_recv, (unsigned long)context.packets_sent,
                             (unsigned long)context.packets_recv_errors, (unsigned)context.queue_depth);
+    }
     case BOT_COMMAND_SIG:
       return executeSig(context, output, output_len);
     case BOT_COMMAND_AIR:

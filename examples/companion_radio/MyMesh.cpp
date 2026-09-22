@@ -875,8 +875,8 @@ void MyMesh::printBotPrefs() {
   Serial.printf("  > bot %s\n", bot_prefs.enabled ? "enabled" : "disabled");
   Serial.printf("  > channels bot=%s testing=%s emergency=%s public=%s\n", bot_prefs.bot_channel,
                 bot_prefs.testing_channel, bot_prefs.emergency_channel, bot_prefs.public_channel);
-  Serial.printf("  > delay base=%u jitter=%u\n", (unsigned)bot_prefs.normal_delay_ms,
-                (unsigned)bot_prefs.normal_jitter_ms);
+  Serial.printf("  > delay base=%u jitter=%u hop=%u\n", (unsigned)bot_prefs.normal_delay_ms,
+                (unsigned)bot_prefs.normal_jitter_ms, (unsigned)bot_prefs.hop_step_ms);
   Serial.printf("  > advert local=%lu flood=%lu\n", (unsigned long)bot_prefs.local_advert_interval_ms,
                 (unsigned long)bot_prefs.flood_advert_interval_ms);
 }
@@ -939,18 +939,25 @@ bool MyMesh::handleBotCLI(const char *args) {
     const char *pos = args + 6;
     uint32_t base = 0;
     uint32_t jitter = 0;
+    uint32_t hop = 0;
     if (botParseU32(pos, &base, &pos)) {
       botSkipSpaces(&pos);
-      if (botParseU32(pos, &jitter, &pos) && *pos == 0 && base <= BOT_PREFS_MAX_DELAY_MILLIS &&
-          jitter <= BOT_PREFS_MAX_DELAY_MILLIS) {
-        bot_prefs.normal_delay_ms = (uint16_t)base;
-        bot_prefs.normal_jitter_ms = (uint16_t)jitter;
-        printBotPrefsSaveResult("  > bot delay saved", saveBotPrefs());
+      if (botParseU32(pos, &jitter, &pos)) {
+        botSkipSpaces(&pos);
+        if (botParseU32(pos, &hop, &pos) && *pos == 0 && base <= BOT_PREFS_MAX_DELAY_MILLIS &&
+            jitter <= BOT_PREFS_MAX_DELAY_MILLIS && hop > 0 && hop <= BOT_HOP_STEP_MILLIS_MAX) {
+          bot_prefs.normal_delay_ms = (uint16_t)base;
+          bot_prefs.normal_jitter_ms = (uint16_t)jitter;
+          bot_prefs.hop_step_ms = (uint16_t)hop;
+          printBotPrefsSaveResult("  > bot delay saved", saveBotPrefs());
+        } else {
+          Serial.println("  Error: usage bot delay <base_ms> <jitter_ms> <hop_ms>");
+        }
       } else {
-        Serial.println("  Error: usage bot delay <base_ms> <jitter_ms>");
+        Serial.println("  Error: usage bot delay <base_ms> <jitter_ms> <hop_ms>");
       }
     } else {
-      Serial.println("  Error: usage bot delay <base_ms> <jitter_ms>");
+      Serial.println("  Error: usage bot delay <base_ms> <jitter_ms> <hop_ms>");
     }
     return true;
   }
@@ -1240,12 +1247,13 @@ BotCommandResult MyMesh::executeBotTimeCommand(const BotMessage &message, char *
   uint32_t days = uptime_seconds / 86400UL;
   uint32_t hours = (uptime_seconds / 3600UL) % 24UL;
   uint32_t mins = (uptime_seconds / 60UL) % 60UL;
+  const char *tz = (now != 0 && FirmwareBot::easternUtcOffsetSeconds(now) == -4 * 3600) ? "EDT" : "EST";
   const char *target = message.sender_name[0] ? message.sender_name : NULL;
   if (target) {
-    return botWriteFormatted(output, output_len, "Time @[%s] %s | up %lud %luh %lum", target, time_str,
+    return botWriteFormatted(output, output_len, "@[%s] %s %s | up %lud %luh %lum", target, time_str, tz,
                              (unsigned long)days, (unsigned long)hours, (unsigned long)mins);
   }
-  return botWriteFormatted(output, output_len, "Time %s | up %lud %luh %lum", time_str, (unsigned long)days,
+  return botWriteFormatted(output, output_len, "%s %s | up %lud %luh %lum", time_str, tz, (unsigned long)days,
                            (unsigned long)hours, (unsigned long)mins);
 }
 
@@ -1259,10 +1267,10 @@ BotCommandResult MyMesh::executeBotLoraCommand(const BotMessage &message, char *
   const char *target = message.sender_name[0] ? message.sender_name : NULL;
   if (target) {
     return botWriteFormatted(output, output_len,
-                             "LoRa @[%s] %lu.%03luMHz SF%u BW%lu.%lukHz CR%u %+ddBm", target, freq_mhz, freq_khz,
+                             "@[%s] %lu.%03luMHz | SF%u | BW%lu.%lukHz | CR%u | %+ddBm", target, freq_mhz, freq_khz,
                              (unsigned)_prefs.sf, bw_khz, bw_dh, (unsigned)_prefs.cr, (int)_prefs.tx_power_dbm);
   }
-  return botWriteFormatted(output, output_len, "LoRa %lu.%03luMHz SF%u BW%lu.%lukHz CR%u %+ddBm", freq_mhz, freq_khz,
+  return botWriteFormatted(output, output_len, "%lu.%03luMHz | SF%u | BW%lu.%lukHz | CR%u | %+ddBm", freq_mhz, freq_khz,
                            (unsigned)_prefs.sf, bw_khz, bw_dh, (unsigned)_prefs.cr, (int)_prefs.tx_power_dbm);
 }
 
@@ -1272,9 +1280,9 @@ BotCommandResult MyMesh::executeBotIdCommand(const BotMessage &message, char *ou
   const char *name = _prefs.node_name[0] ? _prefs.node_name : "MeshCore bot";
   const char *target = message.sender_name[0] ? message.sender_name : NULL;
   if (target) {
-    return botWriteFormatted(output, output_len, "Id @[%s] %s name %s", target, key_hex, name);
+    return botWriteFormatted(output, output_len, "@[%s] %s I'm %s", target, key_hex, name);
   }
-  return botWriteFormatted(output, output_len, "Id %s name %s", key_hex, name);
+  return botWriteFormatted(output, output_len, "%s I'm %s", key_hex, name);
 }
 
 void MyMesh::recordBotNeighbor(const uint8_t *pub_key, int16_t rssi_dbm, int8_t snr_quarters) {
@@ -1329,14 +1337,14 @@ BotCommandResult MyMesh::executeBotNeighborsCommand(const BotMessage &message, c
   }
 
   if (count == 0) {
-    if (target) return botWriteFormatted(output, output_len, "Neighbors @[%s]: none heard recently", target);
+    if (target) return botWriteFormatted(output, output_len, "@[%s]: none heard recently", target);
     return botWriteText(output, output_len, "Neighbors: none heard recently");
   }
 
   if (!output || output_len == 0) return botCommandResult(BOT_COMMAND_RESULT_NO_SPACE, 0);
   output[0] = 0;
   int header_n = target
-                     ? snprintf(output, output_len, "Neighbors @[%s]: ", target)
+                     ? snprintf(output, output_len, "@[%s]: ", target)
                      : snprintf(output, output_len, "Neighbors: ");
   if (header_n < 0) return botCommandResult(BOT_COMMAND_RESULT_NO_SPACE, 0);
   size_t pos = (size_t)header_n;
