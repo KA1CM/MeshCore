@@ -226,7 +226,6 @@ private:
                              const BotCommand &command);
   bool dispatchBotTraceDirectLink(const BotMessage &message, const ContactInfo *direct_recipient, uint8_t channel_idx,
                                   const BotCommand &command);
-  BotCommandResult executeBotPrefixCommand(const BotCommand &command, char *output, size_t output_len);
   BotCommandResult executeBotTimeCommand(const BotMessage &message, char *output, size_t output_len);
   BotCommandResult executeBotLoraCommand(const BotMessage &message, char *output, size_t output_len);
   BotCommandResult executeBotIdCommand(const BotMessage &message, char *output, size_t output_len);

@@ -1224,37 +1224,6 @@ bool MyMesh::findBotChannel(BotChannelKind kind, uint8_t &channel_idx) {
   return false;
 }
 
-BotCommandResult MyMesh::executeBotPrefixCommand(const BotCommand &command, char *output, size_t output_len) {
-  uint8_t prefix[PUB_KEY_SIZE];
-  uint8_t prefix_len = 0;
-  if (!botParsePubKeyPrefixHex(command, prefix, &prefix_len)) {
-    return botWriteText(output, output_len, "Usage: prefix <even hex>");
-  }
-
-  ContactInfo match;
-  bool have_match = false;
-  uint8_t match_count = 0;
-  for (uint32_t i = 0; i < (uint32_t)getNumContacts(); i++) {
-    ContactInfo contact;
-    if (!getContactByIdx(i, contact)) continue;
-    if (memcmp(contact.id.pub_key, prefix, prefix_len) != 0) continue;
-    if (!have_match) {
-      match = contact;
-      have_match = true;
-    }
-    if (match_count < 2) match_count++;
-  }
-
-  if (!have_match) return botWriteText(output, output_len, "Prefix no match");
-  if (match_count > 1) return botWriteText(output, output_len, "Prefix ambiguous");
-
-  char name[sizeof(match.name)];
-  char key_hex[BOT_SENDER_KEY_PREFIX_LEN * 2 + 1];
-  botCopyContactName(match, name, sizeof(name));
-  botFormatKeyPrefixHex(match.id.pub_key, key_hex, sizeof(key_hex));
-  return botWriteFormatted(output, output_len, "Prefix %s %s", key_hex, name);
-}
-
 BotCommandResult MyMesh::executeBotTimeCommand(const BotMessage &message, char *output, size_t output_len) {
   uint32_t now = getRTCClock()->getCurrentTime();
   uint32_t uptime_seconds = _ms->getMillis() / 1000;
@@ -1856,9 +1825,6 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
         result.text_len = written;
         break;
       }
-      case BOT_COMMAND_PREFIX:
-        result = executeBotPrefixCommand(command, response, sizeof(response));
-        break;
       case BOT_COMMAND_TIME:
         result = executeBotTimeCommand(message, response, sizeof(response));
         break;

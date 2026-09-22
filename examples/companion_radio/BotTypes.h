@@ -154,7 +154,7 @@ struct BotCommandMetadata {
                               BOT_COMMAND_MASK_TEST | BOT_COMMAND_MASK_HELLO | BOT_COMMAND_MASK_ABOUT | \
                               BOT_COMMAND_MASK_STATUS | BOT_COMMAND_MASK_CHANNELS | BOT_COMMAND_MASK_VERSION | \
                               BOT_COMMAND_MASK_STATS | BOT_COMMAND_MASK_PATH | BOT_COMMAND_MASK_TRACE | \
-                              BOT_COMMAND_MASK_PREFIX | BOT_COMMAND_MASK_TIME | \
+                              BOT_COMMAND_MASK_TIME | \
                               BOT_COMMAND_MASK_LORA | BOT_COMMAND_MASK_ID | BOT_COMMAND_MASK_NEIGHBORS | \
                               BOT_COMMAND_MASK_SIG | BOT_COMMAND_MASK_AIR)
 

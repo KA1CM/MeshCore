@@ -182,56 +182,21 @@ void formatQuarters(int8_t quarters, char* output, size_t output_len) {
   snprintf(output, output_len, "%s%d.%02d", sign, value / 4, (value % 4) * 25);
 }
 
-bool commandInClasses(const BotCommandMetadata* command, const BotCommandContextClass* classes, size_t class_count) {
-  for (size_t i = 0; i < class_count; i++) {
-    if (command->context_class == classes[i]) return true;
-  }
-  return false;
-}
-
-// Listings are derived from the registry so an added command can never
-// be missed; classes split the list because all commands do not fit one
-// group-channel message.
-void appendCommandsByClass(char* output, size_t output_len, size_t* pos, const BotCommandContextClass* classes,
-                           size_t class_count) {
-  bool first = true;
-  for (size_t i = 0; i < BotCommandRegistry::commandCount(); i++) {
-    const BotCommandMetadata* command = BotCommandRegistry::commandAt(i);
-    if (!command || command->visibility != BOT_COMMAND_VISIBILITY_DISCOVERABLE) continue;
-    if (!commandInClasses(command, classes, class_count)) continue;
-    if (!first) appendText(output, output_len, pos, " ");
-    appendText(output, output_len, pos, command->name);
-    first = false;
-  }
-}
-
-const BotCommandContextClass kChatClasses[] = { BOT_COMMAND_CONTEXT_NORMAL, BOT_COMMAND_CONTEXT_TRACE };
-const BotCommandContextClass kDiagClasses[] = { BOT_COMMAND_CONTEXT_DIAGNOSTIC, BOT_COMMAND_CONTEXT_LOCAL_CONTACT };
-
 BotCommandResult executeCmd(const BotCommand& command, char* output, size_t output_len) {
-  if (!output || output_len == 0) return makeResult(BOT_COMMAND_RESULT_NO_SPACE, 0);
-  output[0] = 0;
-  size_t pos = 0;
-  if (textEqualsIgnoreCase(command.args, command.args_len, "diag")) {
-    appendText(output, output_len, &pos, "Diag: ");
-    appendCommandsByClass(output, output_len, &pos, kDiagClasses, 2);
-    return resultForAppend(output, output_len, pos);
-  }
-  appendText(output, output_len, &pos, "Commands: ");
-  appendCommandsByClass(output, output_len, &pos, kChatClasses, 2);
-  appendText(output, output_len, &pos, " | cmd diag");
-  return resultForAppend(output, output_len, pos);
+  return writeText(output, output_len,
+                   "help  cmd  hello  about  version  status\n"
+                   "ping  sig  test  path  trace\n"
+                   "channels  stats  time\n"
+                   "lora  id  neighbors  air");
 }
 
 BotCommandResult executeHelp(const BotCommand& command, char* output, size_t output_len) {
   if (command.args_len == 0) {
-    if (!output || output_len == 0) return makeResult(BOT_COMMAND_RESULT_NO_SPACE, 0);
-    output[0] = 0;
-    size_t pos = 0;
-    appendText(output, output_len, &pos, "Commands: ");
-    appendCommandsByClass(output, output_len, &pos, kChatClasses, 2);
-    appendText(output, output_len, &pos, " | cmd diag | help <command>");
-    return resultForAppend(output, output_len, pos);
+    return writeText(output, output_len,
+                     "help  cmd  hello  about  version  status\n"
+                     "ping  sig  test  path  trace\n"
+                     "channels  stats  time\n"
+                     "lora  id  neighbors  air");
   }
 
   const BotCommandMetadata* metadata = BotCommandRegistry::findByName(command.args, command.args_len);
@@ -239,7 +204,8 @@ BotCommandResult executeHelp(const BotCommand& command, char* output, size_t out
   if (metadata->visibility != BOT_COMMAND_VISIBILITY_DISCOVERABLE) {
     return writeFormatted(output, output_len, "%s is not available", command.args);
   }
-  return writeFormatted(output, output_len, "%s: %s. Usage: %s", metadata->name, metadata->details, metadata->usage);
+  return writeFormatted(output, output_len, "%s: %s. Usage: %s",
+                        metadata->name, metadata->details, metadata->usage);
 }
 
 BotCommandResult executePathLike(const BotCommandContext& context, char* output, size_t output_len, const char* label) {
