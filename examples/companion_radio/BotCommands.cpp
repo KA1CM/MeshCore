@@ -408,20 +408,61 @@ BotCommandResult executeCommand(const BotCommand& command, const BotCommandConte
     case BOT_COMMAND_STATUS: {
       char up_str[20];
       formatUptime(context.uptime_seconds, up_str, sizeof(up_str));
-      const char* name = context.node_name[0] ? context.node_name : "bot";
+
+      uint32_t tx_seconds = context.tx_airtime_seconds;
+      uint32_t rx_seconds = context.rx_airtime_seconds;
+
       if (context.battery_millivolts > 0) {
         uint8_t pct = batteryPercentFromMillivolts(context.battery_millivolts);
-        return writeFormatted(output, output_len, "%s | up %s | batt %u.%02uV %u%% | storage %lu/%luKB | seen %lu sent %lu fail %lu",
-                              name, up_str, (unsigned)(context.battery_millivolts / 1000),
-                              (unsigned)((context.battery_millivolts % 1000) / 10), (unsigned)pct,
-                              (unsigned long)context.storage_used_kb, (unsigned long)context.storage_total_kb,
-                              (unsigned long)context.observed_messages, (unsigned long)context.sent_messages,
-                              (unsigned long)context.send_failures);
+        return writeFormatted(
+            output, output_len,
+            "up %s | batt %u.%02uV %u%% | storage %lu/%luKB\n"
+            "seen %lu sent %lu fail %lu\n"
+            "RF %lurx %lutx %luerr q%u\n"
+            "AIR %lus rx %lus tx | F/D rx %lu/%lu tx %lu/%lu",
+            up_str,
+            (unsigned)(context.battery_millivolts / 1000),
+            (unsigned)((context.battery_millivolts % 1000) / 10),
+            (unsigned)pct,
+            (unsigned long)context.storage_used_kb,
+            (unsigned long)context.storage_total_kb,
+            (unsigned long)context.observed_messages,
+            (unsigned long)context.sent_messages,
+            (unsigned long)context.send_failures,
+            (unsigned long)context.packets_recv,
+            (unsigned long)context.packets_sent,
+            (unsigned long)context.packets_recv_errors,
+            (unsigned)context.queue_depth,
+            (unsigned long)rx_seconds,
+            (unsigned long)tx_seconds,
+            (unsigned long)context.flood_recv,
+            (unsigned long)context.direct_recv,
+            (unsigned long)context.flood_sent,
+            (unsigned long)context.direct_sent);
       }
-      return writeFormatted(output, output_len, "%s | up %s | storage %lu/%luKB | seen %lu sent %lu fail %lu",
-                            name, up_str, (unsigned long)context.storage_used_kb,
-                            (unsigned long)context.storage_total_kb, (unsigned long)context.observed_messages,
-                            (unsigned long)context.sent_messages, (unsigned long)context.send_failures);
+
+      return writeFormatted(
+          output, output_len,
+          "up %s | storage %lu/%luKB\n"
+          "seen %lu sent %lu fail %lu\n"
+          "RF %lurx %lutx %luerr q%u\n"
+          "AIR %lus rx %lus tx | F/D rx %lu/%lu tx %lu/%lu",
+          up_str,
+          (unsigned long)context.storage_used_kb,
+          (unsigned long)context.storage_total_kb,
+          (unsigned long)context.observed_messages,
+          (unsigned long)context.sent_messages,
+          (unsigned long)context.send_failures,
+          (unsigned long)context.packets_recv,
+          (unsigned long)context.packets_sent,
+          (unsigned long)context.packets_recv_errors,
+          (unsigned)context.queue_depth,
+          (unsigned long)rx_seconds,
+          (unsigned long)tx_seconds,
+          (unsigned long)context.flood_recv,
+          (unsigned long)context.direct_recv,
+          (unsigned long)context.flood_sent,
+          (unsigned long)context.direct_sent);
     }
     case BOT_COMMAND_CHANNELS:
       return writeText(output, output_len,

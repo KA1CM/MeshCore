@@ -715,6 +715,14 @@ ContactInfo*  MyMesh::processAck(const uint8_t *data) {
       _serial->writeFrame(out_frame, 9);
 
       // NOTE: the same ACK can be received multiple times!
+#if CMESH_BOT_ENABLED
+      uint32_t received_ack = 0;
+      memcpy(&received_ack, data, sizeof(received_ack));
+      if (pending_bot_dm_ack.active &&
+          pending_bot_dm_ack.expected_ack == received_ack) {
+        pending_bot_dm_ack.active = false;
+      }
+#endif
       expected_ack_table[i].ack = 0; // clear expected hash, now that we have received ACK
       return expected_ack_table[i].contact;
     }
@@ -898,6 +906,7 @@ bool MyMesh::handleBotCLI(const char *args) {
     bot_prefs.enabled = false;
     ResponseCoordinator::clear(bot_coordinator_pending, BOT_COORDINATOR_PENDING_SLOTS);
     memset(pending_bot_responses, 0, sizeof(pending_bot_responses));
+    memset(&pending_bot_dm_ack, 0, sizeof(pending_bot_dm_ack));
     memset(pending_bot_traces, 0, sizeof(pending_bot_traces));
     applyBotPrefs();
     printBotPrefsSaveResult("  > bot disabled", saveBotPrefs());
@@ -1164,7 +1173,8 @@ void MyMesh::buildBotCommandContext(BotCommandContext &context, BotCommandId com
     StrHelper::strzcpy(context.firmware_version, FIRMWARE_VERSION, sizeof(context.firmware_version));
     StrHelper::strzcpy(context.firmware_build_date, FIRMWARE_BUILD_DATE, sizeof(context.firmware_build_date));
   }
-  if (command_id == BOT_COMMAND_STATS || command_id == BOT_COMMAND_SIG || command_id == BOT_COMMAND_AIR) {
+  if (command_id == BOT_COMMAND_STATUS || command_id == BOT_COMMAND_STATS ||
+      command_id == BOT_COMMAND_SIG || command_id == BOT_COMMAND_AIR) {
     context.queue_depth = (uint8_t)_mgr->getOutboundTotal();
     context.noise_floor = (int16_t)_radio->getNoiseFloor();
     context.last_rssi = (int8_t)radio_driver.getLastRSSI();
@@ -1369,15 +1379,11 @@ BotCommandResult MyMesh::executeBotNeighborsCommand(const BotMessage &message, c
     }
     char snr_str[8];
     botFormatQuarters(n.snr_quarters, snr_str, sizeof(snr_str));
-    uint32_t ago_ms = now - n.last_heard_millis;
-    uint32_t ago_min = ago_ms / 60000UL;
-    char ago_buf[8];
-    if (ago_min < 60) snprintf(ago_buf, sizeof(ago_buf), "%lum", (unsigned long)ago_min);
-    else if (ago_min < 1440) snprintf(ago_buf, sizeof(ago_buf), "%luh", (unsigned long)(ago_min / 60));
-    else snprintf(ago_buf, sizeof(ago_buf), "%lud", (unsigned long)(ago_min / 1440));
-    char entry[80];
-    int entry_n = snprintf(entry, sizeof(entry), "%s%s %ddBm %s %s", k == 0 ? "" : ", ", display_name,
-                           (int)n.rssi_dbm, snr_str, ago_buf);
+    char entry[64];
+    int entry_n = snprintf(entry, sizeof(entry),
+                           "%s%s %d/%s",
+                           k == 0 ? "" : "\n", display_name,
+                           (int)n.rssi_dbm, snr_str);
     if (entry_n < 0) break;
     size_t entry_len = (size_t)entry_n;
     size_t available = pos + 1 < output_len ? output_len - 1 - pos : 0;
@@ -1990,6 +1996,18 @@ void MyMesh::sendQueuedBotResponses() {
           expected_ack_table[next_ack_idx].ack = expected_ack;
           expected_ack_table[next_ack_idx].contact = recipient;
           next_ack_idx = (next_ack_idx + 1) % EXPECTED_ACK_TABLE_SIZE;
+
+          pending_bot_dm_ack.active = true;
+          memcpy(pending_bot_dm_ack.recipient_pub_key, recipient->id.pub_key,
+                 sizeof(pending_bot_dm_ack.recipient_pub_key));
+          pending_bot_dm_ack.expected_ack = expected_ack;
+          pending_bot_dm_ack.timestamp = timestamp;
+          pending_bot_dm_ack.ack_deadline_millis =
+              futureMillis(est_timeout);
+          pending_bot_dm_ack.attempt = 0;
+          pending_bot_dm_ack.text_len = pending->text_len;
+          memcpy(pending_bot_dm_ack.text, pending->text, pending->text_len);
+          pending_bot_dm_ack.text[pending->text_len] = 0;
         }
       }
     } else if (pending->channel_idx != 0xFF) {
@@ -2066,6 +2084,51 @@ void MyMesh::scheduleBotFloodAdvert(unsigned long interval_millis) {
 
 void MyMesh::tickBot() {
   uint32_t now = _ms->getMillis();
+
+  if (pending_bot_dm_ack.active &&
+      millisHasNowPassed(pending_bot_dm_ack.ack_deadline_millis)) {
+    if (pending_bot_dm_ack.attempt >= 1) {
+      pending_bot_dm_ack.active = false;
+      bot_stats.send_failures++;
+    } else {
+      ContactInfo *recipient =
+          lookupContactByPubKey(pending_bot_dm_ack.recipient_pub_key, PUB_KEY_SIZE);
+
+      if (!recipient) {
+        pending_bot_dm_ack.active = false;
+        bot_stats.send_failures++;
+      } else {
+        // The known direct route did not ACK. Forget it so the retry
+        // falls back to MeshCore's flood routing.
+        resetPathTo(*recipient);
+        pending_bot_dm_ack.attempt++;
+
+        uint32_t expected_ack = 0;
+        uint32_t est_timeout = 0;
+        int result = sendMessage(*recipient,
+                                 pending_bot_dm_ack.timestamp,
+                                 pending_bot_dm_ack.attempt,
+                                 pending_bot_dm_ack.text,
+                                 expected_ack,
+                                 est_timeout);
+
+        if (result == MSG_SEND_FAILED || expected_ack == 0) {
+          pending_bot_dm_ack.active = false;
+          bot_stats.send_failures++;
+        } else {
+          pending_bot_dm_ack.expected_ack = expected_ack;
+          pending_bot_dm_ack.ack_deadline_millis =
+              futureMillis(est_timeout);
+
+          expected_ack_table[next_ack_idx].msg_sent = now;
+          expected_ack_table[next_ack_idx].ack = expected_ack;
+          expected_ack_table[next_ack_idx].contact = recipient;
+          next_ack_idx = (next_ack_idx + 1) % EXPECTED_ACK_TABLE_SIZE;
+        }
+      }
+    }
+  }
+
   sendQueuedEmergencyForwards();
   if (bot_prefs.enabled) {
     sendQueuedBotResponses();
@@ -2441,6 +2504,7 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
   BotPrefsCodec::defaults(bot_prefs);
   memset(&bot_stats, 0, sizeof(bot_stats));
   memset(pending_bot_responses, 0, sizeof(pending_bot_responses));
+  memset(&pending_bot_dm_ack, 0, sizeof(pending_bot_dm_ack));
   memset(pending_bot_traces, 0, sizeof(pending_bot_traces));
   memset(pending_emergency_forwards, 0, sizeof(pending_emergency_forwards));
   memset(bot_command_cooldowns, 0, sizeof(bot_command_cooldowns));

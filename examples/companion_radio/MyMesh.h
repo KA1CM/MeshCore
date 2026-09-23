@@ -197,7 +197,7 @@ private:
   void updateContactFromFrame(ContactInfo &contact, uint32_t& last_mod, const uint8_t *frame, int len);
   void addToOfflineQueue(const uint8_t frame[], int len);
   int getFromOfflineQueue(uint8_t frame[]);
-  int getBlobByKey(const uint8_t key[], int key_len, uint8_t dest_buf[]) override { 
+  int getBlobByKey(const uint8_t key[], int key_len, uint8_t dest_buf[]) override {
     return _store->getBlobByKey(key, key_len, dest_buf);
   }
   bool putBlobByKey(const uint8_t key[], int key_len, const uint8_t src_buf[], int len) override {
@@ -294,6 +294,17 @@ private:
     size_t text_len;
   };
 
+  struct PendingBotDmAck {
+    bool active;
+    uint8_t recipient_pub_key[PUB_KEY_SIZE];
+    uint32_t expected_ack;
+    uint32_t timestamp;
+    uint32_t ack_deadline_millis;
+    uint8_t attempt;
+    char text[BOT_MAX_RESPONSE_LEN + 1];
+    size_t text_len;
+  };
+
   struct PendingEmergencyForward {
     bool active;
     char text[BOT_MAX_GROUP_RESPONSE_LEN + 1];
@@ -324,6 +335,7 @@ private:
   BotPrefs bot_prefs;
   BotStats bot_stats;
   PendingBotResponse pending_bot_responses[BOT_PENDING_RESPONSE_SLOTS];
+  PendingBotDmAck pending_bot_dm_ack;
   PendingBotTrace pending_bot_traces[BOT_PENDING_TRACE_SLOTS];
   PendingEmergencyForward pending_emergency_forwards[BOT_PENDING_EMERGENCY_SLOTS];
   BotCommandCooldown bot_command_cooldowns[BOT_COMMAND_COOLDOWN_SLOTS];
