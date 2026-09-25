@@ -16,14 +16,7 @@ BotWriteResult writeResponseForChannel(BotChannelKind channel_kind, bool allow_p
                                        size_t text_len, char* output, size_t output_len, size_t* written);
 BotWriteResult writeAckResponse(const BotMessage& message, const BotCommand& command, char* output, size_t output_len,
                                 size_t* written);
-BotFingerprint fingerprintFor(const BotMessage& message);
-BotFingerprint responseFingerprintFor(const BotMessage& message, const char* response_text, size_t response_text_len);
-uint16_t requestToken(BotFingerprint request_fingerprint);
 int32_t easternUtcOffsetSeconds(uint32_t timestamp);
-void formatRequestToken(uint16_t token, char out[5]);
-bool parseRequestTokenPrefix(const char* text, size_t text_len, uint16_t* token, size_t* prefix_len);
-BotWriteResult prependRequestToken(BotFingerprint request_fingerprint, char* text, size_t text_len, size_t buf_len,
-                                   size_t* new_len);
 BotCommandId commandIdForName(const char* name, size_t len);
 size_t maxResponseLenForChannel(BotChannelKind channel_kind);
 bool isCommandOnCooldown(const BotCommandCooldown* cooldowns, size_t cooldown_count, BotCommandId command_id,

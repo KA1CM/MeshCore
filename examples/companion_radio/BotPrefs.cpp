@@ -115,9 +115,6 @@ size_t serializedSize() {
 void defaults(BotPrefs& prefs) {
   memset(&prefs, 0, sizeof(prefs));
   prefs.enabled = true;
-  prefs.normal_delay_ms = BOT_RESPONSE_DELAY_BASE_MILLIS;
-  prefs.normal_jitter_ms = BOT_RESPONSE_DELAY_JITTER_MILLIS;
-  prefs.hop_step_ms = BOT_HOP_STEP_MILLIS_DEFAULT;
   prefs.local_advert_interval_ms = BOT_PREFS_DEFAULT_LOCAL_ADVERT_MILLIS;
   prefs.flood_advert_interval_ms = BOT_PREFS_DEFAULT_FLOOD_ADVERT_MILLIS;
   prefs.command_mask = BOT_COMMAND_MASK_ALL;
@@ -129,10 +126,6 @@ void defaults(BotPrefs& prefs) {
 }
 
 void validate(BotPrefs& prefs) {
-  prefs.normal_delay_ms = prefs.normal_delay_ms > BOT_PREFS_MAX_DELAY_MILLIS ? BOT_PREFS_MAX_DELAY_MILLIS : prefs.normal_delay_ms;
-  prefs.normal_jitter_ms = prefs.normal_jitter_ms > BOT_PREFS_MAX_DELAY_MILLIS ? BOT_PREFS_MAX_DELAY_MILLIS : prefs.normal_jitter_ms;
-  if (prefs.hop_step_ms == 0) prefs.hop_step_ms = BOT_HOP_STEP_MILLIS_DEFAULT;
-  if (prefs.hop_step_ms > BOT_HOP_STEP_MILLIS_MAX) prefs.hop_step_ms = BOT_HOP_STEP_MILLIS_MAX;
   if (prefs.local_advert_interval_ms > BOT_PREFS_MAX_ADVERT_MILLIS) prefs.local_advert_interval_ms = BOT_PREFS_MAX_ADVERT_MILLIS;
   if (prefs.flood_advert_interval_ms > BOT_PREFS_MAX_ADVERT_MILLIS) prefs.flood_advert_interval_ms = BOT_PREFS_MAX_ADVERT_MILLIS;
   prefs.command_mask &= BOT_COMMAND_MASK_ALL;
@@ -188,9 +181,11 @@ bool serialize(const BotPrefs& prefs, uint8_t* output, size_t output_len) {
   size_t checksum_pos = pos;
   put32(output, pos, 0);
   put8(output, pos, clean.enabled ? 1 : 0);
-  put16(output, pos, clean.normal_delay_ms);
-  put16(output, pos, clean.normal_jitter_ms);
-  put16(output, pos, clean.hop_step_ms);
+  // Reserved legacy delay fields. Keep these 6 bytes so version 7
+  // preferences retain the same serialized size and field offsets.
+  put16(output, pos, 0);
+  put16(output, pos, 0);
+  put16(output, pos, 0);
   put32(output, pos, clean.local_advert_interval_ms);
   put32(output, pos, clean.flood_advert_interval_ms);
   put32(output, pos, clean.command_mask);
@@ -239,9 +234,10 @@ bool deserialize(const uint8_t* data, size_t data_len, BotPrefs& prefs) {
   BotPrefs loaded;
   memset(&loaded, 0, sizeof(loaded));
   loaded.enabled = get8(data, pos) != 0;
-  loaded.normal_delay_ms = get16(data, pos);
-  loaded.normal_jitter_ms = get16(data, pos);
-  loaded.hop_step_ms = get16(data, pos);
+  // Skip reserved legacy delay fields.
+  (void)get16(data, pos);
+  (void)get16(data, pos);
+  (void)get16(data, pos);
   loaded.local_advert_interval_ms = get32(data, pos);
   loaded.flood_advert_interval_ms = get32(data, pos);
   loaded.command_mask = get32(data, pos);

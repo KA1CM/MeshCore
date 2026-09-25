@@ -397,24 +397,20 @@ BotWriteResult writeAckResponse(const BotMessage& message, const BotCommand& com
   bool truncated = pos >= output_len;
   if (truncated) pos = output_len - 1;
 
-  int value = message.packet_snr_quarters;
-  const char* sign = value < 0 ? "-" : "";
-  if (value < 0) value = -value;
-  char path_block[40];
+  char path_block[32];
   int path_n;
   if (message.path_hash_count == 0 || message.path_hash_size == 0) {
-    path_n = snprintf(path_block, sizeof(path_block), " | 0 hops, SNR %s%d.%02d", sign, value / 4, (value % 4) * 25);
+    path_n = snprintf(path_block, sizeof(path_block), "\n0 hops");
   } else {
-    path_n = snprintf(path_block, sizeof(path_block), " | %u hops, %u-byte hashes, SNR %s%d.%02d",
-                      (unsigned)message.path_hash_count, (unsigned)message.path_hash_size, sign, value / 4,
-                      (value % 4) * 25);
+    path_n = snprintf(path_block, sizeof(path_block), "\n%u hops, %u-byte",
+                      (unsigned)message.path_hash_count, (unsigned)message.path_hash_size);
   }
   if (path_n > 0) appendBlock(output, output_len, &pos, &truncated, path_block, (size_t)path_n);
 
   char received_at[9];
   formatTimestampHms(message.received_at_timestamp, received_at, sizeof(received_at));
   char received_block[32];
-  int received_n = snprintf(received_block, sizeof(received_block), " | recv %s", received_at);
+  int received_n = snprintf(received_block, sizeof(received_block), "\nrecv %s", received_at);
   if (received_n < 0) return BOT_WRITE_NO_SPACE;
   appendBlock(output, output_len, &pos, &truncated, received_block, (size_t)received_n);
 
@@ -429,111 +425,5 @@ BotWriteResult writeAckResponse(const BotMessage& message, const BotCommand& com
   return truncated ? BOT_WRITE_TRUNCATED : BOT_WRITE_OK;
 }
 
-BotFingerprint fingerprintFor(const BotMessage& message) {
-  uint64_t hash = 1469598103934665603ULL;
-  hash = fnv1aUpdateChannel(hash, message);
-  hash = fnv1aUpdateBytes(hash, message.sender_key_prefix, sizeof(message.sender_key_prefix));
-  hash = fnv1aUpdateTextLower(hash, message.sender_name, boundedStrLen(message.sender_name, sizeof(message.sender_name)));
-  if (message.channel_kind == BOT_CHANNEL_DM) hash = fnv1aUpdateU32(hash, message.sender_timestamp);
-
-  char normalized[BOT_MAX_TEXT_LEN + 1];
-  size_t normalized_len = 0;
-  normalizeText(message.text, message.text_len, normalized, sizeof(normalized), &normalized_len);
-  hash = fnv1aUpdateTextLower(hash, normalized, normalized_len);
-
-  BotFingerprint fingerprint = { hash };
-  return fingerprint;
-}
-
-static int hexNibble(char c);
-
-bool parseRequestTokenPrefix(const char* text, size_t text_len, uint16_t* token, size_t* prefix_len) {
-  if (token) *token = 0;
-  if (prefix_len) *prefix_len = 0;
-  if (!text || text_len < 7) return false;
-  if (text[0] != '[' || text[5] != ']' || text[6] != ' ') return false;
-  uint16_t value = 0;
-  for (int i = 0; i < 4; i++) {
-    int n = hexNibble(text[1 + i]);
-    if (n < 0) return false;
-    value = (uint16_t)((value << 4) | (uint16_t)n);
-  }
-  if (token) *token = value;
-  if (prefix_len) *prefix_len = 7;
-  return true;
-}
-
-BotFingerprint responseFingerprintFor(const BotMessage& message, const char* response_text, size_t response_text_len) {
-  uint64_t hash = 1469598103934665603ULL;
-  hash = fnv1aUpdateChannel(hash, message);
-  if (message.channel_kind == BOT_CHANNEL_DM) {
-    hash = fnv1aUpdate(hash, message.sender_key_prefix_len);
-    hash = fnv1aUpdateBytes(hash, message.sender_key_prefix, message.sender_key_prefix_len);
-  }
-
-  uint16_t token = 0;
-  size_t prefix_len = 0;
-  if (parseRequestTokenPrefix(response_text, response_text_len, &token, &prefix_len)) {
-    response_text += prefix_len;
-    response_text_len -= prefix_len;
-  }
-
-  char normalized[BOT_MAX_RESPONSE_LEN + 1];
-  size_t normalized_len = 0;
-  normalizeText(response_text, response_text_len, normalized, sizeof(normalized), &normalized_len);
-  hash = fnv1aUpdateTextLower(hash, normalized, normalized_len);
-
-  BotFingerprint fingerprint = { hash };
-  return fingerprint;
-}
-
-uint16_t requestToken(BotFingerprint request_fingerprint) {
-  // Take the low 16 bits of the request fingerprint. Two bots computing
-  // fingerprintFor() against the same request derive the same token, so
-  // a bot can recognise another bot's response to a request it also queued
-  // even when the response text differs (different hop count, SNR, recv time).
-  return (uint16_t)(request_fingerprint.value & 0xFFFFu);
-}
-
-void formatRequestToken(uint16_t token, char out[5]) {
-  if (!out) return;
-  static const char hex[] = "0123456789abcdef";
-  out[0] = hex[(token >> 12) & 0xF];
-  out[1] = hex[(token >> 8) & 0xF];
-  out[2] = hex[(token >> 4) & 0xF];
-  out[3] = hex[token & 0xF];
-  out[4] = 0;
-}
-
-static int hexNibble(char c) {
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
-  if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
-  return -1;
-}
-
-BotWriteResult prependRequestToken(BotFingerprint request_fingerprint, char* text, size_t text_len, size_t buf_len,
-                                   size_t* new_len) {
-  if (new_len) *new_len = text_len;
-  if (!text || buf_len == 0) return BOT_WRITE_NO_SPACE;
-  if (text_len + 7 + 1 > buf_len) {
-    // No room for "[XXXX] " prefix + null terminator without dropping content.
-    return BOT_WRITE_NO_SPACE;
-  }
-  char hex[5];
-  formatRequestToken(requestToken(request_fingerprint), hex);
-  memmove(text + 7, text, text_len);
-  text[0] = '[';
-  text[1] = hex[0];
-  text[2] = hex[1];
-  text[3] = hex[2];
-  text[4] = hex[3];
-  text[5] = ']';
-  text[6] = ' ';
-  size_t total = text_len + 7;
-  if (total < buf_len) text[total] = 0;
-  if (new_len) *new_len = total;
-  return BOT_WRITE_OK;
-}
 
 }

@@ -15,7 +15,6 @@
 #include "EmergencyForwarder.h"
 #include "FirmwareBot.h"
 #include "KnownBotRegistry.h"
-#include "ResponseCoordinator.h"
 #endif
 
 #define CMD_APP_START                 1
@@ -635,7 +634,8 @@ void MyMesh::onContactsFull() {
 
 void MyMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path_len, const uint8_t* path) {
 #if CMESH_BOT_ENABLED
-  if ((path_len & 63) == 0) {
+  // A bot neighbor is a repeater whose advert was received directly.
+  if (contact.type == ADV_TYPE_REPEATER && (path_len & 63) == 0) {
     float rssi = radio_driver.getLastRSSI();
     if (rssi > 32767.0f) rssi = 32767.0f;
     if (rssi < -32768.0f) rssi = -32768.0f;
@@ -883,8 +883,6 @@ void MyMesh::printBotPrefs() {
   Serial.printf("  > bot %s\n", bot_prefs.enabled ? "enabled" : "disabled");
   Serial.printf("  > channels bot=%s testing=%s emergency=%s public=%s\n", bot_prefs.bot_channel,
                 bot_prefs.testing_channel, bot_prefs.emergency_channel, bot_prefs.public_channel);
-  Serial.printf("  > delay base=%u jitter=%u hop=%u\n", (unsigned)bot_prefs.normal_delay_ms,
-                (unsigned)bot_prefs.normal_jitter_ms, (unsigned)bot_prefs.hop_step_ms);
   Serial.printf("  > advert local=%lu flood=%lu\n", (unsigned long)bot_prefs.local_advert_interval_ms,
                 (unsigned long)bot_prefs.flood_advert_interval_ms);
 }
@@ -904,10 +902,7 @@ bool MyMesh::handleBotCLI(const char *args) {
   }
   if (strcmp(args, "disable") == 0) {
     bot_prefs.enabled = false;
-    ResponseCoordinator::clear(bot_coordinator_pending, BOT_COORDINATOR_PENDING_SLOTS);
-    memset(pending_bot_responses, 0, sizeof(pending_bot_responses));
     memset(&pending_bot_dm_ack, 0, sizeof(pending_bot_dm_ack));
-    memset(pending_bot_traces, 0, sizeof(pending_bot_traces));
     applyBotPrefs();
     printBotPrefsSaveResult("  > bot disabled", saveBotPrefs());
     return true;
@@ -941,32 +936,6 @@ bool MyMesh::handleBotCLI(const char *args) {
       }
     } else {
       Serial.println("  Error: usage bot channels <bot> <testing> <emergency> <public>");
-    }
-    return true;
-  }
-  if (memcmp(args, "delay ", 6) == 0) {
-    const char *pos = args + 6;
-    uint32_t base = 0;
-    uint32_t jitter = 0;
-    uint32_t hop = 0;
-    if (botParseU32(pos, &base, &pos)) {
-      botSkipSpaces(&pos);
-      if (botParseU32(pos, &jitter, &pos)) {
-        botSkipSpaces(&pos);
-        if (botParseU32(pos, &hop, &pos) && *pos == 0 && base <= BOT_PREFS_MAX_DELAY_MILLIS &&
-            jitter <= BOT_PREFS_MAX_DELAY_MILLIS && hop > 0 && hop <= BOT_HOP_STEP_MILLIS_MAX) {
-          bot_prefs.normal_delay_ms = (uint16_t)base;
-          bot_prefs.normal_jitter_ms = (uint16_t)jitter;
-          bot_prefs.hop_step_ms = (uint16_t)hop;
-          printBotPrefsSaveResult("  > bot delay saved", saveBotPrefs());
-        } else {
-          Serial.println("  Error: usage bot delay <base_ms> <jitter_ms> <hop_ms>");
-        }
-      } else {
-        Serial.println("  Error: usage bot delay <base_ms> <jitter_ms> <hop_ms>");
-      }
-    } else {
-      Serial.println("  Error: usage bot delay <base_ms> <jitter_ms> <hop_ms>");
     }
     return true;
   }
@@ -1059,10 +1028,10 @@ bool MyMesh::handleBotCLI(const char *args) {
     return true;
   }
   if (strcmp(args, "stats") == 0) {
-    Serial.printf("  > observed=%lu ignored=%lu eligible=%lu sent=%lu failed=%lu suppressed=%lu emergency=%lu/%lu\n",
+    Serial.printf("  > observed=%lu ignored=%lu eligible=%lu sent=%lu failed=%lu emergency=%lu/%lu\n",
                   (unsigned long)bot_stats.observed_messages, (unsigned long)bot_stats.ignored_messages,
                   (unsigned long)bot_stats.eligible_messages, (unsigned long)bot_stats.sent_messages,
-                  (unsigned long)bot_stats.send_failures, (unsigned long)bot_stats.suppressed_responses,
+                  (unsigned long)bot_stats.send_failures,
                   (unsigned long)bot_stats.emergency_forwards, (unsigned long)bot_stats.emergency_forward_failures);
     Serial.printf("  > prefs load_failures=%lu save_failures=%lu\n", (unsigned long)bot_prefs.prefs_load_failures,
                   (unsigned long)bot_prefs.prefs_save_failures);
@@ -1088,12 +1057,6 @@ void MyMesh::observeBotDirectMessage(const ContactInfo &from, uint32_t sender_ti
   message.sender_timestamp = sender_timestamp;
   message.received_at_timestamp = getRTCClock()->getCurrentTime();
   message.packet_snr_quarters = packet ? (int8_t)(packet->getSNR() * 4) : (int8_t)0;
-  if (packet && packet->getPathHashCount() == 0) {
-    float rssi = radio_driver.getLastRSSI();
-    if (rssi > 32767.0f) rssi = 32767.0f;
-    if (rssi < -32768.0f) rssi = -32768.0f;
-    recordBotNeighbor(from.id.pub_key, (int16_t)rssi, (int8_t)(packet->getSNR() * 4));
-  }
   if (packet && packet->isRouteFlood() && packet->path_len <= 0xFF && mesh::Packet::isValidPathLen((uint8_t)packet->path_len)) {
     message.path_len = (uint8_t)packet->path_len;
     message.path_hash_size = packet->getPathHashSize();
@@ -1154,8 +1117,6 @@ void MyMesh::buildBotCommandContext(BotCommandContext &context, BotCommandId com
   context.eligible_messages = bot_stats.eligible_messages;
   context.sent_messages = bot_stats.sent_messages;
   context.send_failures = bot_stats.send_failures;
-  context.suppressed_responses = bot_stats.suppressed_responses;
-  context.pending_responses = bot_stats.pending_responses;
   context.emergency_forwards = bot_stats.emergency_forwards;
   context.emergency_forward_failures = bot_stats.emergency_forward_failures;
   if (command_id == BOT_COMMAND_STATUS || command_id == BOT_COMMAND_STATS) {
@@ -1174,7 +1135,7 @@ void MyMesh::buildBotCommandContext(BotCommandContext &context, BotCommandId com
     StrHelper::strzcpy(context.firmware_build_date, FIRMWARE_BUILD_DATE, sizeof(context.firmware_build_date));
   }
   if (command_id == BOT_COMMAND_STATUS || command_id == BOT_COMMAND_STATS ||
-      command_id == BOT_COMMAND_SIG || command_id == BOT_COMMAND_AIR) {
+      command_id == BOT_COMMAND_TEST || command_id == BOT_COMMAND_SIG || command_id == BOT_COMMAND_AIR) {
     context.queue_depth = (uint8_t)_mgr->getOutboundTotal();
     context.noise_floor = (int16_t)_radio->getNoiseFloor();
     context.last_rssi = (int8_t)radio_driver.getLastRSSI();
@@ -1191,42 +1152,6 @@ void MyMesh::buildBotCommandContext(BotCommandContext &context, BotCommandId com
   }
 }
 
-bool MyMesh::enqueueBotResponse(const BotMessage &message, const ContactInfo *direct_recipient, uint8_t channel_idx,
-                                const char *text, size_t text_len, BotFingerprint request_fingerprint,
-                                BotFingerprint response_fingerprint) {
-  size_t slot = BOT_PENDING_RESPONSE_SLOTS;
-  for (size_t i = 0; i < BOT_PENDING_RESPONSE_SLOTS; i++) {
-    if (pending_bot_responses[i].active && pending_bot_responses[i].request_fingerprint.value == request_fingerprint.value) {
-      slot = i;
-      break;
-    }
-    if (slot == BOT_PENDING_RESPONSE_SLOTS && !pending_bot_responses[i].active) slot = i;
-  }
-  if (slot == BOT_PENDING_RESPONSE_SLOTS) return false;
-
-  PendingBotResponse *pending = &pending_bot_responses[slot];
-  pending->direct = message.channel_kind == BOT_CHANNEL_DM;
-  if (pending->direct) {
-    if (!direct_recipient) return false;
-    memcpy(pending->recipient_pub_key, direct_recipient->id.pub_key, sizeof(pending->recipient_pub_key));
-  } else {
-    memset(pending->recipient_pub_key, 0, sizeof(pending->recipient_pub_key));
-  }
-  pending->channel_idx = channel_idx;
-  pending->request_fingerprint = request_fingerprint;
-  pending->response_fingerprint = response_fingerprint;
-  if (!botFormatResponseForChannel(message, text, text_len, pending->text, sizeof(pending->text), &pending->text_len)) {
-    return false;
-  }
-  // Prefix every bot response with the request token so peer bots can correlate
-  // their pending response to ours (their response text may differ from ours when
-  // the command includes per-bot data like hop count, SNR, recv time, etc.).
-  FirmwareBot::prependRequestToken(request_fingerprint, pending->text, pending->text_len, sizeof(pending->text),
-                                    &pending->text_len);
-  pending->active = true;
-  return true;
-}
-
 bool MyMesh::findBotChannel(BotChannelKind kind, uint8_t &channel_idx) {
   for (uint8_t i = 0; i < MAX_GROUP_CHANNELS; i++) {
     ChannelDetails channel;
@@ -1239,6 +1164,35 @@ bool MyMesh::findBotChannel(BotChannelKind kind, uint8_t &channel_idx) {
     }
   }
   return false;
+}
+
+BotCommandResult MyMesh::executeBotHelloCommand(const BotMessage &message, char *output, size_t output_len) {
+  uint32_t now = getRTCClock()->getCurrentTime();
+  const char *target = message.sender_name[0] ? message.sender_name : NULL;
+
+  const char *greeting = "Hello";
+
+  if (now != 0) {
+    int64_t adjusted = (int64_t)now +
+                       (int64_t)FirmwareBot::easternUtcOffsetSeconds(now);
+    uint32_t seconds_of_day =
+        (uint32_t)((adjusted % 86400LL + 86400LL) % 86400LL);
+    uint8_t hour = (uint8_t)(seconds_of_day / 3600UL);
+
+    if (hour < 12) {
+      greeting = "Good Morning";
+    } else if (hour < 18) {
+      greeting = "Good Afternoon";
+    } else {
+      greeting = "Good Evening";
+    }
+  }
+
+  if (target) {
+    return botWriteFormatted(output, output_len, "%s @[%s]", greeting, target);
+  }
+
+  return botWriteText(output, output_len, greeting);
 }
 
 BotCommandResult MyMesh::executeBotTimeCommand(const BotMessage &message, char *output, size_t output_len) {
@@ -1325,15 +1279,15 @@ void MyMesh::recordBotNeighbor(const uint8_t *pub_key, int16_t rssi_dbm, int8_t 
 }
 
 BotCommandResult MyMesh::executeBotNeighborsCommand(const BotMessage &message, char *output, size_t output_len) {
-  uint32_t now = _ms->getMillis();
-  const char *target = message.sender_name[0] ? message.sender_name : NULL;
+  // Build only as large as this channel can actually transmit.
+  size_t response_limit = FirmwareBot::maxResponseLenForChannel(message.channel_kind);
+  if (response_limit + 1 < output_len) output_len = response_limit + 1;
 
-  // Build sorted index by recency.
+  // Build index sorted by most recently heard.
   uint8_t idx[BOT_NEIGHBOR_SLOTS];
   uint8_t count = 0;
   for (size_t i = 0; i < BOT_NEIGHBOR_SLOTS; i++) {
     if (!bot_neighbors[i].active) continue;
-    if ((int32_t)(now - bot_neighbors[i].last_heard_millis) > (int32_t)BOT_NEIGHBOR_RECENT_MILLIS) continue;
     idx[count++] = (uint8_t)i;
   }
   for (uint8_t a = 0; a + 1 < count; a++) {
@@ -1347,19 +1301,13 @@ BotCommandResult MyMesh::executeBotNeighborsCommand(const BotMessage &message, c
   }
 
   if (count == 0) {
-    if (target) return botWriteFormatted(output, output_len, "@[%s]: none heard recently", target);
-    return botWriteText(output, output_len, "Neighbors: none heard recently");
+    return botWriteText(output, output_len, "No repeaters heard directly");
   }
 
   if (!output || output_len == 0) return botCommandResult(BOT_COMMAND_RESULT_NO_SPACE, 0);
   output[0] = 0;
-  int header_n = target
-                     ? snprintf(output, output_len, "@[%s]: ", target)
-                     : snprintf(output, output_len, "Neighbors: ");
-  if (header_n < 0) return botCommandResult(BOT_COMMAND_RESULT_NO_SPACE, 0);
-  size_t pos = (size_t)header_n;
-  bool truncated = pos >= output_len;
-  if (truncated) pos = output_len - 1;
+  size_t pos = 0;
+  bool truncated = false;
 
   for (uint8_t k = 0; k < count; k++) {
     const BotNeighbor &n = bot_neighbors[idx[k]];
@@ -1388,7 +1336,6 @@ BotCommandResult MyMesh::executeBotNeighborsCommand(const BotMessage &message, c
     size_t entry_len = (size_t)entry_n;
     size_t available = pos + 1 < output_len ? output_len - 1 - pos : 0;
     if (entry_len > available) {
-      truncated = true;
       break;
     }
     memcpy(&output[pos], entry, entry_len);
@@ -1397,305 +1344,6 @@ BotCommandResult MyMesh::executeBotNeighborsCommand(const BotMessage &message, c
   }
 
   return botCommandResult(truncated ? BOT_COMMAND_RESULT_TRUNCATED : BOT_COMMAND_RESULT_OK, pos);
-}
-
-bool MyMesh::dispatchBotTraceDirectLink(const BotMessage &message, const ContactInfo *direct_recipient,
-                                        uint8_t channel_idx, const BotCommand &command) {
-  char snr_str[8];
-  botFormatQuarters(message.packet_snr_quarters, snr_str, sizeof(snr_str));
-  const char *target = message.sender_name[0] ? message.sender_name : NULL;
-  char response[BOT_MAX_RESPONSE_LEN + 1];
-  int written =
-      target ? snprintf(response, sizeof(response), "Trace @[%s] direct link, SNR %s (no repeaters to trace)", target,
-                       snr_str)
-             : snprintf(response, sizeof(response), "Trace direct link, SNR %s (no repeaters to trace)", snr_str);
-  if (written < 0) return false;
-  size_t response_len = (size_t)written;
-  if (response_len >= sizeof(response)) response_len = sizeof(response) - 1;
-
-  char final_response[BOT_MAX_RESPONSE_LEN + 1];
-  size_t final_response_len = 0;
-  if (!botFormatResponseForChannel(message, response, response_len, final_response, sizeof(final_response),
-                                   &final_response_len)) {
-    bot_stats.send_failures++;
-    return true;
-  }
-
-  BotFingerprint request_fingerprint = FirmwareBot::fingerprintFor(message);
-  uint32_t now = _ms->getMillis();
-  if (!direct_recipient && ResponseCoordinator::recentlyAnswered(bot_coordinator_recent, BOT_COORDINATOR_RECENT_SLOTS,
-                                                                 FirmwareBot::requestToken(request_fingerprint), now)) {
-    bot_stats.suppressed_responses++;
-    return true;
-  }
-  BotFingerprint response_fingerprint =
-      FirmwareBot::responseFingerprintFor(message, final_response, final_response_len);
-  BotFingerprint fingerprint;
-  uint32_t due_at_millis = 0;
-  uint32_t bot_identity_seed;
-  memcpy(&bot_identity_seed, self_id.pub_key, sizeof(bot_identity_seed));
-  uint32_t jitter_seed = (uint32_t)request_fingerprint.value ^ bot_identity_seed;
-  if (jitter_seed == 0) jitter_seed = 1;
-  uint8_t queue_depth = (uint8_t)_mgr->getOutboundTotal();
-  BotCoordinatorScheduleResult schedule = ResponseCoordinator::schedule(
-      bot_coordinator_pending, BOT_COORDINATOR_PENDING_SLOTS, message, command.id, request_fingerprint,
-      response_fingerprint, now, jitter_seed, bot_identity_seed, queue_depth, bot_prefs.normal_delay_ms,
-      bot_prefs.normal_jitter_ms, bot_prefs.hop_step_ms, &fingerprint, &due_at_millis);
-  if (schedule == BOT_COORDINATOR_NO_SPACE || schedule == BOT_COORDINATOR_NOT_NORMAL) {
-    bot_stats.send_failures++;
-    return true;
-  }
-
-  bot_stats.eligible_messages++;
-  bot_stats.pending_responses++;
-  FirmwareBot::recordCommandCooldown(bot_command_cooldowns, BOT_COMMAND_COOLDOWN_SLOTS, command.id, now,
-                                     BOT_TRACE_COOLDOWN_MILLIS);
-  if (!enqueueBotResponse(message, direct_recipient, channel_idx, final_response, final_response_len, fingerprint,
-                          response_fingerprint)) {
-    ResponseCoordinator::cancel(bot_coordinator_pending, BOT_COORDINATOR_PENDING_SLOTS, fingerprint);
-    bot_stats.send_failures++;
-  }
-  return true;
-}
-
-bool MyMesh::handleBotTraceCommand(const BotMessage &message, const ContactInfo *direct_recipient, uint8_t channel_idx,
-                                   const BotCommand &command) {
-  uint8_t hash_size = command.args_len > 0 ? botConfiguredTraceHashSize(_prefs.path_hash_mode) : message.path_hash_size;
-  if (hash_size == 0) hash_size = botConfiguredTraceHashSize(_prefs.path_hash_mode);
-  uint8_t flags = 0;
-  if (!botTraceFlagForHashSize(hash_size, &flags)) return false;
-
-  if (command.args_len == 0 && message.path_hash_size == hash_size && message.path_hash_count == 0) {
-    return dispatchBotTraceDirectLink(message, direct_recipient, channel_idx, command);
-  }
-
-  uint8_t path[BOT_MAX_PATH_BYTES];
-  uint8_t path_len = 0;
-  bool have_path = false;
-  bool append_self = false;
-  if (command.args_len > 0) {
-    have_path = botParseTraceHexPath(command, flags, path, &path_len);
-  } else if (message.path_hash_size == hash_size) {
-    uint8_t raw_len = (uint8_t)(message.path_hash_count * hash_size);
-    if (botTracePathShapeValid(raw_len, flags)) {
-      if (raw_len > 0) {
-        if (!message.path) return false;
-        if (message.channel_kind == BOT_CHANNEL_DM) {
-          memcpy(path, message.path, raw_len);
-        } else {
-          botCopyReversedPath(path, message.path, message.path_hash_count, hash_size);
-        }
-        append_self = true;
-      }
-      path_len = raw_len;
-      have_path = true;
-    }
-  }
-
-  if (append_self && path_len >= hash_size) {
-    // Replace the final hop (the contact, who is typically a non-forwarding chat node)
-    // with the bot's own hash so the trace round-trips through the repeaters and
-    // onTraceRecv fires locally on the bot.
-    memcpy(&path[path_len - hash_size], self_id.pub_key, hash_size);
-  }
-  if (!have_path || !botTracePathShapeValid(path_len, flags)) return false;
-
-  BotFingerprint request_fingerprint = FirmwareBot::fingerprintFor(message);
-  if (!direct_recipient && ResponseCoordinator::recentlyAnswered(bot_coordinator_recent, BOT_COORDINATOR_RECENT_SLOTS,
-                                                                 FirmwareBot::requestToken(request_fingerprint), _ms->getMillis())) {
-    bot_stats.suppressed_responses++;
-    return true;
-  }
-  char response[BOT_MAX_RESPONSE_LEN + 1];
-  size_t response_len = botFormatTraceSent(response, sizeof(response), (uint8_t)(path_len / hash_size));
-  char final_response[BOT_MAX_RESPONSE_LEN + 1];
-  size_t final_response_len = 0;
-  if (!botFormatResponseForChannel(message, response, response_len, final_response, sizeof(final_response),
-                                   &final_response_len)) {
-    bot_stats.send_failures++;
-    return true;
-  }
-  BotFingerprint response_fingerprint = FirmwareBot::responseFingerprintFor(message, final_response, final_response_len);
-  BotFingerprint fingerprint;
-  uint32_t due_at_millis = 0;
-  uint32_t now = _ms->getMillis();
-  uint32_t bot_identity_seed;
-  memcpy(&bot_identity_seed, self_id.pub_key, sizeof(bot_identity_seed));
-  uint32_t jitter_seed = (uint32_t)request_fingerprint.value ^ bot_identity_seed;
-  if (jitter_seed == 0) jitter_seed = 1;
-  uint8_t queue_depth = (uint8_t)_mgr->getOutboundTotal();
-  BotCoordinatorScheduleResult schedule = ResponseCoordinator::schedule(bot_coordinator_pending, BOT_COORDINATOR_PENDING_SLOTS,
-                                                                        message, command.id, request_fingerprint,
-                                                                        response_fingerprint, now, jitter_seed,
-                                                                        bot_identity_seed, queue_depth, bot_prefs.normal_delay_ms,
-                                                                        bot_prefs.normal_jitter_ms, bot_prefs.hop_step_ms,
-                                                                        &fingerprint, &due_at_millis);
-  if (schedule == BOT_COORDINATOR_NO_SPACE || schedule == BOT_COORDINATOR_NOT_NORMAL) {
-    bot_stats.send_failures++;
-    return true;
-  }
-
-  uint32_t tag = getRTCClock()->getCurrentTimeUnique();
-  uint32_t auth_code = 0;
-  getRNG()->random((uint8_t *)&auth_code, sizeof(auth_code));
-  if (auth_code == 0) auth_code = tag ^ 0x54435245UL;
-
-  bot_stats.eligible_messages++;
-  bot_stats.pending_responses++;
-  FirmwareBot::recordCommandCooldown(bot_command_cooldowns, BOT_COMMAND_COOLDOWN_SLOTS, command.id, now,
-                                     BOT_TRACE_COOLDOWN_MILLIS);
-  if (!enqueueBotTrace(message, direct_recipient, channel_idx, path, path_len, flags, fingerprint, response_fingerprint, tag,
-                       auth_code)) {
-    ResponseCoordinator::cancel(bot_coordinator_pending, BOT_COORDINATOR_PENDING_SLOTS, fingerprint);
-    bot_stats.send_failures++;
-  }
-  return true;
-}
-
-bool MyMesh::enqueueBotTrace(const BotMessage &message, const ContactInfo *direct_recipient, uint8_t channel_idx,
-                             const uint8_t *path, uint8_t path_len, uint8_t flags,
-                             BotFingerprint request_fingerprint, BotFingerprint response_fingerprint, uint32_t tag,
-                             uint32_t auth_code) {
-  if ((path_len > 0 && !path) || !botTracePathShapeValid(path_len, flags)) return false;
-
-  size_t slot = BOT_PENDING_TRACE_SLOTS;
-  for (size_t i = 0; i < BOT_PENDING_TRACE_SLOTS; i++) {
-    if (pending_bot_traces[i].active && pending_bot_traces[i].request_fingerprint.value == request_fingerprint.value) {
-      slot = i;
-      break;
-    }
-    if (slot == BOT_PENDING_TRACE_SLOTS && !pending_bot_traces[i].active) slot = i;
-  }
-  if (slot == BOT_PENDING_TRACE_SLOTS) return false;
-
-  PendingBotTrace *pending = &pending_bot_traces[slot];
-  memset(pending, 0, sizeof(*pending));
-  pending->direct = message.channel_kind == BOT_CHANNEL_DM;
-  if (pending->direct) {
-    if (!direct_recipient) return false;
-    memcpy(pending->recipient_pub_key, direct_recipient->id.pub_key, sizeof(pending->recipient_pub_key));
-  }
-  pending->channel_idx = channel_idx;
-  pending->channel_kind = message.channel_kind;
-  StrHelper::strzcpy(pending->channel_name, message.channel_name, sizeof(pending->channel_name));
-  StrHelper::strzcpy(pending->target_name, message.sender_name, sizeof(pending->target_name));
-  memcpy(pending->sender_key_prefix, message.sender_key_prefix, sizeof(pending->sender_key_prefix));
-  pending->sender_key_prefix_len = message.sender_key_prefix_len;
-  pending->request_fingerprint = request_fingerprint;
-  pending->response_fingerprint = response_fingerprint;
-  pending->tag = tag;
-  pending->auth_code = auth_code;
-  pending->flags = flags;
-  pending->path_len = path_len;
-  if (path_len > 0) memcpy(pending->path, path, path_len);
-  pending->active = true;
-  return true;
-}
-
-BotFingerprint MyMesh::traceResponseFingerprintFor(const PendingBotTrace &pending, const char *text, size_t text_len) {
-  BotMessage message;
-  memset(&message, 0, sizeof(message));
-  message.channel_kind = pending.channel_kind;
-  StrHelper::strzcpy(message.channel_name, pending.channel_name, sizeof(message.channel_name));
-  memcpy(message.sender_key_prefix, pending.sender_key_prefix, sizeof(message.sender_key_prefix));
-  message.sender_key_prefix_len = pending.sender_key_prefix_len;
-  return FirmwareBot::responseFingerprintFor(message, text, text_len);
-}
-
-bool MyMesh::sendBotTraceText(const PendingBotTrace &pending, const char *text, size_t text_len,
-                              BotFingerprint response_fingerprint, uint32_t now_millis) {
-  // Prefix with the request token so peer bots can correlate this trace result
-  // back to their own pending trace for the same request and suppress duplicates.
-  char tokened[BOT_MAX_RESPONSE_LEN + 1];
-  size_t tokened_len = text_len;
-  if (tokened_len > BOT_MAX_RESPONSE_LEN) tokened_len = BOT_MAX_RESPONSE_LEN;
-  if (tokened_len > 0) memcpy(tokened, text, tokened_len);
-  tokened[tokened_len] = 0;
-  FirmwareBot::prependRequestToken(pending.request_fingerprint, tokened, tokened_len, sizeof(tokened), &tokened_len);
-  const char *send_text = tokened;
-  size_t send_len = tokened_len;
-
-  bool success = false;
-  if (pending.direct) {
-    ContactInfo *recipient = lookupContactByPubKey(pending.recipient_pub_key, PUB_KEY_SIZE);
-    if (recipient) {
-      uint32_t expected_ack = 0;
-      uint32_t est_timeout = 0;
-      uint32_t timestamp = getRTCClock()->getCurrentTimeUnique();
-      int result = sendMessage(*recipient, timestamp, 0, send_text, expected_ack, est_timeout);
-      success = result != MSG_SEND_FAILED;
-      if (success && expected_ack) {
-        expected_ack_table[next_ack_idx].msg_sent = _ms->getMillis();
-        expected_ack_table[next_ack_idx].ack = expected_ack;
-        expected_ack_table[next_ack_idx].contact = recipient;
-        next_ack_idx = (next_ack_idx + 1) % EXPECTED_ACK_TABLE_SIZE;
-      }
-    }
-  } else if (pending.channel_idx != 0xFF) {
-    success = sendBotGroupMessage(pending.channel_idx, send_text, send_len);
-  }
-
-  if (success) {
-    bot_stats.sent_messages++;
-    ResponseCoordinator::recordRecent(bot_coordinator_recent, BOT_COORDINATOR_RECENT_SLOTS, response_fingerprint,
-                                      now_millis);
-    if (!pending.direct) {
-      ResponseCoordinator::recordRequestToken(bot_coordinator_recent, BOT_COORDINATOR_RECENT_SLOTS,
-                                              FirmwareBot::requestToken(pending.request_fingerprint), now_millis);
-    }
-  } else {
-    bot_stats.send_failures++;
-  }
-  return success;
-}
-
-bool MyMesh::sendPendingBotTrace(PendingBotTrace &pending, uint32_t now_millis) {
-  mesh::Packet *pkt = createTrace(pending.tag, pending.auth_code, pending.flags);
-  if (!pkt) return false;
-
-  sendDirect(pkt, pending.path, pending.path_len);
-  pending.sent = true;
-  pending.expires_at_millis = now_millis + BOT_TRACE_TIMEOUT_MILLIS;
-  ResponseCoordinator::recordRecent(bot_coordinator_recent, BOT_COORDINATOR_RECENT_SLOTS,
-                                    pending.response_fingerprint, now_millis);
-  return true;
-}
-
-void MyMesh::expirePendingBotTraces(uint32_t now_millis) {
-  for (size_t i = 0; i < BOT_PENDING_TRACE_SLOTS; i++) {
-    PendingBotTrace *pending = &pending_bot_traces[i];
-    if (!pending->active || !pending->sent || (int32_t)(now_millis - pending->expires_at_millis) < 0) continue;
-
-    char response[BOT_MAX_RESPONSE_LEN + 1];
-    uint8_t hash_size = botTraceHashSize(pending->flags);
-    uint8_t hop_count = hash_size > 0 ? (uint8_t)(pending->path_len / hash_size) : 0;
-    bool has_target = pending->target_name[0] != 0;
-    if (hop_count == 0) {
-      if (has_target) {
-        snprintf(response, sizeof(response), "Trace @[%s] %08lx timed out, no reply on direct zero-hop route",
-                 pending->target_name, (unsigned long)pending->tag);
-      } else {
-        snprintf(response, sizeof(response), "Trace %08lx timed out, no reply on direct zero-hop route",
-                 (unsigned long)pending->tag);
-      }
-    } else {
-      if (has_target) {
-        snprintf(response, sizeof(response), "Trace @[%s] %08lx timed out, no reply on %u-hop route",
-                 pending->target_name, (unsigned long)pending->tag, (unsigned)hop_count);
-      } else {
-        snprintf(response, sizeof(response), "Trace %08lx timed out, no reply on %u-hop route",
-                 (unsigned long)pending->tag, (unsigned)hop_count);
-      }
-    }
-    char final_response[BOT_MAX_RESPONSE_LEN + 1];
-    size_t final_response_len = 0;
-    if (botFormatResponseForChannelKind(pending->channel_kind, response, botBoundedStrLen(response, BOT_MAX_RESPONSE_LEN + 1),
-                                        final_response, sizeof(final_response), &final_response_len)) {
-      BotFingerprint response_fingerprint = traceResponseFingerprintFor(*pending, final_response, final_response_len);
-      sendBotTraceText(*pending, final_response, final_response_len, response_fingerprint, now_millis);
-    }
-    pending->active = false;
-  }
 }
 
 bool MyMesh::enqueueEmergencyForward(const BotMessage &message) {
@@ -1724,48 +1372,6 @@ bool MyMesh::enqueueEmergencyForward(const BotMessage &message) {
   return true;
 }
 
-bool MyMesh::observeKnownBotResponse(const BotMessage &message, bool authoritative_sender) {
-  if (!authoritative_sender || message.channel_kind != BOT_CHANNEL_DM) return false;
-  if (!KnownBotRegistry::canSuppressNormal(known_bot_entries, BOT_KNOWN_BOT_SLOTS, message.sender_key_prefix,
-                                           message.sender_key_prefix_len)) return false;
-
-  bot_stats.known_bot_messages++;
-  BotFingerprint fingerprint = FirmwareBot::responseFingerprintFor(message, message.text, message.text_len);
-  if (ResponseCoordinator::recentlySent(bot_coordinator_recent, BOT_COORDINATOR_RECENT_SLOTS, fingerprint, _ms->getMillis())) {
-    return true;
-  }
-  if (ResponseCoordinator::suppress(bot_coordinator_pending, BOT_COORDINATOR_PENDING_SLOTS, fingerprint)) {
-    return true;
-  }
-  return false;
-}
-
-bool MyMesh::observeBotGroupResponse(const BotMessage &message) {
-  if (!BotPolicy::isPrefixlessCommandAllowed(message.channel_kind)) return false;
-
-  // If the incoming channel message carries a request token from a peer bot,
-  // suppress our own pending response for that same request even when the
-  // response text differs (hop count, SNR, recv time, etc.).
-  uint16_t token = 0;
-  size_t token_prefix_len = 0;
-  bool token_suppressed = false;
-  if (FirmwareBot::parseRequestTokenPrefix(message.text, message.text_len, &token, &token_prefix_len)) {
-    ResponseCoordinator::recordRequestToken(bot_coordinator_recent, BOT_COORDINATOR_RECENT_SLOTS, token, _ms->getMillis());
-    if (ResponseCoordinator::suppressByRequestToken(bot_coordinator_pending, BOT_COORDINATOR_PENDING_SLOTS, token)) {
-      token_suppressed = true;
-    }
-  }
-
-  BotFingerprint fingerprint = FirmwareBot::responseFingerprintFor(message, message.text, message.text_len);
-  if (ResponseCoordinator::recentlySent(bot_coordinator_recent, BOT_COORDINATOR_RECENT_SLOTS, fingerprint, _ms->getMillis())) {
-    return true;
-  }
-  if (ResponseCoordinator::suppress(bot_coordinator_pending, BOT_COORDINATOR_PENDING_SLOTS, fingerprint)) {
-    return true;
-  }
-  return token_suppressed;
-}
-
 void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *direct_recipient, uint8_t channel_idx) {
   bot_stats.observed_messages++;
   BotPolicyDecision decision = BotPolicy::decide(message.channel_kind);
@@ -1784,10 +1390,6 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
     return;
   }
 
-  if (observeKnownBotResponse(message, direct_recipient != NULL)) return;
-  if (!direct_recipient && observeBotGroupResponse(message)) return;
-  sendQueuedBotResponses();
-
   BotCommand command;
   if (!FirmwareBot::parseCommand(message.text, message.text_len, &command,
                                  BotPolicy::isPrefixlessCommandAllowed(message.channel_kind))) {
@@ -1804,22 +1406,14 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
   char response[BOT_MAX_RESPONSE_LEN + 1];
   BotCommandResult result;
   bool result_ready = false;
-  if (command.id == BOT_COMMAND_TRACE) {
-    if (handleBotTraceCommand(message, direct_recipient, channel_idx, command)) {
-      return;
-    }
-    if (command.args_len > 0) {
-      result = botWriteFormatted(response, sizeof(response), "Usage: trace [path]");
-      result_ready = true;
-    }
-  }
-
   BotCommandContext context;
   buildBotCommandContext(context, command.id);
+  context.received_at_timestamp = message.received_at_timestamp;
   if (message.sender_name[0]) {
     StrHelper::strzcpy(context.response_target, message.sender_name, sizeof(context.response_target));
   }
-  if (command.id == BOT_COMMAND_PATH || command.id == BOT_COMMAND_TRACE ||
+  if (command.id == BOT_COMMAND_PATH ||
+      command.id == BOT_COMMAND_TEST ||
       command.id == BOT_COMMAND_SIG) {
     context.path_len = message.path_len;
     context.path_hash_size = command.args_len > 0 ? botConfiguredTraceHashSize(_prefs.path_hash_mode) : message.path_hash_size;
@@ -1829,16 +1423,9 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
   }
   if (!result_ready) {
     switch (command.id) {
-      case BOT_COMMAND_TEST: {
-        size_t written = 0;
-        BotWriteResult write_result = FirmwareBot::writeAckResponse(message, command, response, sizeof(response), &written);
-        result.code = write_result == BOT_WRITE_NO_SPACE
-                          ? BOT_COMMAND_RESULT_NO_SPACE
-                          : (write_result == BOT_WRITE_TRUNCATED ? BOT_COMMAND_RESULT_TRUNCATED
-                                                                  : BOT_COMMAND_RESULT_OK);
-        result.text_len = written;
+      case BOT_COMMAND_HELLO:
+        result = executeBotHelloCommand(message, response, sizeof(response));
         break;
-      }
       case BOT_COMMAND_TIME:
         result = executeBotTimeCommand(message, response, sizeof(response));
         break;
@@ -1868,38 +1455,13 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
     return;
   }
 
-  BotFingerprint request_fingerprint = FirmwareBot::fingerprintFor(message);
-  if (!direct_recipient && ResponseCoordinator::recentlyAnswered(bot_coordinator_recent, BOT_COORDINATOR_RECENT_SLOTS,
-                                                                 FirmwareBot::requestToken(request_fingerprint), _ms->getMillis())) {
-    bot_stats.suppressed_responses++;
-    return;
-  }
-  BotFingerprint response_fingerprint = FirmwareBot::responseFingerprintFor(message, final_response, final_response_len);
-  BotFingerprint fingerprint;
-  uint32_t due_at_millis = 0;
-  uint32_t bot_identity_seed;
-  memcpy(&bot_identity_seed, self_id.pub_key, sizeof(bot_identity_seed));
-  uint32_t jitter_seed = (uint32_t)request_fingerprint.value ^ bot_identity_seed ^ context.random_seed;
-  if (jitter_seed == 0) jitter_seed = 1;
-  uint8_t queue_depth = (uint8_t)_mgr->getOutboundTotal();
-  BotCoordinatorScheduleResult schedule = ResponseCoordinator::schedule(bot_coordinator_pending, BOT_COORDINATOR_PENDING_SLOTS,
-                                                                        message, command.id, request_fingerprint,
-                                                                        response_fingerprint, _ms->getMillis(),
-                                                                        jitter_seed, bot_identity_seed,
-                                                                        queue_depth, bot_prefs.normal_delay_ms,
-                                                                        bot_prefs.normal_jitter_ms, bot_prefs.hop_step_ms,
-                                                                        &fingerprint, &due_at_millis);
-  if (schedule == BOT_COORDINATOR_NO_SPACE || schedule == BOT_COORDINATOR_NOT_NORMAL) {
-    bot_stats.send_failures++;
-    return;
-  }
-
   bot_stats.eligible_messages++;
-  bot_stats.pending_responses++;
-  FirmwareBot::recordCommandCooldown(bot_command_cooldowns, BOT_COMMAND_COOLDOWN_SLOTS, command.id, _ms->getMillis(),
+  FirmwareBot::recordCommandCooldown(bot_command_cooldowns, BOT_COMMAND_COOLDOWN_SLOTS,
+                                     command.id, _ms->getMillis(),
                                      BOT_COMMAND_COOLDOWN_MILLIS);
-  if (!enqueueBotResponse(message, direct_recipient, channel_idx, final_response, final_response_len, fingerprint, response_fingerprint)) {
-    ResponseCoordinator::cancel(bot_coordinator_pending, BOT_COORDINATOR_PENDING_SLOTS, fingerprint);
+
+  if (!sendBotResponse(message, direct_recipient, channel_idx,
+                       final_response, final_response_len)) {
     bot_stats.send_failures++;
   }
 }
@@ -1934,100 +1496,53 @@ bool MyMesh::sendBotGroupMessage(uint8_t channel_idx, const char *text, size_t t
                           _prefs.node_name, text, text_len);
 }
 
-void MyMesh::sendQueuedBotResponses() {
-  uint32_t now = _ms->getMillis();
-  while (true) {
-    BotCoordinatorReady ready = ResponseCoordinator::poll(bot_coordinator_pending, BOT_COORDINATOR_PENDING_SLOTS, now);
-    if (ready.result == BOT_COORDINATOR_READY_NONE) return;
-    if (ready.result == BOT_COORDINATOR_READY_SUPPRESSED) {
-      bot_stats.suppressed_responses++;
-    } else if (ready.result == BOT_COORDINATOR_READY_EXPIRED) {
-      bot_stats.expired_responses++;
+bool MyMesh::sendBotResponse(const BotMessage &message, const ContactInfo *direct_recipient,
+                             uint8_t channel_idx, const char *text, size_t text_len) {
+  if (message.channel_kind == BOT_CHANNEL_DM) {
+    if (!direct_recipient) return false;
+
+    uint32_t expected_ack = 0;
+    uint32_t est_timeout = 0;
+    uint32_t timestamp = getRTCClock()->getCurrentTimeUnique();
+
+    int result = sendMessage(*direct_recipient, timestamp, 0,
+                             text, expected_ack, est_timeout);
+
+    if (result == MSG_SEND_FAILED) return false;
+
+    if (expected_ack) {
+      expected_ack_table[next_ack_idx].msg_sent = _ms->getMillis();
+      expected_ack_table[next_ack_idx].ack = expected_ack;
+      expected_ack_table[next_ack_idx].contact =
+          const_cast<ContactInfo *>(direct_recipient);
+      next_ack_idx = (next_ack_idx + 1) % EXPECTED_ACK_TABLE_SIZE;
+
+      pending_bot_dm_ack.active = true;
+      memcpy(pending_bot_dm_ack.recipient_pub_key,
+             direct_recipient->id.pub_key,
+             sizeof(pending_bot_dm_ack.recipient_pub_key));
+      pending_bot_dm_ack.expected_ack = expected_ack;
+      pending_bot_dm_ack.timestamp = timestamp;
+      pending_bot_dm_ack.ack_deadline_millis =
+          futureMillis(est_timeout);
+      pending_bot_dm_ack.attempt = 0;
+      pending_bot_dm_ack.text_len = text_len;
+      memcpy(pending_bot_dm_ack.text, text, text_len);
+      pending_bot_dm_ack.text[text_len] = 0;
     }
 
-    PendingBotTrace *pending_trace = NULL;
-    for (size_t i = 0; i < BOT_PENDING_TRACE_SLOTS; i++) {
-      if (pending_bot_traces[i].active &&
-          pending_bot_traces[i].request_fingerprint.value == ready.request_fingerprint.value) {
-        pending_trace = &pending_bot_traces[i];
-        break;
-      }
-    }
-    if (pending_trace) {
-      if (ready.result == BOT_COORDINATOR_READY_SEND) {
-        if (!sendPendingBotTrace(*pending_trace, now)) pending_trace->active = false;
-      } else {
-        pending_trace->active = false;
-      }
-      continue;
-    }
-
-    PendingBotResponse *pending = NULL;
-    for (size_t i = 0; i < BOT_PENDING_RESPONSE_SLOTS; i++) {
-      if (pending_bot_responses[i].active && pending_bot_responses[i].request_fingerprint.value == ready.request_fingerprint.value) {
-        pending = &pending_bot_responses[i];
-        break;
-      }
-    }
-    if (!pending) continue;
-
-    if (ready.result != BOT_COORDINATOR_READY_SEND) {
-      pending->active = false;
-      continue;
-    }
-    if (!pending->direct && ResponseCoordinator::recentlyAnswered(bot_coordinator_recent, BOT_COORDINATOR_RECENT_SLOTS,
-                                                                  FirmwareBot::requestToken(ready.request_fingerprint), now)) {
-      bot_stats.suppressed_responses++;
-      pending->active = false;
-      continue;
-    }
-
-    bool success = false;
-    if (pending->direct) {
-      ContactInfo *recipient = lookupContactByPubKey(pending->recipient_pub_key, PUB_KEY_SIZE);
-      if (recipient) {
-        uint32_t expected_ack = 0;
-        uint32_t est_timeout = 0;
-        uint32_t timestamp = getRTCClock()->getCurrentTimeUnique();
-        int result = sendMessage(*recipient, timestamp, 0, pending->text, expected_ack, est_timeout);
-        success = result != MSG_SEND_FAILED;
-        if (success && expected_ack) {
-          expected_ack_table[next_ack_idx].msg_sent = _ms->getMillis();
-          expected_ack_table[next_ack_idx].ack = expected_ack;
-          expected_ack_table[next_ack_idx].contact = recipient;
-          next_ack_idx = (next_ack_idx + 1) % EXPECTED_ACK_TABLE_SIZE;
-
-          pending_bot_dm_ack.active = true;
-          memcpy(pending_bot_dm_ack.recipient_pub_key, recipient->id.pub_key,
-                 sizeof(pending_bot_dm_ack.recipient_pub_key));
-          pending_bot_dm_ack.expected_ack = expected_ack;
-          pending_bot_dm_ack.timestamp = timestamp;
-          pending_bot_dm_ack.ack_deadline_millis =
-              futureMillis(est_timeout);
-          pending_bot_dm_ack.attempt = 0;
-          pending_bot_dm_ack.text_len = pending->text_len;
-          memcpy(pending_bot_dm_ack.text, pending->text, pending->text_len);
-          pending_bot_dm_ack.text[pending->text_len] = 0;
-        }
-      }
-    } else if (pending->channel_idx != 0xFF) {
-      success = sendBotGroupMessage(pending->channel_idx,
-                                    pending->text, pending->text_len);
-    }
-
-    if (success) {
-      bot_stats.sent_messages++;
-      ResponseCoordinator::recordRecent(bot_coordinator_recent, BOT_COORDINATOR_RECENT_SLOTS,
-                                        pending->response_fingerprint, now);
-      if (!pending->direct) {
-        ResponseCoordinator::recordRequestToken(bot_coordinator_recent, BOT_COORDINATOR_RECENT_SLOTS,
-                                                FirmwareBot::requestToken(pending->request_fingerprint), now);
-      }
-    } else {
-      bot_stats.send_failures++;
-    }
-    pending->active = false;
+    bot_stats.sent_messages++;
+    return true;
   }
+
+  if (channel_idx == 0xFF) return false;
+
+  if (!sendBotGroupMessage(channel_idx, text, text_len)) {
+    return false;
+  }
+
+  bot_stats.sent_messages++;
+  return true;
 }
 
 void MyMesh::sendQueuedEmergencyForwards() {
@@ -2130,10 +1645,6 @@ void MyMesh::tickBot() {
   }
 
   sendQueuedEmergencyForwards();
-  if (bot_prefs.enabled) {
-    sendQueuedBotResponses();
-    expirePendingBotTraces(now);
-  }
   if (!bot_prefs.enabled) return;
   if (next_bot_local_advert && millisHasNowPassed(next_bot_local_advert)) {
     sendBotSelfAdvert(false);
@@ -2449,29 +1960,6 @@ void MyMesh::onTraceRecv(mesh::Packet *packet, uint32_t tag, uint32_t auth_code,
     MESH_DEBUG_PRINTLN("onTraceRecv(), data received while app offline");
   }
 
-#if CMESH_BOT_ENABLED
-  uint32_t now = _ms->getMillis();
-  for (size_t idx = 0; idx < BOT_PENDING_TRACE_SLOTS; idx++) {
-    PendingBotTrace *pending = &pending_bot_traces[idx];
-    if (!pending->active || !pending->sent || pending->tag != tag || pending->auth_code != auth_code) continue;
-
-    char response[BOT_MAX_RESPONSE_LEN + 1];
-    uint8_t result_hash_size = botTraceHashSize(flags);
-    uint8_t result_hop_count = result_hash_size > 0 ? (uint8_t)(path_len / result_hash_size) : 0;
-    size_t response_len = BotCommands::formatTraceResult(response, sizeof(response), pending->target_name, tag,
-                                                        result_hash_size, path_snrs, path_hashes, result_hop_count,
-                                                        (int8_t)(packet->getSNR() * 4));
-    char final_response[BOT_MAX_RESPONSE_LEN + 1];
-    size_t final_response_len = 0;
-    if (botFormatResponseForChannelKind(pending->channel_kind, response, response_len, final_response,
-                                        sizeof(final_response), &final_response_len)) {
-      BotFingerprint response_fingerprint = traceResponseFingerprintFor(*pending, final_response, final_response_len);
-      sendBotTraceText(*pending, final_response, final_response_len, response_fingerprint, now);
-    }
-    pending->active = false;
-    break;
-  }
-#endif
 }
 
 uint32_t MyMesh::calcFloodTimeoutMillisFor(uint32_t pkt_airtime_millis) const {
@@ -2503,14 +1991,10 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
 #if CMESH_BOT_ENABLED
   BotPrefsCodec::defaults(bot_prefs);
   memset(&bot_stats, 0, sizeof(bot_stats));
-  memset(pending_bot_responses, 0, sizeof(pending_bot_responses));
   memset(&pending_bot_dm_ack, 0, sizeof(pending_bot_dm_ack));
-  memset(pending_bot_traces, 0, sizeof(pending_bot_traces));
   memset(pending_emergency_forwards, 0, sizeof(pending_emergency_forwards));
   memset(bot_command_cooldowns, 0, sizeof(bot_command_cooldowns));
   memset(bot_neighbors, 0, sizeof(bot_neighbors));
-  ResponseCoordinator::clear(bot_coordinator_pending, BOT_COORDINATOR_PENDING_SLOTS);
-  ResponseCoordinator::clearRecent(bot_coordinator_recent, BOT_COORDINATOR_RECENT_SLOTS);
   KnownBotRegistry::clear(known_bot_entries, BOT_KNOWN_BOT_SLOTS);
   next_bot_local_advert = 0;
   next_bot_flood_advert = 0;

@@ -1,6 +1,7 @@
 #include "BotCommands.h"
 
 #include "BotCommandRegistry.h"
+#include "FirmwareBot.h"
 
 #include <ctype.h>
 #include <stdarg.h>
@@ -184,19 +185,13 @@ void formatQuarters(int8_t quarters, char* output, size_t output_len) {
 
 BotCommandResult executeCmd(const BotCommand& command, char* output, size_t output_len) {
   return writeText(output, output_len,
-                   "help  cmd  hello  about  version  status\n"
-                   "ping  sig  test  path  trace\n"
-                   "channels  stats  time\n"
-                   "lora  id  neighbors  air");
+                   "help  cmd  hello  about  version  time  status  stats  air  ping  test  path  sig  channels  lora  id  neighbors");
 }
 
 BotCommandResult executeHelp(const BotCommand& command, char* output, size_t output_len) {
   if (command.args_len == 0) {
     return writeText(output, output_len,
-                     "help  cmd  hello  about  version  status\n"
-                     "ping  sig  test  path  trace\n"
-                     "channels  stats  time\n"
-                     "lora  id  neighbors  air");
+                     "help  cmd  hello  about  version  time  status  stats  air  ping  test  path  sig  channels  lora  id  neighbors");
   }
 
   const BotCommandMetadata* metadata = BotCommandRegistry::findByName(command.args, command.args_len);
@@ -248,23 +243,6 @@ BotCommandResult executePath(const BotCommand& command, const BotCommandContext&
   return executePathLike(context, output, output_len, "Path");
 }
 
-BotCommandResult executeTraceLike(const BotCommand& command, const BotCommandContext& context, const char* label,
-                                  const char* usage, char* output, size_t output_len) {
-  if (command.args_len == 0) {
-    if (context.path_hash_size == 0) {
-      return writeFormatted(output, output_len, "%s needs a known route. Try path first.", label);
-    }
-    if (context.path_hash_count == 0 || context.path_len == 0) return writeFormatted(output, output_len, "%s ready: direct zero-hop route", label);
-    if (!context.path) return writeFormatted(output, output_len, "%s needs a known route. Try path first.", label);
-    return writeFormatted(output, output_len, "%s ready: %u-hop route", label, (unsigned)context.path_hash_count);
-  }
-  ParsedPathArg path;
-  if (!parsePathArgument(command.args, command.args_len, context.path_hash_size, &path)) {
-    return writeFormatted(output, output_len, "Usage: %s [path]", usage);
-  }
-  return writeFormatted(output, output_len, "%s ready: %u-hop route", label, (unsigned)path.hash_count);
-}
-
 void formatSecondsHms(uint32_t timestamp, char* output, size_t output_len) {
   if (!output || output_len == 0) return;
   if (timestamp == 0) {
@@ -296,12 +274,33 @@ uint8_t batteryPercentFromMillivolts(uint16_t mv) {
 BotCommandResult executeSig(const BotCommandContext& context, char* output, size_t output_len) {
   char snr[8];
   formatQuarters(context.path_snr_quarters, snr, sizeof(snr));
+
   const char* target = context.response_target[0] ? context.response_target : NULL;
+  unsigned hops = (unsigned)context.path_hash_count;
+
   if (target) {
-    return writeFormatted(output, output_len, "@[%s]: heard you near Trumbull Mall | SNR %s | RSSI %d dBm | noise %d dBm", target,
+    if (hops == 0) {
+      return writeFormatted(output, output_len,
+                            "@[%s]\nDirect\nSNR %s | RSSI %d dBm | noise %d dBm",
+                            target, snr,
+                            (int)context.last_rssi, (int)context.noise_floor);
+    }
+
+    return writeFormatted(output, output_len,
+                          "@[%s]\n%u %s\nLast hop\nSNR %s | RSSI %d dBm | noise %d dBm",
+                          target, hops, hops == 1 ? "hop" : "hops", snr,
+                          (int)context.last_rssi, (int)context.noise_floor);
+  }
+
+  if (hops == 0) {
+    return writeFormatted(output, output_len,
+                          "Direct\nSNR %s | RSSI %d dBm | noise %d dBm",
                           snr, (int)context.last_rssi, (int)context.noise_floor);
   }
-  return writeFormatted(output, output_len, "heard you near Trumbull Mall | SNR %s | RSSI %d dBm | noise %d dBm", snr,
+
+  return writeFormatted(output, output_len,
+                        "%u %s\nLast hop\nSNR %s | RSSI %d dBm | noise %d dBm",
+                        hops, hops == 1 ? "hop" : "hops", snr,
                         (int)context.last_rssi, (int)context.noise_floor);
 }
 
@@ -320,22 +319,56 @@ BotCommandResult executeAir(const BotCommandContext& context, char* output, size
 }
 
 BotCommandResult executeTest(const BotCommand& command, const BotCommandContext& context, char* output, size_t output_len) {
+  (void)command;
+
   char snr[8];
   formatQuarters(context.path_snr_quarters, snr, sizeof(snr));
-
-  char received_at[9];
-  formatSecondsHms(context.uptime_seconds, received_at, sizeof(received_at));
 
   const char* target = context.response_target[0] ? context.response_target : NULL;
   unsigned hops = (unsigned)context.path_hash_count;
 
-  if (target) {
-    return writeFormatted(output, output_len, "@[%s] | %u %s, SNR %s | received at %s",
-                          target, hops, hops == 1 ? "hop" : "hops", snr, received_at);
+  uint32_t now = context.received_at_timestamp;
+
+  int32_t utc_offset = FirmwareBot::easternUtcOffsetSeconds(now);
+  uint32_t eastern_time =
+      (uint32_t)((int64_t)now + (int64_t)utc_offset);
+
+  char received_at[9];
+  formatSecondsHms(eastern_time, received_at, sizeof(received_at));
+
+  const char* tz = utc_offset == -4 * 3600 ? "EDT" : "EST";
+
+  if (hops == 0) {
+    if (target) {
+      return writeFormatted(output, output_len,
+                            "@[%s]\nDirect\nSNR %s | RSSI %d dBm | noise %d dBm\nrecv %s %s",
+                            target, snr,
+                            (int)context.last_rssi,
+                            (int)context.noise_floor,
+                            received_at, tz);
+    }
+
+    return writeFormatted(output, output_len,
+                          "Direct\nSNR %s | RSSI %d dBm | noise %d dBm\nrecv %s %s",
+                          snr,
+                          (int)context.last_rssi,
+                          (int)context.noise_floor,
+                          received_at, tz);
   }
 
-  return writeFormatted(output, output_len, "%u %s, SNR %s | received at %s",
-                        hops, hops == 1 ? "hop" : "hops", snr, received_at);
+  if (target) {
+    return writeFormatted(output, output_len,
+                          "@[%s]\n%u hops, %u-byte\nrecv %s %s",
+                          target, hops,
+                          (unsigned)context.path_hash_size,
+                          received_at, tz);
+  }
+
+  return writeFormatted(output, output_len,
+                        "%u hops, %u-byte\nrecv %s %s",
+                        hops,
+                        (unsigned)context.path_hash_size,
+                        received_at, tz);
 }
 
 }
@@ -409,44 +442,43 @@ BotCommandResult executeCommand(const BotCommand& command, const BotCommandConte
       char up_str[20];
       formatUptime(context.uptime_seconds, up_str, sizeof(up_str));
 
-      uint32_t tx_seconds = context.tx_airtime_seconds;
-      uint32_t rx_seconds = context.rx_airtime_seconds;
-
       if (context.battery_millivolts > 0) {
-        uint8_t pct = batteryPercentFromMillivolts(context.battery_millivolts);
         return writeFormatted(
             output, output_len,
-            "up %s | batt %u.%02uV %u%% | storage %lu/%luKB\n"
+            "Batt %u.%02uV\n"
+            "up %s\n"
+            "Storage %lu/%luKB\n"
             "seen %lu sent %lu fail %lu\n"
-            "RF %lurx %lutx %luerr q%u\n"
-            "AIR %lus rx %lus tx | F/D rx %lu/%lu tx %lu/%lu",
-            up_str,
+            "RX %lu %luF/%luD %lus\n"
+            "TX %lu %luF/%luD %lus\n"
+            "%luerr",
             (unsigned)(context.battery_millivolts / 1000),
             (unsigned)((context.battery_millivolts % 1000) / 10),
-            (unsigned)pct,
+            up_str,
             (unsigned long)context.storage_used_kb,
             (unsigned long)context.storage_total_kb,
             (unsigned long)context.observed_messages,
             (unsigned long)context.sent_messages,
             (unsigned long)context.send_failures,
             (unsigned long)context.packets_recv,
-            (unsigned long)context.packets_sent,
-            (unsigned long)context.packets_recv_errors,
-            (unsigned)context.queue_depth,
-            (unsigned long)rx_seconds,
-            (unsigned long)tx_seconds,
             (unsigned long)context.flood_recv,
             (unsigned long)context.direct_recv,
+            (unsigned long)context.rx_airtime_seconds,
+            (unsigned long)context.packets_sent,
             (unsigned long)context.flood_sent,
-            (unsigned long)context.direct_sent);
+            (unsigned long)context.direct_sent,
+            (unsigned long)context.tx_airtime_seconds,
+            (unsigned long)context.packets_recv_errors);
       }
 
       return writeFormatted(
           output, output_len,
-          "up %s | storage %lu/%luKB\n"
+          "up %s\n"
+          "Storage %lu/%luKB\n"
           "seen %lu sent %lu fail %lu\n"
-          "RF %lurx %lutx %luerr q%u\n"
-          "AIR %lus rx %lus tx | F/D rx %lu/%lu tx %lu/%lu",
+          "RX %lu %luF/%luD %lus\n"
+          "TX %lu %luF/%luD %lus\n"
+          "%luerr",
           up_str,
           (unsigned long)context.storage_used_kb,
           (unsigned long)context.storage_total_kb,
@@ -454,15 +486,14 @@ BotCommandResult executeCommand(const BotCommand& command, const BotCommandConte
           (unsigned long)context.sent_messages,
           (unsigned long)context.send_failures,
           (unsigned long)context.packets_recv,
-          (unsigned long)context.packets_sent,
-          (unsigned long)context.packets_recv_errors,
-          (unsigned)context.queue_depth,
-          (unsigned long)rx_seconds,
-          (unsigned long)tx_seconds,
           (unsigned long)context.flood_recv,
           (unsigned long)context.direct_recv,
+          (unsigned long)context.rx_airtime_seconds,
+          (unsigned long)context.packets_sent,
           (unsigned long)context.flood_sent,
-          (unsigned long)context.direct_sent);
+          (unsigned long)context.direct_sent,
+          (unsigned long)context.tx_airtime_seconds,
+          (unsigned long)context.packets_recv_errors);
     }
     case BOT_COMMAND_CHANNELS:
       return writeText(output, output_len,
@@ -474,17 +505,17 @@ BotCommandResult executeCommand(const BotCommand& command, const BotCommandConte
     case BOT_COMMAND_STATS: {
       const char* target = context.response_target[0] ? context.response_target : NULL;
       if (target) {
-        return writeFormatted(output, output_len, "@[%s]: %lu seen | %lu ok | %lu sent | %lu fail | RF %lu rx | %lu tx | %lu err | q %u",
+        return writeFormatted(output, output_len, "@[%s]: %lu seen | %lu ok | %lu sent | %lu fail | RF %lu rx | %lu tx | %lu err",
                               target, (unsigned long)context.observed_messages, (unsigned long)context.eligible_messages,
                               (unsigned long)context.sent_messages, (unsigned long)context.send_failures,
                               (unsigned long)context.packets_recv, (unsigned long)context.packets_sent,
-                              (unsigned long)context.packets_recv_errors, (unsigned)context.queue_depth);
+                              (unsigned long)context.packets_recv_errors);
       }
-      return writeFormatted(output, output_len, "%lu seen | %lu ok | %lu sent | %lu fail | RF %lu rx | %lu tx | %lu err | q %u",
+      return writeFormatted(output, output_len, "%lu seen | %lu ok | %lu sent | %lu fail | RF %lu rx | %lu tx | %lu err",
                             (unsigned long)context.observed_messages, (unsigned long)context.eligible_messages,
                             (unsigned long)context.sent_messages, (unsigned long)context.send_failures,
                             (unsigned long)context.packets_recv, (unsigned long)context.packets_sent,
-                            (unsigned long)context.packets_recv_errors, (unsigned)context.queue_depth);
+                            (unsigned long)context.packets_recv_errors);
     }
     case BOT_COMMAND_SIG:
       return executeSig(context, output, output_len);
@@ -492,8 +523,6 @@ BotCommandResult executeCommand(const BotCommand& command, const BotCommandConte
       return executeAir(context, output, output_len);
     case BOT_COMMAND_PATH:
       return executePath(command, context, output, output_len);
-    case BOT_COMMAND_TRACE:
-      return executeTraceLike(command, context, "Trace", "trace", output, output_len);
     case BOT_COMMAND_PREFIX:
       return writeText(output, output_len, "Prefix lookup requires local contacts");
     case BOT_COMMAND_UNSUPPORTED:
