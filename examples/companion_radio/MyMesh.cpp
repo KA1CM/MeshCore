@@ -1786,7 +1786,14 @@ uint8_t MyMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_tim
   return 0; // unknown
 }
 
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+#include "RepeaterMonitor.h"
+#endif
 void MyMesh::onContactResponse(const ContactInfo &contact, const uint8_t *data, uint8_t len) {
+  if (len < 4) return;
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+  if (repeaterMonitor && repeaterMonitor->onResponse(contact, data, len)) return;
+#endif
   uint32_t tag;
   memcpy(&tag, data, 4);
 

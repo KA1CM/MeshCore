@@ -1,6 +1,7 @@
 #include <Arduino.h>   // needed for PlatformIO
 #include <Mesh.h>
 #include "MyMesh.h"
+#include "RepeaterMonitor.h"
 
 #if defined(ESP32) && defined(BOT_NTP_SYNC)
   #include <WiFi.h>
@@ -106,13 +107,16 @@ MyMesh the_mesh(radio_driver, fast_rng, rtc_clock, tables, store
 );
 
 /* END GLOBAL OBJECTS */
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+RepeaterMonitor repeater_monitor(the_mesh);
+#endif
 
 void halt() {
   while (1) ;
 }
 
-/* BOT NTP TIME SYNC */
-#if defined(ESP32) && defined(BOT_NTP_SYNC)
+/* BOT NTP TIME SYNC (the dashboard manages persistent Wi-Fi when enabled) */
+#if defined(ESP32) && defined(BOT_NTP_SYNC) && !defined(BOT_REPEATER_MONITOR)
 
 enum BotNtpState {
   BOT_NTP_IDLE,
@@ -352,6 +356,9 @@ void setup() {
 #endif
 
   board.onBootComplete();
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+  repeater_monitor.begin();
+#endif
 }
 
 void loop() {
@@ -362,7 +369,9 @@ void loop() {
 #endif
   rtc_clock.tick();
 
-#if defined(ESP32) && defined(BOT_NTP_SYNC)
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+  repeater_monitor.loop();
+#elif defined(ESP32) && defined(BOT_NTP_SYNC)
   botNtpLoop();
 #endif
 

@@ -92,12 +92,19 @@ struct AdvertPath {
   uint8_t path[MAX_PATH_SIZE];
 };
 
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+class RepeaterMonitor;
+#endif
+
 class MyMesh : public BaseChatMesh, public DataStoreHost {
 public:
   MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMeshTables &tables, DataStore& store, AbstractUITask* ui=NULL);
 
   void begin(bool has_display);
   void startInterface(BaseSerialInterface &serial);
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+  void setRepeaterMonitor(RepeaterMonitor* monitor) { repeaterMonitor = monitor; }
+#endif
 
   const char *getNodeName();
   NodePrefs *getNodePrefs();
@@ -189,6 +196,9 @@ public:
   bool hasPendingWork() const;
 
 private:
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+  RepeaterMonitor* repeaterMonitor = nullptr;
+#endif
   void writeOKFrame();
   void writeErrFrame(uint8_t err_code);
   void writeDisabledFrame();
