@@ -104,8 +104,13 @@ public:
   void startInterface(BaseSerialInterface &serial);
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
   void setRepeaterMonitor(RepeaterMonitor* monitor) { repeaterMonitor = monitor; }
+  void saveMonitorContacts() { saveContacts(); }
+  bool restoreMonitorContactName(const uint8_t* key);
 #endif
 
+#if CMESH_BOT_ENABLED
+  bool getBotNeighbor(size_t index, BotNeighbor& neighbor, uint32_t& ageSeconds) const;
+#endif
   const char *getNodeName();
   NodePrefs *getNodePrefs();
   uint32_t getBLEPin();
@@ -132,6 +137,7 @@ protected:
   void sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t delay_millis=0) override;
 
   void logRxRaw(float snr, float rssi, const uint8_t raw[], int len) override;
+  void logRx(mesh::Packet* packet, int len, float score) override;
   bool isAutoAddEnabled() const override;
   bool shouldAutoAddContactType(uint8_t type) const override;
   bool shouldOverwriteWhenFull() const override;

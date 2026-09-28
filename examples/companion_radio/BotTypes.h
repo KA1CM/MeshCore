@@ -160,6 +160,7 @@ struct BotMessage {
   uint8_t sender_key_prefix[BOT_SENDER_KEY_PREFIX_LEN];
   uint8_t sender_key_prefix_len;
   bool text_truncated;
+  bool path_is_inbound;
   uint32_t sender_timestamp;
   uint32_t received_at_timestamp;
   uint8_t path_len;
@@ -218,6 +219,7 @@ struct BotCommandContext {
   uint8_t path_hash_count;
   int8_t path_snr_quarters;
   char response_target[BOT_MAX_SENDER_NAME_LEN + 1];
+  const char* last_repeater_name;
   const uint8_t* path;
 };
 
@@ -244,6 +246,25 @@ struct BotNeighbor {
   uint32_t last_heard_millis;
   int16_t rssi_dbm;
   int8_t snr_quarters;
+  uint8_t sample_count;
+  uint8_t sample_next;
+  int16_t rssi_samples[16];
+  int8_t snr_samples[16];
+
+  void addSignalSample(int16_t rssi, int8_t snr) {
+    rssi_samples[sample_next] = rssi;
+    snr_samples[sample_next] = snr;
+    sample_next = (sample_next + 1) % 16;
+    if (sample_count < 16) ++sample_count;
+    int32_t rssi_sum = 0, snr_sum = 0;
+    for (uint8_t i = 0; i < sample_count; ++i) {
+      rssi_sum += rssi_samples[i];
+      snr_sum += snr_samples[i];
+    }
+    // Round to nearest dBm / quarter-dB, including negative readings.
+    rssi_dbm = (rssi_sum + (rssi_sum < 0 ? -sample_count / 2 : sample_count / 2)) / sample_count;
+    snr_quarters = (snr_sum + (snr_sum < 0 ? -sample_count / 2 : sample_count / 2)) / sample_count;
+  }
 };
 
 struct BotEmergencyForward {
@@ -284,11 +305,11 @@ struct BotStats {
 static_assert(BOT_COMMAND_UNKNOWN < 32, "BotCommandId must fit uint32_t command masks");
 static_assert(sizeof(BotMessage) <= 264, "BotMessage RAM budget exceeded");
 static_assert(sizeof(BotCommand) <= 120, "BotCommand RAM budget exceeded");
-static_assert(sizeof(BotCommandContext) <= 312, "BotCommandContext RAM budget exceeded");
+static_assert(sizeof(BotCommandContext) <= 320, "BotCommandContext RAM budget exceeded");
 static_assert(sizeof(BotCommandResult) <= 16, "BotCommandResult RAM budget exceeded");
 static_assert(sizeof(BotCommandCooldown) <= 8, "BotCommandCooldown RAM budget exceeded");
 static_assert(sizeof(BotKnownBotEntry) <= 24, "BotKnownBotEntry RAM budget exceeded");
-static_assert(sizeof(BotNeighbor) <= 24, "BotNeighbor RAM budget exceeded");
+static_assert(sizeof(BotNeighbor) <= 72, "BotNeighbor RAM budget exceeded");
 static_assert(sizeof(BotEmergencyForward) <= 480, "BotEmergencyForward RAM budget exceeded");
 static_assert(sizeof(BotPrefs) <= 320, "BotPrefs RAM budget exceeded");
 static_assert(sizeof(BotStats) <= 64, "BotStats RAM budget exceeded");

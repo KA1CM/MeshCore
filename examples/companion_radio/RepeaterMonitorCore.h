@@ -4,20 +4,40 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <stdio.h>
 
 // Hardware-independent scheduling and wire-format helpers.
 namespace MonitorCore {
 constexpr uint32_t VALID_TIME = 1735689600UL;
 constexpr size_t MAX_REPEATERS = 32;
 enum Result : uint8_t { Empty, Checking, Ok, NoResponse, LoginFailed, SendFailed, Interrupted, NoContactSpace };
-struct Reading { uint32_t day = 0, timestamp = 0; uint16_t millivolts = 0; uint8_t result = Empty; };
+struct Reading { uint32_t day = 0, timestamp = 0; uint16_t millivolts = 0; uint8_t result = Empty; bool clockKnown = false; int64_t clockOffset = 0; uint32_t clockUncertainty = 0; };
 struct Entry {
   uint8_t key[32] = {};
   char name[33] = {};
+  char learnedName[33] = {};
   bool enabled = true;
   uint32_t scheduledDay = 0;
+  uint32_t lastSynced = 0;
+  uint32_t clockCheckedAt = 0, clockUncertainty = 0;
+  int64_t clockOffset = 0;
   Reading readings[7];
 };
+inline bool timeSyncDue(const Entry& e, uint32_t utc) {
+  if (!e.enabled || utc < VALID_TIME) return false;
+  if (!e.lastSynced || (utc >= e.lastSynced && utc - e.lastSynced >= 30UL * 86400)) return true;
+  uint32_t sampleTime = 0;
+  int64_t offset = 0;
+  if (e.clockCheckedAt && e.clockCheckedAt >= e.lastSynced) {
+    sampleTime = e.clockCheckedAt; offset = e.clockOffset;
+  }
+  for (const Reading& r : e.readings) {
+    if (r.clockKnown && r.timestamp >= e.lastSynced && r.timestamp > sampleTime) {
+      sampleTime = r.timestamp; offset = r.clockOffset;
+    }
+  }
+  return sampleTime && (offset >= 600 || offset <= -600);
+}
 inline int hexDigit(char c) {
   if (c >= '0' && c <= '9') return c - '0';
   if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -47,6 +67,18 @@ inline int32_t civilDay(int y, unsigned m, unsigned d) {
   const unsigned yoe = y - era * 400;
   const unsigned doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
   return era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+}
+// Repeater CLI clock output has minute precision. Never infer wall time from its unique counter.
+inline bool parseClockReply(const char* text, uint32_t& utc) {
+  unsigned h, minute, d, m, y; int end = 0;
+  if (!text || strlen(text) > 32 || sscanf(text, "%2u:%2u - %2u/%2u/%4u UTC%n", &h, &minute, &d, &m, &y, &end) != 5 ||
+      !end || text[end] || h > 23 || minute > 59 || m < 1 || m > 12 || y < 1970 || y > 2106) return false;
+  const unsigned days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+  bool leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+  if (d < 1 || d > days[m-1] + (m == 2 && leap ? 1U : 0U)) return false;
+  uint64_t seconds = (uint64_t)civilDay(y, m, d) * 86400 + h * 3600 + minute * 60;
+  if (seconds > UINT32_MAX) return false;
+  utc = (uint32_t)seconds; return true;
 }
 inline uint32_t easternDay(uint32_t utc) {
   time_t t = utc;
@@ -96,6 +128,15 @@ inline bool voltage(const uint8_t* data, size_t len, uint32_t tag, uint16_t& mv)
   uint32_t received = (uint32_t)data[0] | (uint32_t)data[1]<<8 | (uint32_t)data[2]<<16 | (uint32_t)data[3]<<24;
   if (received != tag) return false;
   mv = (uint16_t)data[4] | (uint16_t)data[5]<<8;
+  return true;
+}
+inline bool loginClock(const uint8_t* data, size_t len, uint32_t sentUtc, uint32_t elapsedMs,
+                       int64_t& offset, uint32_t& uncertainty) {
+  // Only the documented modern login reply, allowing encryption padding.
+  if (!data || len < 13 || len > 16 || data[4] != 0 || elapsedMs > 180000) return false;
+  uint32_t remote = (uint32_t)data[0] | (uint32_t)data[1]<<8 | (uint32_t)data[2]<<16 | (uint32_t)data[3]<<24;
+  offset = (int64_t)remote - ((int64_t)sentUtc + elapsedMs / 2000);
+  uncertainty = (elapsedMs + 1999) / 2000 + 1; // Half RTT plus timestamp quantization.
   return true;
 }
 inline uint32_t crc32(const char* data, size_t len) {

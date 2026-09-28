@@ -185,19 +185,22 @@ void formatQuarters(int8_t quarters, char* output, size_t output_len) {
 
 BotCommandResult executeCmd(const BotCommand& command, char* output, size_t output_len) {
   return writeText(output, output_len,
-                   "help  cmd  hello  about  version  time  status  stats  air  ping  test  path  sig  channels  lora  id  neighbors");
+                   "help  cmd  hello  about  version  time  status  stats  air  ping  test  path  snr  channels  lora  id  neighbors");
 }
 
 BotCommandResult executeHelp(const BotCommand& command, char* output, size_t output_len) {
   if (command.args_len == 0) {
     return writeText(output, output_len,
-                     "help  cmd  hello  about  version  time  status  stats  air  ping  test  path  sig  channels  lora  id  neighbors");
+                     "help  cmd  hello  about  version  time  status  stats  air  ping  test  path  snr  channels  lora  id  neighbors");
   }
 
   const BotCommandMetadata* metadata = BotCommandRegistry::findByName(command.args, command.args_len);
   if (!metadata) return writeFormatted(output, output_len, "No help for %s", command.args);
   if (metadata->visibility != BOT_COMMAND_VISIBILITY_DISCOVERABLE) {
     return writeFormatted(output, output_len, "%s is not available", command.args);
+  }
+  if (metadata->id == BOT_COMMAND_SIG) {
+    return writeFormatted(output, output_len, "%s Usage: %s", metadata->details, metadata->usage);
   }
   return writeFormatted(output, output_len, "%s: %s. Usage: %s",
                         metadata->name, metadata->details, metadata->usage);
@@ -276,6 +279,9 @@ BotCommandResult executeSig(const BotCommandContext& context, char* output, size
   formatQuarters(context.path_snr_quarters, snr, sizeof(snr));
 
   const char* target = context.response_target[0] ? context.response_target : NULL;
+  const char* repeater = context.last_repeater_name;
+  const char* from = repeater && repeater[0] ? " from " : "";
+  if (!repeater) repeater = "";
   unsigned hops = (unsigned)context.path_hash_count;
 
   if (target) {
@@ -287,8 +293,8 @@ BotCommandResult executeSig(const BotCommandContext& context, char* output, size
     }
 
     return writeFormatted(output, output_len,
-                          "@[%s]\n%u %s\nLast hop\nSNR %s | RSSI %d dBm | noise %d dBm",
-                          target, hops, hops == 1 ? "hop" : "hops", snr,
+                          "@[%s]\n%u %s\nLast hop%s%s SNR %s | RSSI %d dBm | noise %d dBm",
+                          target, hops, hops == 1 ? "hop" : "hops", from, repeater, snr,
                           (int)context.last_rssi, (int)context.noise_floor);
   }
 
@@ -299,8 +305,8 @@ BotCommandResult executeSig(const BotCommandContext& context, char* output, size
   }
 
   return writeFormatted(output, output_len,
-                        "%u %s\nLast hop\nSNR %s | RSSI %d dBm | noise %d dBm",
-                        hops, hops == 1 ? "hop" : "hops", snr,
+                        "%u %s\nLast hop%s%s SNR %s | RSSI %d dBm | noise %d dBm",
+                        hops, hops == 1 ? "hop" : "hops", from, repeater, snr,
                         (int)context.last_rssi, (int)context.noise_floor);
 }
 

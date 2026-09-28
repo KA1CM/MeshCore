@@ -98,6 +98,13 @@ public:
    */
   virtual void tick() { /* no op */}
 
+  // A trusted wall-clock correction must also recover a poisoned uniqueness counter.
+  // Keep a small lead for normal bursts of messages generated in the same second.
+  void setCurrentTimeFromSync(uint32_t time) {
+    setCurrentTime(time);
+    if (last_unique > time && last_unique - time > 60) last_unique = 0;
+  }
+
   uint32_t getCurrentTimeUnique() {
     uint32_t t = getCurrentTime();
     if (t <= last_unique) {

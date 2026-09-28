@@ -1,3 +1,6 @@
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+#include "RepeaterMonitor.h"
+#endif
 #include "MyMesh.h"
 
 #include <Arduino.h> // needed for PlatformIO
@@ -565,6 +568,38 @@ uint8_t MyMesh::getExtraAckTransmitCount() const {
   return _prefs.multi_acks;
 }
 
+void MyMesh::logRx(mesh::Packet* packet, int len, float score) {
+  (void)len;
+  (void)score;
+#if CMESH_BOT_ENABLED
+  // Runs before duplicate filtering or delayed processing, with this packet's RSSI.
+  // Flood paths record traversed repeaters; direct paths describe the route ahead.
+  if (!packet || !packet->isRouteFlood() || packet->path_len > 0xFF ||
+      !mesh::Packet::isValidPathLen((uint8_t)packet->path_len) ||
+      packet->getPathHashCount() == 0) return;
+  const uint8_t hash_size = packet->getPathHashSize();
+  const uint8_t* last_hash = packet->path + (packet->getPathHashCount() - 1) * hash_size;
+  ContactsIterator iter;
+  ContactInfo candidate;
+  uint8_t matched_key[PUB_KEY_SIZE];
+  unsigned matches = 0;
+  while (iter.hasNext(this, candidate)) {
+    if (candidate.type != ADV_TYPE_REPEATER ||
+        memcmp(candidate.id.pub_key, last_hash, hash_size) != 0) continue;
+    if (++matches > 1) return; // Do not guess when short hashes collide.
+    memcpy(matched_key, candidate.id.pub_key, sizeof(matched_key));
+  }
+  if (matches == 1) {
+    float rssi = radio_driver.getLastRSSI();
+    if (rssi > 32767.0f) rssi = 32767.0f;
+    if (rssi < -32768.0f) rssi = -32768.0f;
+    recordBotNeighbor(matched_key, (int16_t)rssi, (int8_t)(packet->getSNR() * 4));
+  }
+#else
+  (void)packet;
+#endif
+}
+
 void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
   if (_serial->isConnected() && len + 3 <= MAX_FRAME_SIZE) {
     int i = 0;
@@ -634,7 +669,7 @@ void MyMesh::onContactsFull() {
 
 void MyMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path_len, const uint8_t* path) {
 #if CMESH_BOT_ENABLED
-  // A bot neighbor is a repeater whose advert was received directly.
+  // Zero-hop adverts also identify neighbors, including newly discovered repeaters.
   if (contact.type == ADV_TYPE_REPEATER && (path_len & 63) == 0) {
     float rssi = radio_driver.getLastRSSI();
     if (rssi > 32767.0f) rssi = 32767.0f;
@@ -835,6 +870,9 @@ void MyMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t 
 void MyMesh::onCommandDataRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp,
                                const char *text) {
   markConnectionActive(from); // in case this is from a server, and we have a connection
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+  if (repeaterMonitor && repeaterMonitor->onCommandResponse(from, text)) return;
+#endif
   queueMessage(from, TXT_TYPE_CLI_DATA, pkt, sender_timestamp, NULL, 0, text);
 }
 
@@ -1062,6 +1100,7 @@ void MyMesh::observeBotDirectMessage(const ContactInfo &from, uint32_t sender_ti
     message.path_hash_size = packet->getPathHashSize();
     message.path_hash_count = packet->getPathHashCount();
     message.path = packet->path;
+    message.path_is_inbound = true;
   } else if (from.out_path_len != OUT_PATH_UNKNOWN && mesh::Packet::isValidPathLen(from.out_path_len)) {
     message.path_len = from.out_path_len;
     message.path_hash_size = (from.out_path_len >> 6) + 1;
@@ -1096,6 +1135,7 @@ void MyMesh::observeBotChannelMessage(uint8_t channel_idx, const char *channel_n
     message.path_hash_count = packet->getPathHashCount();
     message.packet_snr_quarters = (int8_t)(packet->getSNR() * 4);
     message.path = packet->path;
+    message.path_is_inbound = true;
   }
 
   message.text_truncated = FirmwareBot::normalizeChannelText(text, message.sender_name, sizeof(message.sender_name),
@@ -1249,6 +1289,13 @@ BotCommandResult MyMesh::executeBotIdCommand(const BotMessage &message, char *ou
   return botWriteFormatted(output, output_len, "%s I'm %s", key_hex, name);
 }
 
+bool MyMesh::getBotNeighbor(size_t index, BotNeighbor& neighbor, uint32_t& ageSeconds) const {
+  if (index >= BOT_NEIGHBOR_SLOTS || !bot_neighbors[index].active) return false;
+  neighbor = bot_neighbors[index];
+  ageSeconds = (uint32_t)(_ms->getMillis() - neighbor.last_heard_millis) / 1000;
+  return true;
+}
+
 void MyMesh::recordBotNeighbor(const uint8_t *pub_key, int16_t rssi_dbm, int8_t snr_quarters) {
   if (!pub_key) return;
   size_t slot = BOT_NEIGHBOR_SLOTS;
@@ -1271,11 +1318,14 @@ void MyMesh::recordBotNeighbor(const uint8_t *pub_key, int16_t rssi_dbm, int8_t 
   }
   if (slot == BOT_NEIGHBOR_SLOTS) slot = oldest_slot;
 
+  if (!bot_neighbors[slot].active ||
+      memcmp(bot_neighbors[slot].pub_key_prefix, pub_key, BOT_SENDER_KEY_PREFIX_LEN) != 0) {
+    bot_neighbors[slot] = BotNeighbor{}; // Never carry samples across different neighbors.
+  }
   bot_neighbors[slot].active = true;
   memcpy(bot_neighbors[slot].pub_key_prefix, pub_key, BOT_SENDER_KEY_PREFIX_LEN);
   bot_neighbors[slot].last_heard_millis = _ms->getMillis();
-  bot_neighbors[slot].snr_quarters = snr_quarters;
-  bot_neighbors[slot].rssi_dbm = rssi_dbm;
+  bot_neighbors[slot].addSignalSample(rssi_dbm, snr_quarters);
 }
 
 BotCommandResult MyMesh::executeBotNeighborsCommand(const BotMessage &message, char *output, size_t output_len) {
@@ -1420,6 +1470,32 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
     context.path_hash_count = message.path_hash_count;
     context.path_snr_quarters = message.packet_snr_quarters;
     context.path = message.path;
+  }
+  char last_repeater_name[BOT_MAX_SENDER_NAME_LEN + 1] = {};
+  if (command.id == BOT_COMMAND_SIG && message.path_is_inbound && message.path &&
+      message.path_hash_count > 0 && message.path_hash_size > 0 && message.path_hash_size <= 4 &&
+      (size_t)message.path_hash_count * message.path_hash_size <= BOT_MAX_PATH_BYTES) {
+    const uint8_t* last_hash = message.path + (message.path_hash_count - 1) * message.path_hash_size;
+    ContactsIterator iter;
+    ContactInfo contact;
+    unsigned matches = 0;
+    while (iter.hasNext(this, contact)) {
+      if (contact.type != ADV_TYPE_REPEATER ||
+          memcmp(contact.id.pub_key, last_hash, message.path_hash_size) != 0) continue;
+      if (++matches > 1) break;  // Short path hashes can identify multiple repeaters.
+      StrHelper::strzcpy(last_repeater_name, contact.name, sizeof(last_repeater_name));
+    }
+    if (matches != 1 || !last_repeater_name[0]) {
+      static const char hex[] = "0123456789abcdef";
+      last_repeater_name[0] = '[';
+      for (uint8_t i = 0; i < message.path_hash_size; ++i) {
+        last_repeater_name[1 + i * 2] = hex[last_hash[i] >> 4];
+        last_repeater_name[2 + i * 2] = hex[last_hash[i] & 15];
+      }
+      last_repeater_name[1 + message.path_hash_size * 2] = ']';
+      last_repeater_name[2 + message.path_hash_size * 2] = 0;
+    }
+    context.last_repeater_name = last_repeater_name;
   }
   if (!result_ready) {
     switch (command.id) {
@@ -1787,8 +1863,36 @@ uint8_t MyMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_tim
 }
 
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
-#include "RepeaterMonitor.h"
+bool MyMesh::restoreMonitorContactName(const uint8_t* key) {
+  auto* c = lookupContactByPubKey(key, PUB_KEY_SIZE);
+  if (!c) return false;
+  uint8_t raw[256];
+  const uint8_t len = exportContact(*c, raw);
+  mesh::Packet packet;
+  constexpr size_t appOffset = PUB_KEY_SIZE + 4 + SIGNATURE_SIZE;
+  if (!len || !packet.readFrom(raw, len) || packet.getPayloadType() != PAYLOAD_TYPE_ADVERT ||
+      packet.payload_len <= appOffset || packet.payload_len > appOffset + MAX_ADVERT_DATA_SIZE ||
+      memcmp(packet.payload, key, PUB_KEY_SIZE)) return false;
+  uint32_t timestamp; memcpy(&timestamp, packet.payload + PUB_KEY_SIZE, 4);
+  if (timestamp < c->last_advert_timestamp) return false;
+  const uint8_t* app = packet.payload + appOffset;
+  const size_t appLen = packet.payload_len - appOffset;
+  const size_t nameOffset = 1 + ((app[0] & 0x10) ? 8 : 0) + ((app[0] & 0x20) ? 2 : 0) + ((app[0] & 0x40) ? 2 : 0);
+  if (!(app[0] & 0x80) || nameOffset >= appLen || appLen - nameOffset >= sizeof(c->name)) return false;
+  uint8_t message[PUB_KEY_SIZE + 4 + MAX_ADVERT_DATA_SIZE];
+  memcpy(message, packet.payload, PUB_KEY_SIZE + 4);
+  memcpy(message + PUB_KEY_SIZE + 4, app, appLen);
+  if (!c->id.verify(packet.payload + PUB_KEY_SIZE + 4, message, PUB_KEY_SIZE + 4 + appLen)) return false;
+  char name[32]{};
+  memcpy(name, app + nameOffset, appLen - nameOffset);
+  for (size_t i = 0; i < appLen - nameOffset; ++i) if ((uint8_t)name[i] < 32 || name[i] == 127) return false;
+  if (!strcmp(c->name, name)) return false;
+  strlcpy(c->name, name, sizeof(c->name));
+  c->lastmod = getRTCClock()->getCurrentTime();
+  return true;
+}
 #endif
+
 void MyMesh::onContactResponse(const ContactInfo &contact, const uint8_t *data, uint8_t len) {
   if (len < 4) return;
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)

@@ -200,7 +200,7 @@ static void botNtpLoop() {
       time_t ntp_now = time(nullptr);
 
       if (ntp_now >= BOT_NTP_VALID_TIME) {
-        rtc_clock.setCurrentTime((uint32_t)ntp_now);
+        rtc_clock.setCurrentTimeFromSync((uint32_t)ntp_now);
         bot_ntp_last_sync = now_ms;
 
         Serial.print("[NTP] RTC synchronized: ");
