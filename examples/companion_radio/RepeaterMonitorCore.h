@@ -12,31 +12,59 @@ constexpr uint32_t VALID_TIME = 1735689600UL;
 constexpr size_t MAX_REPEATERS = 32;
 enum Result : uint8_t { Empty, Checking, Ok, NoResponse, LoginFailed, SendFailed, Interrupted, NoContactSpace };
 struct Reading { uint32_t day = 0, timestamp = 0; uint16_t millivolts = 0; uint8_t result = Empty; bool clockKnown = false; int64_t clockOffset = 0; uint32_t clockUncertainty = 0; };
+// Validate Unicode scalar values and keep multiline notes bounded.
+inline bool validNotes(const char* text, size_t length) {
+  if (length > 2048) return false;
+  size_t count = 0;
+  for (size_t i = 0; i < length;) {
+    uint32_t cp = (unsigned char)text[i++];
+    unsigned extra = 0; uint32_t minimum = 0;
+    if (cp >= 0xc2 && cp <= 0xdf) { cp &= 31; extra=1; minimum=0x80; }
+    else if (cp >= 0xe0 && cp <= 0xef) { cp &= 15; extra=2; minimum=0x800; }
+    else if (cp >= 0xf0 && cp <= 0xf4) { cp &= 7; extra=3; minimum=0x10000; }
+    else if (cp >= 0x80) return false;
+    if (i + extra > length) return false;
+    while (extra--) { unsigned char c=text[i++]; if ((c & 0xc0)!=0x80) return false; cp=(cp<<6)|(c&63); }
+    if (cp < minimum || cp > 0x10ffff || (cp>=0xd800 && cp<=0xdfff) ||
+        (cp<32 && cp!=9 && cp!=10 && cp!=13) || cp==127 || ++count>512) return false;
+  }
+  return true;
+}
+
 struct Entry {
   uint8_t key[32] = {};
   char name[33] = {};
+  char notes[2049] = {}; // Up to 512 Unicode characters, four UTF-8 bytes each.
   char learnedName[33] = {};
+  int32_t learnedLatitude = 0, learnedLongitude = 0;
   bool enabled = true;
   uint32_t scheduledDay = 0;
   uint32_t lastSynced = 0;
+  uint32_t syncAttemptAt = 0;
+  char syncAttemptResult[128] = {};
   uint32_t clockCheckedAt = 0, clockUncertainty = 0;
   int64_t clockOffset = 0;
   Reading readings[7];
 };
+inline bool validLocation(int32_t lat, int32_t lon) {
+  return (lat || lon) && lat >= -90000000 && lat <= 90000000 && lon >= -180000000 && lon <= 180000000;
+}
 inline bool timeSyncDue(const Entry& e, uint32_t utc) {
   if (!e.enabled || utc < VALID_TIME) return false;
-  if (!e.lastSynced || (utc >= e.lastSynced && utc - e.lastSynced >= 30UL * 86400)) return true;
   uint32_t sampleTime = 0;
   int64_t offset = 0;
-  if (e.clockCheckedAt && e.clockCheckedAt >= e.lastSynced) {
+  if (e.clockCheckedAt >= VALID_TIME && e.clockCheckedAt <= utc && e.clockCheckedAt >= e.lastSynced) {
     sampleTime = e.clockCheckedAt; offset = e.clockOffset;
   }
   for (const Reading& r : e.readings) {
-    if (r.clockKnown && r.timestamp >= e.lastSynced && r.timestamp > sampleTime) {
+    if (r.clockKnown && r.timestamp >= VALID_TIME && r.timestamp <= utc && r.timestamp >= e.lastSynced && r.timestamp > sampleTime) {
       sampleTime = r.timestamp; offset = r.clockOffset;
     }
   }
-  return sampleTime && (offset >= 600 || offset <= -600);
+  if (sampleTime && (offset >= 600 || offset <= -600)) return true;
+  // A recent acceptable offset is also evidence that clock maintenance is current.
+  const uint32_t verifiedAt = sampleTime ? sampleTime : e.lastSynced;
+  return verifiedAt < VALID_TIME || verifiedAt > utc || utc - verifiedAt >= 30UL * 86400;
 }
 inline int hexDigit(char c) {
   if (c >= '0' && c <= '9') return c - '0';
@@ -118,6 +146,13 @@ inline bool due(const Entry& e, uint32_t utc) {
 }
 inline bool elapsed(uint32_t now, uint32_t deadline) { return (int32_t)(now - deadline) >= 0; }
 inline uint32_t timeout(uint32_t estimate) { return estimate < 30000 ? 30000 : (estimate > 180000 ? 180000 : estimate); }
+inline bool modernLoginOK(const uint8_t* data, size_t len) {
+  // The 13-byte reply can retain up to 15 AES padding bytes after a PATH
+  // prefix is removed. Direct responses commonly have only 16 bytes.
+  if (!data || len < 13 || len > 28 || data[4] != 0) return false;
+  for (size_t i = 13; i < len; ++i) if (data[i] != 0) return false;
+  return true;
+}
 inline bool loginOK(const uint8_t* data, size_t len) {
   // Decryption preserves zero padding to 16-byte blocks. A PATH response
   // removes its variable-length path prefix but still retains that padding.
@@ -133,7 +168,7 @@ inline bool voltage(const uint8_t* data, size_t len, uint32_t tag, uint16_t& mv)
 inline bool loginClock(const uint8_t* data, size_t len, uint32_t sentUtc, uint32_t elapsedMs,
                        int64_t& offset, uint32_t& uncertainty) {
   // Only the documented modern login reply, allowing encryption padding.
-  if (!data || len < 13 || len > 16 || data[4] != 0 || elapsedMs > 180000) return false;
+  if (!modernLoginOK(data, len) || elapsedMs > 180000) return false;
   uint32_t remote = (uint32_t)data[0] | (uint32_t)data[1]<<8 | (uint32_t)data[2]<<16 | (uint32_t)data[3]<<24;
   offset = (int64_t)remote - ((int64_t)sentUtc + elapsedMs / 2000);
   uncertainty = (elapsedMs + 1999) / 2000 + 1; // Half RTT plus timestamp quantization.

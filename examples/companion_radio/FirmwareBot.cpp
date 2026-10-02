@@ -273,7 +273,8 @@ bool parseCommand(const char* text, size_t text_len, BotCommand* command, bool a
   command->name[copy_name_len] = 0;
   const BotCommandMetadata* metadata = name_len > BOT_MAX_COMMAND_NAME_LEN ? NULL : BotCommandRegistry::findByName(command->name, copy_name_len);
   command->id = metadata ? metadata->id : BOT_COMMAND_UNKNOWN;
-  if (!has_prefix && (!metadata || metadata->visibility != BOT_COMMAND_VISIBILITY_DISCOVERABLE)) return false;
+  if (!has_prefix && (!metadata || (metadata->visibility != BOT_COMMAND_VISIBILITY_DISCOVERABLE &&
+                                   metadata->id != BOT_COMMAND_ADVERT && metadata->id != BOT_COMMAND_CHECK && metadata->id != BOT_COMMAND_SYNC))) return false;
 
   while (pos < normalized_len && isCommandDelimiter(normalized[pos])) pos++;
   size_t args_len = normalized_len - pos;

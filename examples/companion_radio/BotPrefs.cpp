@@ -222,7 +222,7 @@ bool deserialize(const uint8_t* data, size_t data_len, BotPrefs& prefs) {
   uint16_t version = get16(data, pos);
   uint16_t length = get16(data, pos);
   uint32_t checksum = get32(data, pos);
-  if (magic != BOT_PREFS_MAGIC || version != BOT_PREFS_VERSION || length != SERIALIZED_SIZE) {
+  if (magic != BOT_PREFS_MAGIC || (version != BOT_PREFS_VERSION && version != 7) || length != SERIALIZED_SIZE) {
     defaults(prefs);
     return false;
   }
@@ -241,6 +241,7 @@ bool deserialize(const uint8_t* data, size_t data_len, BotPrefs& prefs) {
   loaded.local_advert_interval_ms = get32(data, pos);
   loaded.flood_advert_interval_ms = get32(data, pos);
   loaded.command_mask = get32(data, pos);
+  if (version == 7) loaded.command_mask |= BOT_COMMAND_MASK_LIST;
   loaded.max_response_parts = get8(data, pos);
   getFixedString(data, pos, loaded.bot_channel, sizeof(loaded.bot_channel));
   getFixedString(data, pos, loaded.testing_channel, sizeof(loaded.testing_channel));

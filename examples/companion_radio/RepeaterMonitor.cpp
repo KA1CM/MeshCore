@@ -29,14 +29,17 @@ uint32_t RepeaterMonitor::now() const {
   return synced ? (uint32_t)time(nullptr) : mesh.getRTCClock()->getCurrentTime();
 }
 
-void RepeaterMonitor::exportState(JsonDocument& doc, bool history) {
+void RepeaterMonitor::exportState(JsonDocument& doc, bool history, bool ordered) {
   doc["version"] = 1;
   JsonArray list = doc["repeaters"].to<JsonArray>();
   uint32_t today = synced && now() >= VALID_TIME ? easternDay(now()) : 0;
+  size_t order[MAX_REPEATERS];
+  RepeaterOrder::westToEast(entries,count,mesh,order);
   for (size_t i = 0; i < count; ++i) {
-    const Entry& e = entries[i];
+    const Entry& e = entries[ordered ? order[i] : i];
     char key[65]; formatKey(e.key, key);
     JsonObject item = list.add<JsonObject>();
+    item["notes"] = e.notes;
     item["key"] = key; item["name"] = e.name; item["enabled"] = e.enabled;
     auto* known = mesh.lookupContactByPubKey(e.key, 32);
     const char* displayName = known && known->name[0] ? known->name : e.learnedName[0] ? e.learnedName : e.name;
@@ -47,8 +50,14 @@ void RepeaterMonitor::exportState(JsonDocument& doc, bool history) {
     }
     item["displayName"] = displayName;
     item["learnedName"] = known && known->name[0] ? known->name : e.learnedName;
+    if (validLocation(e.learnedLatitude,e.learnedLongitude)) {
+      item["learnedLatitude"] = e.learnedLatitude;
+      item["learnedLongitude"] = e.learnedLongitude;
+    }
     item["scheduledDay"] = e.scheduledDay;
     item["lastSynced"] = e.lastSynced;
+    item["syncAttemptAt"] = e.syncAttemptAt;
+    item["syncAttemptResult"] = e.syncAttemptResult;
     if (e.clockCheckedAt) {
       item["clockCheckedAt"] = e.clockCheckedAt;
       item["clockOffset"] = e.clockOffset;
@@ -85,6 +94,12 @@ bool RepeaterMonitor::importState(JsonDocument& doc, bool history) {
     if (!history) {
       for (size_t j = 0; j < count; ++j) if (memcmp(entries[j].key, e.key, 32) == 0) e = entries[j];
     }
+    if (item.containsKey("notes")) {
+      if (!item["notes"].is<const char*>()) return false;
+      JsonString notes = item["notes"].as<JsonString>();
+      if (!validNotes(notes.c_str(), notes.size())) return false;
+      strlcpy(e.notes, notes.c_str(), sizeof(e.notes));
+    }
     strlcpy(e.name, name, sizeof(e.name));
     e.enabled = item["enabled"];
     if (history) {
@@ -97,10 +112,21 @@ bool RepeaterMonitor::importState(JsonDocument& doc, bool history) {
       if (strlen(learned) > 32) return false;
       for (const unsigned char* p = (const unsigned char*)learned; *p; ++p) if (*p < 32 || *p == 127) return false;
       strlcpy(e.learnedName, learned, sizeof(e.learnedName));
+      if (!item["learnedLatitude"].isNull() || !item["learnedLongitude"].isNull()) {
+        if (!item["learnedLatitude"].is<int32_t>() || !item["learnedLongitude"].is<int32_t>()) return false;
+        e.learnedLatitude = item["learnedLatitude"]; e.learnedLongitude = item["learnedLongitude"];
+        if (!validLocation(e.learnedLatitude,e.learnedLongitude)) return false;
+      }
       e.scheduledDay = item["scheduledDay"] | 0UL;
       if (!item["lastSynced"].isNull() && !item["lastSynced"].is<uint32_t>()) return false;
       e.lastSynced = item["lastSynced"] | 0UL;
       if (e.lastSynced && e.lastSynced < VALID_TIME) return false;
+      if (!item["syncAttemptAt"].isNull() && !item["syncAttemptAt"].is<uint32_t>()) return false;
+      e.syncAttemptAt = item["syncAttemptAt"] | 0UL;
+      if (e.syncAttemptAt && e.syncAttemptAt < VALID_TIME) return false;
+      const char* outcome = item["syncAttemptResult"] | "";
+      if (strlen(outcome) >= sizeof(e.syncAttemptResult)) return false;
+      strlcpy(e.syncAttemptResult, !strcmp(outcome, "In progress") ? "Interrupted by bot restart; sync unconfirmed." : outcome, sizeof(e.syncAttemptResult));
       if (!item["clockCheckedAt"].isNull()) {
         if (!item["clockCheckedAt"].is<uint32_t>() || !item["clockOffset"].is<int64_t>() ||
             !item["clockUncertainty"].is<uint32_t>()) return false;
@@ -138,7 +164,7 @@ bool RepeaterMonitor::importState(JsonDocument& doc, bool history) {
 
 bool RepeaterMonitor::readSlot(int slot, JsonDocument& doc, uint32_t& seq) {
   File f = SPIFFS.open(slots[slot], "r");
-  if (!f || f.size() < 16 || f.size() > 65536) return false;
+  if (!f || f.size() < 16 || f.size() > 196608) return false;
   uint32_t header[4];
   if (f.read((uint8_t*)header, sizeof(header)) != sizeof(header) || header[0] != 0x4D4F4E31 || header[2] != f.size() - 16) return false;
   String payload = f.readString();
@@ -149,9 +175,9 @@ bool RepeaterMonitor::readSlot(int slot, JsonDocument& doc, uint32_t& seq) {
 }
 
 bool RepeaterMonitor::save() {
-  JsonDocument doc; exportState(doc, true);
+  JsonDocument doc; exportState(doc, true, false);
   String payload; serializeJson(doc, payload);
-  if (doc.overflowed() || payload.length() > 65000) { storageOK = false; return false; }
+  if (doc.overflowed() || payload.length() > 196592) { storageOK = false; return false; }
   int dest = savedSlot == 0 ? 1 : 0;
   uint32_t header[] = {0x4D4F4E31, sequence + 1, (uint32_t)payload.length(), crc32(payload.c_str(), payload.length())};
   File f = SPIFFS.open(slots[dest], "w");
@@ -187,6 +213,11 @@ void RepeaterMonitor::rememberNames() {
   bool changed = false;
   for (size_t i = 0; i < count; ++i) {
     auto* known = mesh.lookupContactByPubKey(entries[i].key, 32);
+    if (known && validLocation(known->gps_lat,known->gps_lon) &&
+        (entries[i].learnedLatitude != known->gps_lat || entries[i].learnedLongitude != known->gps_lon)) {
+      entries[i].learnedLatitude = known->gps_lat; entries[i].learnedLongitude = known->gps_lon;
+      changed = true;
+    }
     if (known && known->name[0] && strcmp(known->name, entries[i].learnedName)) {
       strlcpy(entries[i].learnedName, known->name, sizeof(entries[i].learnedName));
       changed = true;
@@ -201,6 +232,19 @@ void RepeaterMonitor::prune(uint32_t utc) {
     if (r.day && !retained(r.day, easternDay(utc))) { r = Reading{}; changed = true; }
   }
   if (changed) save();
+}
+
+void RepeaterMonitor::voltageList(BotVoltageList::Snapshot& out, bool lowOnly) {
+  char names[MAX_REPEATERS][33]{};
+  for(size_t i=0;i<count;++i) {
+    auto* contact=mesh.lookupContactByPubKey(entries[i].key,32);
+    const char* name=contact && contact->name[0] ? contact->name :
+      entries[i].learnedName[0] ? entries[i].learnedName : entries[i].name;
+    BotVoltageList::shortName(name,entries[i].key,names[i]);
+  }
+  size_t order[MAX_REPEATERS];
+  RepeaterOrder::westToEast(entries,count,mesh,order);
+  BotVoltageList::build(entries,names,count,out,order,lowOnly);
 }
 
 bool RepeaterMonitor::authorized(bool mutation) {
@@ -230,6 +274,37 @@ void RepeaterMonitor::routes() {
     server.sendHeader("X-Frame-Options", "DENY");
     server.send_P(200, "text/html", MONITOR_PAGE);
   });
+  server.on("/api/admin-contact", HTTP_POST, [this]() {
+    if(!authorized(true)) return;
+    JsonDocument doc;uint8_t key[32];
+    if(deserializeJson(doc,server.arg("plain")) || !parseKey(doc["key"] | "",key)) {
+      server.send(400,"text/plain","Enter a full 64-character public key.");return;
+    }
+    const char* action=doc["action"] | "set";
+    if(!strcmp(action,"remove")) {
+      size_t index=0;
+      while(index<adminContacts.count() && memcmp(adminContacts.at(index)->key,key,32)) ++index;
+      if(!adminContacts.remove(key)) {server.send(400,"text/plain","Could not remove admin contact.");return;}
+      if(sunriseNotificationPending && index<sunriseRecipient) --sunriseRecipient;
+    } else {
+      if(!doc["commands"].is<bool>() || !doc["notifications"].is<bool>()) {
+        server.send(400,"text/plain","Invalid admin contact permissions.");return;
+      }
+      bool saved=false;
+      if(!strcmp(action,"add")) {
+        auto* contact=mesh.lookupContactByPubKey(key,32);
+        if(!contact || contact->type!=ADV_TYPE_CHAT) {
+          server.send(400,"text/plain","Add this companion to the bot's contacts first.");return;
+        }
+        saved=adminContacts.add(key,doc["commands"].as<bool>(),doc["notifications"].as<bool>());
+        if(saved) protectListedContacts();
+      } else if(!strcmp(action,"set")) {
+        saved=adminContacts.set(key,doc["commands"].as<bool>(),doc["notifications"].as<bool>());
+      }
+      if(!saved) {server.send(400,"text/plain","Could not save admin: duplicate, unknown key, full list (16), or storage unavailable.");return;}
+    }
+    server.send(200,"application/json","{\"ok\":true}");
+  });
   server.on("/api/state", HTTP_GET, [this]() {
     if (!authorized()) return;
     JsonDocument doc; exportState(doc, true);
@@ -241,15 +316,32 @@ void RepeaterMonitor::routes() {
       char key[65]; formatKey(entries[syncTarget].key, key); doc["clockSyncKey"] = key;
     }
     if (requestIsAdmin) {
+      doc["adminContactsReady"] = adminContacts.available();
+      JsonArray admins=doc["adminContacts"].to<JsonArray>();
+      for(size_t i=0;i<adminContacts.count();++i) {
+        const auto& record=*adminContacts.at(i);char key[65];formatKey(record.key,key);
+        auto item=admins.add<JsonObject>();item["key"]=key;
+        auto* c=mesh.lookupContactByPubKey(record.key,32);
+        item["name"]=c?c->name:"Unknown contact";
+        item["commands"]=(record.permissions & BotAdminContacts::Commands)!=0;
+        item["notifications"]=(record.permissions & BotAdminContacts::Notifications)!=0;
+      }
       doc["credentialsReady"] = credentials.available();
       doc["clockSyncReady"] = syncTimeReady();
-      for (size_t i = 0; i < count; ++i)
-        doc["repeaters"][i]["passwordConfigured"] = credentials.password(entries[i].key)[0] != 0;
+      for (JsonObject item : doc["repeaters"].as<JsonArray>()) {
+        uint8_t key[32];
+        item["passwordConfigured"] = parseKey(item["key"] | "",key) && credentials.password(key)[0] != 0;
+      }
     }
     doc["now"] = utc; doc["timeReady"] = synced; doc["storageOK"] = storageOK;
-    doc["running"] = running; doc["active"] = active;
+    doc["running"] = running; doc["active"] = -1;
+    if (active >= 0 && active < (int)count) {
+      char activeKey[65];formatKey(entries[active].key,activeKey);
+      for(size_t i=0;i<count;++i) if(!strcmp(doc["repeaters"][i]["key"] | "",activeKey)) doc["active"] = i;
+    }
     doc["error"] = lastError; doc["ip"] = WiFi.localIP().toString();
     doc["node"] = mesh.getNodeName();
+    doc["lastAdvert"] = mesh.getLastBotAdvertTime();
     JsonArray neighbors = doc["neighbors"].to<JsonArray>();
 #if CMESH_BOT_ENABLED
     for (size_t i = 0; i < BOT_NEIGHBOR_SLOTS; ++i) {
@@ -307,7 +399,7 @@ void RepeaterMonitor::routes() {
     if (busy()) { server.send(409, "text/plain", "Wait for the current check to finish."); return; }
     String body = server.arg("plain");
     JsonDocument doc;
-    if (body.length() > 8192 || deserializeJson(doc, body)) { server.send(400, "text/plain", "Invalid list file."); return; }
+    if (body.length() > 131072 || deserializeJson(doc, body)) { server.send(400, "text/plain", "Invalid list file."); return; }
     std::unique_ptr<Entry[]> backup(new Entry[MAX_REPEATERS]);
     memcpy(backup.get(), entries, sizeof(entries)); size_t oldCount = count;
     if (!importState(doc, false)) { server.send(400, "text/plain", "Use unique 64-digit public keys, names up to 32 bytes, and at most 32 repeaters."); return; }
@@ -321,6 +413,30 @@ void RepeaterMonitor::routes() {
     if (!credentials.retain(entries, count)) lastError = "Private credential storage unavailable.";
     protectListedContacts();
     server.send(200, "application/json", "{\"ok\":true}");
+  });
+  server.on("/api/notes", HTTP_POST, [this]() {
+    if (!authorized(true)) return;
+    JsonDocument doc;
+    String body = server.arg("plain");
+    uint8_t key[32];
+    if (body.length() > 8192 || deserializeJson(doc, body) ||
+        !parseKey(doc["key"] | "", key) || !doc["notes"].is<const char*>()) {
+      server.send(400, "text/plain", "Invalid notes."); return;
+    }
+    JsonString notes = doc["notes"].as<JsonString>();
+    if (!validNotes(notes.c_str(), notes.size())) {
+      server.send(400, "text/plain", "Notes must contain at most 512 characters."); return;
+    }
+    for (size_t i=0; i<count; ++i) if (!memcmp(entries[i].key,key,32)) {
+      String previous(entries[i].notes);
+      strlcpy(entries[i].notes,notes.c_str(),sizeof(entries[i].notes));
+      if (!save()) {
+        strlcpy(entries[i].notes,previous.c_str(),sizeof(entries[i].notes));
+        server.send(507,"text/plain","Could not save notes."); return;
+      }
+      server.send(200,"application/json","{\"ok\":true}"); return;
+    }
+    server.send(404,"text/plain","Repeater is no longer in the list.");
   });
   server.on("/api/check", HTTP_POST, [this]() {
     if (!authorized(true)) return;
@@ -414,6 +530,7 @@ void RepeaterMonitor::begin() {
 #endif
     if (!credentials.begin(entries, count, initial)) lastError = "Private credential storage unavailable.";
   }
+  if(!adminContacts.begin()) lastError="Admin contact storage unavailable; DM permissions disabled.";
   protectListedContacts();
   bool restoredNames = false;
   for (size_t i = 0; i < count; ++i) restoredNames |= mesh.restoreMonitorContactName(entries[i].key);
@@ -422,6 +539,46 @@ void RepeaterMonitor::begin() {
   WiFi.persistent(false); WiFi.mode(WIFI_STA); WiFi.setAutoReconnect(false); connectWifi(0);
   wifiAttempt = wifiWindowStart = millis(); wifiStopped = false; board.setInhibitSleep(true);
   routes(); server.begin();
+}
+
+const char* RepeaterMonitor::startAdminCheck(const uint8_t* sender, const char* query, bool sync) {
+  if (!adminContacts.allows(sender, BotAdminContacts::Commands)) return "Not authorized";
+  if (!query || !query[0]) return sync ? "Usage: sync <repeater>" : "Usage: check <repeater>";
+  if (!synced || !storageOK || busy() || adminCheckPending) return "Bot busy or not ready; try again shortly";
+  int target=-1;
+  for(size_t i=0;i<count;++i) {
+    auto* c=mesh.lookupContactByPubKey(entries[i].key,32);
+    const char* name=c && c->name[0] ? c->name : entries[i].learnedName[0] ? entries[i].learnedName : entries[i].name;
+    bool match=false;
+    for(const char* part=name;*part;++part) if(!strncasecmp(part,query,strlen(query))) {match=true;break;}
+    if(!match) continue;
+    if(target>=0) return "Multiple repeaters match; use a more specific name";
+    target=(int)i;
+    BotVoltageList::shortName(name,entries[i].key,adminCheckName);
+  }
+  if(target<0) return "No matching repeater";
+  memcpy(adminCheckRecipient,sender,32);adminCheckReply[0]=0;adminCheckPending=true;
+  adminCheckIsSync=sync;
+  adminCheckExpires=millis()+7200000;
+  if(sync) {
+    if(!startClockSync(target)) {
+      adminCheckPending=false;
+      return "Could not start sync: check recent NTP, storage, repeater contact and password";
+    }
+    return nullptr;
+  }
+  singleTarget=target;running=true;automatic=false;
+  runDay=easternDay(now());active=-1;phase=Next;deadline=millis();
+  return nullptr; // Reply only when the measurement finishes.
+}
+
+void RepeaterMonitor::pollAdminCheckReply() {
+  if(!adminCheckPending) return;
+  if(!adminContacts.allows(adminCheckRecipient,BotAdminContacts::Commands) ||
+     elapsed(millis(),adminCheckExpires)) {adminCheckPending=false;return;}
+  if(adminCheckIsSync ? syncPhase!=SyncIdle : running) return;
+  if(!adminCheckReply[0]) snprintf(adminCheckReply,sizeof(adminCheckReply),"%s: %s interrupted",adminCheckName,adminCheckIsSync?"sync":"check");
+  if(mesh.sendAdminCheckResult(adminCheckRecipient,adminCheckReply)) adminCheckPending=false;
 }
 
 bool RepeaterMonitor::startRun(bool scheduled) {
@@ -436,6 +593,14 @@ bool RepeaterMonitor::startRun(bool scheduled) {
 void RepeaterMonitor::protectListedContacts() {
   bool changed = false;
   // Protect all existing list members before adding any missing contacts: adding can evict.
+  for (size_t i = 0; i < adminContacts.count(); ++i) {
+    auto* c = mesh.lookupContactByPubKey(adminContacts.at(i)->key, 32);
+    if (c && !(c->flags & 0x01)) {
+      c->flags |= 0x01;
+      c->lastmod = mesh.getRTCClock()->getCurrentTime();
+      changed = true;
+    }
+  }
   for (size_t i = 0; i < count; ++i) {
     auto* c = mesh.lookupContactByPubKey(entries[i].key, 32);
     if (c && !(c->flags & 0x01)) {
@@ -456,6 +621,18 @@ void RepeaterMonitor::protectListedContacts() {
     strlcpy(temp.name, e.learnedName[0] ? e.learnedName : e.name, sizeof(temp.name));
     if (mesh.addContact(temp)) changed = true;
     else lastError = "Contact list full: could not add every monitored repeater as a favorite.";
+  }
+  for (size_t i = 0; i < adminContacts.count(); ++i) {
+    const auto* admin = adminContacts.at(i);
+    if (mesh.lookupContactByPubKey(admin->key, 32)) continue;
+    ContactInfo temp{};
+    memcpy(temp.id.pub_key, admin->key, 32);
+    temp.type = ADV_TYPE_CHAT; temp.flags = 0x01;
+    temp.out_path_len = OUT_PATH_UNKNOWN;
+    temp.lastmod = mesh.getRTCClock()->getCurrentTime();
+    // The next verified advert supplies the current name and route.
+    if (mesh.addContact(temp)) changed = true;
+    else lastError = "Contact list full: could not restore every admin contact as a favorite.";
   }
   if (changed) mesh.saveMonitorContacts();
 }
@@ -479,17 +656,22 @@ void RepeaterMonitor::nextEntry() {
   if (easternDay(now()) != runDay) { running = false; phase = Idle; active = -1; return; }
   if (singleTarget >= 0) active = singleTarget;
   else do { ++active; } while (active < (int)count && (!entries[active].enabled || (automatic && entries[active].scheduledDay >= runDay)));
-  if (active >= (int)count) { running = false; phase = Idle; active = -1; return; }
+  if (active >= (int)count) {
+    running = false; phase = Idle; active = -1;
+    if (automatic) scheduleSunriseNotification();
+    return;
+  }
   clockKnown = false; clockOffset = 0; clockUncertainty = 0;
   attempt = 0;
-  reuseFloodSent = false;
+  preLoginFloodAttempts = 0;
+  postLoginStatusAttempts = 0;
   if (automatic || now() >= sunrise(runDay)) entries[active].scheduledDay = runDay;
   Reading& r = entries[active].readings[runDay % 7];
   r = Reading{}; r.day = runDay; r.timestamp = now(); r.result = Checking;
   // Persist the start before transmitting: reboot cannot repeat an already-started daily check.
   if (!save()) { running = false; phase = Idle; return; }
   // Reuse the repeater's existing authorization for this node when possible.
-  // Try the saved route, then flood, before either of the two flood logins.
+  // Try the saved route, then flood, before starting the flood login attempts.
   sendStatus();
 }
 
@@ -499,7 +681,7 @@ void RepeaterMonitor::sendLogin() {
   if (!c) { finish(NoContactSpace); return; }
   uint32_t estimate = 0;
   ContactInfo target = *c;
-  target.out_path_len = OUT_PATH_UNKNOWN; // both login attempts rediscover the route
+  target.out_path_len = OUT_PATH_UNKNOWN; // every login attempt uses flood
   clockSentUtc = now(); clockSentMillis = millis();
   if (mesh.sendLogin(target, credentials.password(entries[active].key), estimate) == MSG_SEND_FAILED) { failed(SendFailed); return; }
   phase = Login; deadline = millis() + timeout(estimate);
@@ -509,16 +691,23 @@ void RepeaterMonitor::sendStatus(bool flood) {
   auto* c = contact(); uint32_t estimate = 0;
   if (!c) { finish(NoContactSpace); return; }
   ContactInfo target = *c;
-  if (flood) target.out_path_len = OUT_PATH_UNKNOWN;
-  if (attempt == 0 && target.out_path_len == OUT_PATH_UNKNOWN) reuseFloodSent = true;
+  if (flood || attempt > 0) target.out_path_len = OUT_PATH_UNKNOWN;
+  if (attempt > 0) ++postLoginStatusAttempts;
+  if (attempt == 0 && target.out_path_len == OUT_PATH_UNKNOWN) ++preLoginFloodAttempts;
   if (mesh.sendRequest(target, REQ_TYPE_GET_STATUS, tag, estimate) == MSG_SEND_FAILED) { failed(SendFailed); return; }
   phase = Status; deadline = millis() + timeout(estimate);
 }
 
 void RepeaterMonitor::failed(uint8_t result) {
-  if (attempt == 0 && !reuseFloodSent) { phase = RetryFloodStatus; deadline = millis() + 15000; }
-  else if (attempt < 2) { phase = Retry; deadline = millis() + 15000; }
-  else finish(result);
+  if (postLoginStatusAttempts > 0) {
+    // Once logged in, retry only the flood status request; never restart login.
+    if (postLoginStatusAttempts < 4) { phase = RetryFloodStatus; deadline = millis() + 15000; }
+    else finish(result);
+  } else if (attempt == 0 && preLoginFloodAttempts < 3) {
+    phase = RetryFloodStatus; deadline = millis() + 15000;
+  } else if (attempt < 2) {
+    phase = Retry; deadline = millis() + 15000;
+  } else finish(result);
 }
 
 void RepeaterMonitor::finish(uint8_t result, uint16_t mv) {
@@ -533,7 +722,15 @@ void RepeaterMonitor::finish(uint8_t result, uint16_t mv) {
   measured.clockKnown = result == Ok && clockKnown;
   measured.clockOffset = clockOffset; measured.clockUncertainty = clockUncertainty;
   if (!save()) { running = false; phase = Idle; return; }
-  if (singleTarget >= 0) { running = false; phase = Idle; active = -1; singleTarget = -1; }
+  if (singleTarget >= 0) {
+    if(adminCheckPending && !adminCheckIsSync && !adminCheckReply[0]) {
+      if(result==Ok) snprintf(adminCheckReply,sizeof(adminCheckReply),"%s %u.%02uV",adminCheckName,
+                             ((mv+5)/10)/100,((mv+5)/10)%100);
+      else snprintf(adminCheckReply,sizeof(adminCheckReply),"%s N/A (%s)",adminCheckName,
+                    result==LoginFailed?"login timeout":result==NoResponse?"no response":"check failed");
+    }
+    running = false; phase = Idle; active = -1; singleTarget = -1;
+  }
   else {
     phase = Next; deadline = millis() + 10000;
     // The persisted daily-check marker also bounds this to one automatic sync per day.
@@ -543,17 +740,43 @@ void RepeaterMonitor::finish(uint8_t result, uint16_t mv) {
 
 bool RepeaterMonitor::onResponse(const ContactInfo& from, const uint8_t* data, size_t len) {
   if (syncPhase == SyncLogin && syncTarget >= 0 && syncTarget < (int)count &&
-      !elapsed(millis(), syncDeadline) && !memcmp(from.id.pub_key, entries[syncTarget].key, 32) && len >= 13 && len <= 16 && data[4] == 0) {
+      !elapsed(millis(), syncDeadline) && !memcmp(from.id.pub_key, entries[syncTarget].key, 32) && modernLoginOK(data, len)) {
     adminConfirmed[syncTarget] = data[6] == 1;
-    if (!adminConfirmed[syncTarget]) finishClockSync("Login did not grant admin access; clock unchanged.");
-    else { syncPhase = SyncReady; syncDeadline = millis() + 3000; syncResult = "Admin login accepted."; }
+    if (!adminConfirmed[syncTarget]) finishClockSync("No admin permission");
+    else {
+      if (!syncTimeReady()) { finishClockSync("NTP expired during sync"); return true; }
+      Entry& e = entries[syncTarget];
+      int64_t offset; uint32_t uncertainty;
+      if (!loginClock(data, len, syncLoginSentUtc, (uint32_t)(millis() - syncLoginSentMillis), offset, uncertainty)) {
+        finishClockSync("Invalid clock response"); return true;
+      }
+      const uint32_t previousAt=e.clockCheckedAt, previousUncertainty=e.clockUncertainty;
+      const int64_t previousOffset=e.clockOffset;
+      e.clockCheckedAt = now(); e.clockOffset = offset; e.clockUncertainty = uncertainty;
+      if (!save()) {
+        e.clockCheckedAt=previousAt; e.clockOffset=previousOffset; e.clockUncertainty=previousUncertainty;
+        finishClockSync("Admin login accepted, but clock offset could not be saved; sync stopped."); return true;
+      }
+      chooseSyncAction(offset);
+    }
     return true;
   }
   if (!running || active < 0 || active >= (int)count || memcmp(from.id.pub_key, entries[active].key, 32) != 0) return false;
   if (phase == Login && loginOK(data, len)) {
-    adminConfirmed[active] = len >= 13 && len <= 16 && data[4] == 0 && data[6] == 1;
+    adminConfirmed[active] = modernLoginOK(data, len) && data[6] == 1;
     // Reuse the required authorization reply; never send a separate clock request.
     clockKnown = loginClock(data, len, clockSentUtc, (uint32_t)(millis() - clockSentMillis), clockOffset, clockUncertainty);
+    if (clockKnown) {
+      Entry& e = entries[active];
+      const uint32_t previousAt = e.clockCheckedAt, previousUncertainty = e.clockUncertainty;
+      const int64_t previousOffset = e.clockOffset;
+      e.clockCheckedAt = now(); e.clockOffset = clockOffset; e.clockUncertainty = clockUncertainty;
+      // Persist the login measurement independently of the subsequent battery result.
+      if (!save()) {
+        e.clockCheckedAt = previousAt; e.clockOffset = previousOffset; e.clockUncertainty = previousUncertainty;
+        running = false; phase = Idle; return true;
+      }
+    }
     phase = NeedStatus; deadline = millis() + 3000; return true;
   }
   if (phase == Status) {
@@ -580,6 +803,41 @@ void RepeaterMonitor::poll() {
   }
 }
 
+void RepeaterMonitor::onVerifiedAdvert(const uint8_t* key, uint32_t timestamp, uint8_t pathLen) {
+  // Only direct adverts: forwarding latency is not measurable passively.
+  if (pathLen != 0 || !syncTimeReady() || !storageOK || busy() || timestamp < VALID_TIME) return;
+  const uint32_t utc = now();
+  if (utc < VALID_TIME) return;
+  for (size_t i = 0; i < count; ++i) {
+    Entry& e = entries[i];
+    if (!e.enabled || memcmp(e.key, key, 32)) continue;
+    auto& candidate = advertClocks[i];
+    if (memcmp(candidate.key, key, 32)) {
+      candidate = {}; memcpy(candidate.key, key, 32);
+    }
+    // Reject repeats and backward advert timestamps even if contact state changed.
+    if (candidate.remote && timestamp <= candidate.remote) return;
+    const bool advances = candidate.received && utc > candidate.received &&
+      utc - candidate.received >= 30 && utc - candidate.received <= 86400 &&
+      llabs((int64_t)timestamp - candidate.remote - ((int64_t)utc - candidate.received)) <= 10;
+    candidate.remote = timestamp; candidate.received = utc;
+    if (!advances) return;
+    const int64_t offset = (int64_t)timestamp - utc;
+    // At most one routine snapshot per hour; save threshold crossings immediately.
+    const bool large = offset >= 600 || offset <= -600;
+    const bool wasLarge = e.clockOffset >= 600 || e.clockOffset <= -600;
+    if (e.clockCheckedAt && utc >= e.clockCheckedAt && utc - e.clockCheckedAt < 3600 && large == wasLarge) return;
+    const uint32_t oldAt = e.clockCheckedAt, oldUncertainty = e.clockUncertainty;
+    const int64_t oldOffset = e.clockOffset;
+    e.clockCheckedAt = utc; e.clockOffset = offset;
+    e.clockUncertainty = 10; // Approximate tolerance, not a guaranteed bound on packet age.
+    if (!save()) {
+      e.clockCheckedAt = oldAt; e.clockOffset = oldOffset; e.clockUncertainty = oldUncertainty;
+    }
+    return;
+  }
+}
+
 bool RepeaterMonitor::startClockSync(int target) {
   if (syncPhase != SyncIdle || target < 0 || target >= (int)count) return false;
   syncTarget = target;
@@ -588,73 +846,108 @@ bool RepeaterMonitor::startClockSync(int target) {
     syncResult = "Clock sync skipped: needs recent NTP, working storage, a saved password and contact.";
     return false;
   }
-  syncLoginAttempted = false; syncResetAttempted = false; syncToken = (uint8_t)esp_random();
-  if (adminConfirmed[target]) {
-    syncPhase = SyncReady; syncDeadline = millis();
-    syncResult = "Reusing confirmed repeater admin access.";
-    return true;
+  entries[target].syncAttemptAt = now();
+  strlcpy(entries[target].syncAttemptResult, "In progress", sizeof(entries[target].syncAttemptResult));
+  if (!save()) {
+    strlcpy(entries[target].syncAttemptResult, "Could not save sync attempt; no command sent.", sizeof(entries[target].syncAttemptResult));
+    syncResult = entries[target].syncAttemptResult;
+    return false;
   }
+  syncLoginAttempt = 0; syncResetCount = 0; syncCommandAttempts = 0; syncToken = (uint8_t)esp_random();
   return startSyncLogin();
 }
 
 bool RepeaterMonitor::startSyncLogin() {
   if (syncTarget < 0 || syncTarget >= (int)count || !syncTimeReady()) {
-    finishClockSync("Could not authorize clock sync; no fresh NTP time."); return false;
+    finishClockSync("No fresh NTP at login"); return false;
   }
   adminConfirmed[syncTarget] = false;
-  syncLoginAttempted = true;
   auto* c = mesh.lookupContactByPubKey(entries[syncTarget].key, 32);
   const char* password = credentials.password(entries[syncTarget].key);
   uint32_t estimate = 0;
-  if (!c || !password[0] || mesh.sendLogin(*c, password, estimate) == MSG_SEND_FAILED) {
-    finishClockSync("Could not send admin login; synchronization unconfirmed."); return false;
+  if (!c || !password[0]) {
+    finishClockSync("No Password"); return false;
   }
-  syncPhase = SyncLogin; syncDeadline = millis() + timeout(estimate);
-  syncResult = "Waiting for repeater admin login.";
+  // Every sync login uses flood, without overwriting the saved contact route.
+  ContactInfo target = *c;
+  target.out_path_len = OUT_PATH_UNKNOWN;
+  ++syncLoginAttempt;
+  syncLoginSentUtc = now(); syncLoginSentMillis = millis();
+  const bool sent = mesh.sendLogin(target, password, estimate) != MSG_SEND_FAILED;
+  syncPhase = SyncLogin;
+  syncDeadline = millis() + (sent ? timeout(estimate) : 3000);
+  syncResult = sent ? "Waiting for repeater admin login." : "Admin login send failed; waiting to retry.";
   return true;
 }
 
 void RepeaterMonitor::finishClockSync(const char* result) {
   syncPhase = SyncIdle; syncResult = result;
+  if (syncTarget >= 0 && syncTarget < (int)count) {
+    entries[syncTarget].syncAttemptAt = now();
+    strlcpy(entries[syncTarget].syncAttemptResult, result, sizeof(entries[syncTarget].syncAttemptResult));
+    if (storageOK && !save()) syncResult += " Result could not be saved.";
+  }
+  if(adminCheckPending && adminCheckIsSync && !adminCheckReply[0]) {
+    snprintf(adminCheckReply,sizeof(adminCheckReply),"%s: %.60s",adminCheckName,syncResult.c_str());
+  }
   if (running && automatic) deadline = millis() + 10000;
+}
+
+void RepeaterMonitor::chooseSyncAction(int64_t offset) {
+  if (offset < 0) {
+    syncPhase=SyncReady; syncDeadline=millis()+3000;
+    syncResult="Clock is behind; preparing clock sync.";
+  } else if (offset == 0 || (syncResetCount == 0 && offset <= 180)) {
+    finishClockSync("Clock is ahead, but close");
+  } else if (syncResetCount >= 3) {
+    finishClockSync("Reset limit reached");
+  } else {
+    syncPhase=SyncResetReady; syncDeadline=millis()+3000;
+    syncResult="Clock is ahead; preparing clock reset/reboot.";
+  }
 }
 
 void RepeaterMonitor::pollClockSync() {
   if (syncPhase == SyncIdle || !elapsed(millis(), syncDeadline)) return;
-  if (syncPhase == SyncLogin) { adminConfirmed[syncTarget] = false; finishClockSync("Admin login timed out; synchronization unconfirmed."); return; }
-  if (syncPhase == SyncReply) {
-    adminConfirmed[syncTarget] = false;
-    if (!syncLoginAttempted) startSyncLogin();
-    else finishClockSync("No confirmation received; clock may have changed.");
+  if (syncPhase == SyncLogin) {
+    if (syncLoginAttempt < 3) startSyncLogin();
+    else { adminConfirmed[syncTarget] = false; finishClockSync("Admin login timeout"); }
     return;
   }
-  if (syncPhase == SyncCheckReply) { finishClockSync("Could not verify future clock; no reset sent."); return; }
-  if (syncPhase == SyncRebootWait) { startSyncLogin(); return; }
-  if (!syncTimeReady()) { finishClockSync("NTP time is stale; synchronization stopped."); return; }
+  if (syncPhase == SyncReply) {
+    if (syncCommandAttempts < 4) {
+      syncPhase=SyncReady; syncDeadline=millis()+3000;
+      syncResult="No confirmation received; retrying clock sync.";
+    } else { adminConfirmed[syncTarget]=false; finishClockSync("No confirmation received"); }
+    return;
+  }
+  if (syncPhase == SyncRebootWait) { syncLoginAttempt = 0; startSyncLogin(); return; }
+  if (!syncTimeReady()) { finishClockSync("NTP expired during sync"); return; }
   auto* c = mesh.lookupContactByPubKey(entries[syncTarget].key, 32);
   uint32_t stamp = mesh.getRTCClock()->getCurrentTimeUnique(), utc = now(), estimate = 0;
   if (!c || stamp < utc || stamp - utc > 5) {
     finishClockSync("Bot timestamp is not close to NTP; synchronization stopped."); return;
   }
-  const bool checking = syncPhase == SyncCheckReady, resetting = syncPhase == SyncResetReady;
-  if (resetting && syncResetAttempted) { finishClockSync("Reset already attempted; no further reboot sent."); return; }
+  const bool resetting = syncPhase == SyncResetReady;
+  if (resetting && syncResetCount >= 3) { finishClockSync("Reset limit reached"); return; }
   // Each step has a different echoed prefix, so late replies from earlier steps cannot advance it.
   snprintf(syncPrefix, sizeof(syncPrefix), "%02X|", (unsigned)++syncToken);
   char command[16];
-  snprintf(command, sizeof(command), "%s%s", syncPrefix, resetting ? "clkreboot" : checking ? "clock" : "clock sync");
+  snprintf(command, sizeof(command), "%s%s", syncPrefix, resetting ? "clkreboot" : "clock sync");
   syncCommandSentUtc = utc; syncCommandSentMillis = millis();
-  if (mesh.sendCommandData(*c, stamp, 0, command, estimate) == MSG_SEND_FAILED) {
+  ContactInfo target = *c;
+  target.out_path_len = OUT_PATH_UNKNOWN;
+  if (mesh.sendCommandData(target, stamp, 0, command, estimate) == MSG_SEND_FAILED) {
     finishClockSync("Could not send clock command; synchronization stopped."); return;
   }
   syncDeadline = millis() + timeout(estimate);
   if (resetting) {
-    syncResetAttempted = true; adminConfirmed[syncTarget] = false;
+    ++syncResetCount; adminConfirmed[syncTarget] = false;
     syncPhase = SyncRebootWait; syncDeadline += 30000;
-    syncResult = "Clock reset/reboot sent once; waiting before logging in and retrying sync.";
-  } else if (checking) {
-    syncPhase = SyncCheckReply; syncResult = "Checking the repeater wall clock before considering a reset.";
+    syncResult = "Clock reset/reboot sent; waiting before fresh admin login.";
   } else {
-    syncPhase = SyncReply; syncResult = syncResetAttempted ? "Waiting for sync confirmation after reset." : "Waiting for clock-sync confirmation.";
+    ++syncCommandAttempts;
+    syncPhase = SyncReply; syncResult = "Waiting for clock-sync confirmation.";
   }
 }
 
@@ -668,29 +961,15 @@ void RepeaterMonitor::recordClockSample(uint32_t remoteMinute) {
 }
 
 bool RepeaterMonitor::onCommandResponse(const ContactInfo& from, const char* text) {
-  if ((syncPhase != SyncReply && syncPhase != SyncCheckReply && syncPhase != SyncRebootWait) ||
+  if ((syncPhase != SyncReply && syncPhase != SyncRebootWait) ||
       syncTarget < 0 || syncTarget >= (int)count || elapsed(millis(), syncDeadline) ||
       memcmp(from.id.pub_key, entries[syncTarget].key, 32) || strncmp(text, syncPrefix, 3)) return false;
   const char* reply = text + 3;
   if (syncPhase == SyncRebootWait) {
     // Supported clkreboot reboots immediately without a CLI reply.
-    finishClockSync("Repeater returned a reply to clkreboot; reset was not confirmed. Stopped.");
-  } else if (syncPhase == SyncCheckReply) {
-    uint32_t remote;
-    if (!parseClockReply(reply, remote)) finishClockSync("Could not parse repeater wall clock; no reset sent.");
-    else if (!syncTimeReady()) finishClockSync("NTP time is stale; no reset sent.");
-    else {
-      const Entry previous = entries[syncTarget];
-      recordClockSample(remote);
-      if (!save()) {
-        entries[syncTarget] = previous;
-        finishClockSync("Clock checked, but its offset could not be saved; no reset sent.");
-        return true;
-      }
-      // Do not reboot a healthy repeater for minute quantization or small differences.
-      if ((int64_t)remote - now() <= 60) finishClockSync("Clock checked; not clearly ahead. Approximate offset updated; no reset needed.");
-      else { syncPhase = SyncResetReady; syncDeadline = millis() + 3000; syncResult = "Future wall clock confirmed; preparing one clock reset/reboot."; }
-    }
+    // A reply does not prove a reboot. Keep the wait, then use a fresh login
+    // measurement to decide whether another bounded reset is needed.
+    syncResult = "clkreboot sent, no reboot detected";
   } else if (!strncmp(reply, "OK - clock set:", 15)) {
     adminConfirmed[syncTarget] = true;
     const Entry previous = entries[syncTarget];
@@ -703,13 +982,39 @@ bool RepeaterMonitor::onCommandResponse(const ContactInfo& from, const char* tex
       finishClockSync("Repeater confirmed sync, but its timestamp could not be saved.");
       return true;
     }
-    finishClockSync(syncResetAttempted ? "Repeater confirmed clock sync after reset/reboot." : "Repeater confirmed its clock was moved forward.");
+    finishClockSync("Successful sync");
   } else if (!strcmp(reply, "ERR: clock cannot go backwards") || !strcmp(reply, "(ERR: clock cannot go backwards)")) {
     adminConfirmed[syncTarget] = true;
-    if (syncResetAttempted) finishClockSync("Clock sync still refused after reset; no further reboot sent.");
-    else { syncPhase = SyncCheckReady; syncDeadline = millis() + 3000; syncResult = "Backward change refused; checking whether the repeater is actually ahead."; }
-  } else finishClockSync("Repeater did not confirm clock synchronization.");
+    finishClockSync(syncResetCount ? "Sync refused after reset" : "Clock sync refused");
+  } else finishClockSync("Unrecognized sync response");
   return true;
+}
+
+void RepeaterMonitor::scheduleSunriseNotification() {
+  voltageList(sunriseNotification, true);
+  if (!sunriseNotification.count) {
+    sunriseNotification.count = 1;
+    strlcpy(sunriseNotification.lines[0], BotVoltageList::EMPTY_LOW, BotVoltageList::LINE_SIZE);
+  }
+  sunriseRecipient = 0;
+  sunriseNotificationDue = millis() + 60000;
+  sunriseNotificationExpires = millis() + 3600000;
+  sunriseNotificationPending = true;
+}
+
+void RepeaterMonitor::pollSunriseNotification() {
+  if (!sunriseNotificationPending) return;
+  if (elapsed(millis(), sunriseNotificationExpires)) { sunriseNotificationPending = false; return; }
+  if (busy() || !elapsed(millis(), sunriseNotificationDue)) return;
+  while (sunriseRecipient < adminContacts.count()) {
+    const auto* admin = adminContacts.at(sunriseRecipient);
+    if (!(admin->permissions & BotAdminContacts::Notifications) ||
+        !mesh.lookupContactByPubKey(admin->key, 32)) { ++sunriseRecipient; continue; }
+    if (!mesh.queueSunriseNotification(admin->key, sunriseNotification)) return;
+    ++sunriseRecipient;
+    return; // One recipient at a time; the shared DM queue handles pacing and ACKs.
+  }
+  sunriseNotificationPending = false;
 }
 
 void RepeaterMonitor::loop() {
@@ -741,5 +1046,7 @@ void RepeaterMonitor::loop() {
   if (synced && elapsed(millis(), nextPrune)) { prune(now()); nextPrune = millis() + 60000; }
   pollClockSync();
   poll();
+  pollAdminCheckReply();
+  pollSunriseNotification();
 }
 #endif

@@ -185,19 +185,30 @@ void formatQuarters(int8_t quarters, char* output, size_t output_len) {
 
 BotCommandResult executeCmd(const BotCommand& command, char* output, size_t output_len) {
   return writeText(output, output_len,
-                   "help  cmd  hello  about  version  time  status  stats  air  ping  test  path  snr  channels  lora  id  neighbors");
+                   "help  cmd  hello  about  version  time  status  stats  air  ping  test  path  snr  channels  lora  id  neighbors  list");
 }
 
 BotCommandResult executeHelp(const BotCommand& command, char* output, size_t output_len) {
   if (command.args_len == 0) {
     return writeText(output, output_len,
-                     "help  cmd  hello  about  version  time  status  stats  air  ping  test  path  snr  channels  lora  id  neighbors");
+                     "help  cmd  hello  about  version  time  status  stats  air  ping  test  path  snr  channels  lora  id  neighbors  list");
   }
 
+  if (command.args_len == 4 && !strcmp(command.args,"list"))
+    return writeText(output,output_len,
+      "list: list of all managed repeaters with last saved voltage\n"
+      "list low: list of repeaters with voltage below 3.6V or N/A");
+  if (command.args_len == 8 && !strcmp(command.args,"list low"))
+    return writeText(output,output_len,"list low: list of repeaters with voltage below 3.6V or N/A");
   const BotCommandMetadata* metadata = BotCommandRegistry::findByName(command.args, command.args_len);
   if (!metadata) return writeFormatted(output, output_len, "No help for %s", command.args);
   if (metadata->visibility != BOT_COMMAND_VISIBILITY_DISCOVERABLE) {
     return writeFormatted(output, output_len, "%s is not available", command.args);
+  }
+  if (metadata->id == BOT_COMMAND_NEIGHBORS) {
+    return writeText(output, output_len,
+      "Neighbors: list of directly heard repeaters in one page\n"
+      "Neighbors all: list of all directly heard repeaters");
   }
   if (metadata->id == BOT_COMMAND_SIG) {
     return writeFormatted(output, output_len, "%s Usage: %s", metadata->details, metadata->usage);
@@ -334,6 +345,18 @@ BotCommandResult executeTest(const BotCommand& command, const BotCommandContext&
   unsigned hops = (unsigned)context.path_hash_count;
 
   uint32_t now = context.received_at_timestamp;
+  // Receive time includes transit delay; compare in 64 bits to avoid unsigned wrap.
+  int64_t offset = (int64_t)context.sender_timestamp - (int64_t)now;
+  if (offset < 0) offset = -offset;
+  char clock_detail[40];
+  const char* clock_status = !context.sender_timestamp || !now ? "Clock comparison unavailable" :
+      offset > 600 ? "Your clock is way off" :
+      offset > 60 ? clock_detail : "Your clock is ok";
+  if (context.sender_timestamp && now && offset > 60 && offset <= 600) {
+    snprintf(clock_detail, sizeof(clock_detail), "Your clock is off by %lum %lus",
+             (unsigned long)(offset / 60), (unsigned long)(offset % 60));
+  }
+
 
   int32_t utc_offset = FirmwareBot::easternUtcOffsetSeconds(now);
   uint32_t eastern_time =
@@ -347,34 +370,34 @@ BotCommandResult executeTest(const BotCommand& command, const BotCommandContext&
   if (hops == 0) {
     if (target) {
       return writeFormatted(output, output_len,
-                            "@[%s]\nDirect\nSNR %s | RSSI %d dBm | noise %d dBm\nrecv %s %s",
+                            "@[%s]\nDirect\nSNR %s | RSSI %d dBm | noise %d dBm\nrecv %s %s\n%s",
                             target, snr,
                             (int)context.last_rssi,
                             (int)context.noise_floor,
-                            received_at, tz);
+                            received_at, tz, clock_status);
     }
 
     return writeFormatted(output, output_len,
-                          "Direct\nSNR %s | RSSI %d dBm | noise %d dBm\nrecv %s %s",
+                          "Direct\nSNR %s | RSSI %d dBm | noise %d dBm\nrecv %s %s\n%s",
                           snr,
                           (int)context.last_rssi,
                           (int)context.noise_floor,
-                          received_at, tz);
+                          received_at, tz, clock_status);
   }
 
   if (target) {
     return writeFormatted(output, output_len,
-                          "@[%s]\n%u hops, %u-byte\nrecv %s %s",
+                          "@[%s]\n%u hops, %u-byte\nrecv %s %s\n%s",
                           target, hops,
                           (unsigned)context.path_hash_size,
-                          received_at, tz);
+                          received_at, tz, clock_status);
   }
 
   return writeFormatted(output, output_len,
-                        "%u hops, %u-byte\nrecv %s %s",
+                        "%u hops, %u-byte\nrecv %s %s\n%s",
                         hops,
                         (unsigned)context.path_hash_size,
-                        received_at, tz);
+                        received_at, tz, clock_status);
 }
 
 }

@@ -1,0 +1,62 @@
+#pragma once
+#include "RepeaterMonitorCore.h"
+#include <cstdio>
+#include <cstring>
+namespace BotVoltageList {
+constexpr size_t LINE_SIZE = 64;
+constexpr const char* EMPTY_LOW = "no repeaters with voltage lower than 3.6v or N/A";
+struct Snapshot { char lines[MonitorCore::MAX_REPEATERS][LINE_SIZE]{}; size_t count = 0; };
+inline void shortName(const char* name, const uint8_t* key, char* out) {
+  size_t n = 0;
+  while (name && n < 32 && ((name[n] >= 'A' && name[n] <= 'Z') ||
+         (name[n] >= 'a' && name[n] <= 'z') || (name[n] >= '0' && name[n] <= '9') || name[n] == ' ')) {
+    out[n] = name[n]; ++n;
+  }
+  while (n && out[n-1] == ' ') --n;
+  out[n] = 0;
+  if (!n) snprintf(out, 33, "[%02x%02x%02x%02x]", key[0],key[1],key[2],key[3]);
+}
+inline void build(const MonitorCore::Entry* entries, const char names[][33], size_t count, Snapshot& out, const size_t* order = nullptr, bool lowOnly = false) {
+  const size_t total = count > MonitorCore::MAX_REPEATERS ? MonitorCore::MAX_REPEATERS : count;
+  out.count = 0;
+  for(size_t row=0;row<total;++row) {
+    const size_t i=order ? order[row] : row;
+    if (!entries[i].enabled) continue;
+    bool duplicate=false;
+    for(size_t j=0;j<total;++j) if(i!=j && entries[j].enabled && !strcmp(names[i],names[j])) duplicate=true;
+    char label[48];
+    if(duplicate) snprintf(label,sizeof(label),"%s[%02x%02x%02x%02x]",names[i],entries[i].key[0],entries[i].key[1],entries[i].key[2],entries[i].key[3]);
+    else snprintf(label,sizeof(label),"%s",names[i]);
+    const MonitorCore::Reading* latest=nullptr;
+    for(const auto& reading:entries[i].readings)
+      if(reading.timestamp && (!latest || reading.timestamp>latest->timestamp)) latest=&reading;
+    if(lowOnly && latest && latest->result==MonitorCore::Ok && latest->millivolts>=3600) continue;
+    const size_t outputRow=out.count++;
+    if(latest && latest->result==MonitorCore::Ok)
+      snprintf(out.lines[outputRow],LINE_SIZE,"%s %u.%02uV",label,((latest->millivolts+5)/10)/100,((latest->millivolts+5)/10)%100);
+    else snprintf(out.lines[outputRow],LINE_SIZE,"%s N/A",label);
+  }
+}
+// Reserve enough room for the largest possible heading: 32/32 plus newline.
+inline size_t pageEnd(const Snapshot& s, size_t next, size_t capacity) {
+  size_t used=6;
+  while(next<s.count) {
+    const size_t len=strlen(s.lines[next]);
+    if(used+len+1>=capacity) break;
+    used+=len+1; ++next;
+  }
+  return next;
+}
+inline bool page(const Snapshot& s, size_t& next, unsigned part, char* out, size_t capacity) {
+  if(capacity<80 || next>=s.count) return false;
+  unsigned total=0;
+  for(size_t cursor=0;cursor<s.count;++total) cursor=pageEnd(s,cursor,capacity);
+  const size_t end=pageEnd(s,next,capacity);
+  size_t used=snprintf(out,capacity,"%u/%u\n",part,total);
+  while(next<end) {
+    const size_t len=strlen(s.lines[next]);
+    memcpy(out+used,s.lines[next],len);used+=len;out[used++]='\n';++next;
+  }
+  out[used-1]=0;return true;
+}
+}

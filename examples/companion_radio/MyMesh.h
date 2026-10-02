@@ -1,3 +1,4 @@
+#include "BotVoltageList.h"
 #pragma once
 
 #include <Arduino.h>
@@ -103,6 +104,9 @@ public:
   void begin(bool has_display);
   void startInterface(BaseSerialInterface &serial);
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+  bool sendAdminCheckResult(const uint8_t* key, const char* text);
+  bool queueSunriseNotification(const uint8_t* key, const BotVoltageList::Snapshot& snapshot);
+  uint32_t getLastBotAdvertTime() const { return last_bot_advert_time; }
   void setRepeaterMonitor(RepeaterMonitor* monitor) { repeaterMonitor = monitor; }
   void saveMonitorContacts() { saveContacts(); }
   bool restoreMonitorContactName(const uint8_t* key);
@@ -236,7 +240,7 @@ private:
   BotCommandResult executeBotTimeCommand(const BotMessage &message, char *output, size_t output_len);
   BotCommandResult executeBotLoraCommand(const BotMessage &message, char *output, size_t output_len);
   BotCommandResult executeBotIdCommand(const BotMessage &message, char *output, size_t output_len);
-  BotCommandResult executeBotNeighborsCommand(const BotMessage &message, char *output, size_t output_len);
+  BotCommandResult executeBotNeighborsCommand(const BotMessage &message, char *output, size_t output_len, BotVoltageList::Snapshot* snapshot = nullptr);
   void recordBotNeighbor(const uint8_t *pub_key, int16_t rssi_dbm, int8_t snr_quarters);
   bool enqueueEmergencyForward(const BotMessage &message);
   bool findBotChannel(BotChannelKind kind, uint8_t &channel_idx);
@@ -245,7 +249,20 @@ private:
   void tickBot();
   void scheduleBotLocalAdvert(unsigned long interval_millis);
   void scheduleBotFloodAdvert(unsigned long interval_millis);
-  bool sendBotSelfAdvert(bool flood);
+  bool sendBotSelfAdvert(bool flood, bool trackAdmin = false);
+  void logTx(mesh::Packet* packet, int len) override;
+  void logTxFail(mesh::Packet* packet, int len) override;
+  void completeAdminAdvert(mesh::Packet* packet, bool success);
+  void pollAdminAdvert();
+  uint32_t last_bot_advert_time = 0;
+  struct {
+    bool active=false; uint8_t result=0;
+    uint8_t key[PUB_KEY_SIZE]{}, hash[MAX_HASH_SIZE]{};
+    mesh::Packet* packet=nullptr;
+    uint32_t deadline=0;
+  } pending_admin_advert;
+  bool handleBotAdminCommand(const BotMessage &message, const ContactInfo *direct_recipient,
+                            const BotCommand &command);
 #endif
 
   void checkCLIRescueCmd();
@@ -299,6 +316,17 @@ private:
   };
 
 
+  struct PendingVoltageList {
+    BotVoltageList::Snapshot snapshot;
+    BotCommandId command = BOT_COMMAND_LIST;
+    bool notification = false;
+    bool active=false;
+    BotChannelKind kind=BOT_CHANNEL_DM;
+    uint8_t channel=0xFF, key[PUB_KEY_SIZE]{};
+    size_t next=0; unsigned part=1, failures=0;
+    uint32_t deadline=0, expires=0;
+  } pending_voltage_list;
+  void sendNextVoltageListPart();
   BotPrefs bot_prefs;
   BotStats bot_stats;
   PendingBotDmAck pending_bot_dm_ack;
