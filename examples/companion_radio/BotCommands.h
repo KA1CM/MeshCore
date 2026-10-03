@@ -1,8 +1,11 @@
 #pragma once
 
 #include "BotTypes.h"
+#include "BotPath.h"
 
 namespace BotCommands {
+
+bool pathRoute(const BotCommand& command, const BotCommandContext& context, BotPath::Route& route);
 
 BotCommandResult executeCommand(const BotCommand& command, const BotCommandContext& context, char* output,
                                 size_t output_len);

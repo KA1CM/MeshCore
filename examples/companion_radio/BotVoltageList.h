@@ -1,5 +1,6 @@
 #pragma once
 #include "RepeaterMonitorCore.h"
+#include "BotShortName.h"
 #include <cstdio>
 #include <cstring>
 namespace BotVoltageList {
@@ -7,14 +8,8 @@ constexpr size_t LINE_SIZE = 64;
 constexpr const char* EMPTY_LOW = "no repeaters with voltage lower than 3.6v or N/A";
 struct Snapshot { char lines[MonitorCore::MAX_REPEATERS][LINE_SIZE]{}; size_t count = 0; };
 inline void shortName(const char* name, const uint8_t* key, char* out) {
-  size_t n = 0;
-  while (name && n < 32 && ((name[n] >= 'A' && name[n] <= 'Z') ||
-         (name[n] >= 'a' && name[n] <= 'z') || (name[n] >= '0' && name[n] <= '9') || name[n] == ' ')) {
-    out[n] = name[n]; ++n;
-  }
-  while (n && out[n-1] == ' ') --n;
-  out[n] = 0;
-  if (!n) snprintf(out, 33, "[%02x%02x%02x%02x]", key[0],key[1],key[2],key[3]);
+  BotShortName::write(name,out);
+  if (!out[0]) snprintf(out, 33, "[%02x%02x%02x%02x]", key[0],key[1],key[2],key[3]);
 }
 inline void build(const MonitorCore::Entry* entries, const char names[][33], size_t count, Snapshot& out, const size_t* order = nullptr, bool lowOnly = false) {
   const size_t total = count > MonitorCore::MAX_REPEATERS ? MonitorCore::MAX_REPEATERS : count;

@@ -2,6 +2,7 @@
 #include "RepeaterMonitor.h"
 #include "RepeaterMonitorPage.h"
 #include "MyMesh.h"
+#include "BotPathLookup.h"
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <SPIFFS.h>
@@ -341,6 +342,12 @@ void RepeaterMonitor::routes() {
     }
     doc["error"] = lastError; doc["ip"] = WiFi.localIP().toString();
     doc["node"] = mesh.getNodeName();
+    const auto lookup=BotPathLookup::status();
+    JsonObject lookupState=doc["pathLookup"].to<JsonObject>();
+    lookupState["stage"]=lookup.stage; lookupState["detail"]=lookup.detail;
+    lookupState["freeHeap"]=lookup.freeHeap; lookupState["largestBlock"]=lookup.largestBlock;
+    lookupState["lastFailure"]=lookup.lastFailure; lookupState["lastFailureDetail"]=lookup.lastFailureDetail;
+    lookupState["failureHeap"]=lookup.failureHeap; lookupState["failureBlock"]=lookup.failureBlock;
     doc["lastAdvert"] = mesh.getLastBotAdvertTime();
     JsonArray neighbors = doc["neighbors"].to<JsonArray>();
 #if CMESH_BOT_ENABLED

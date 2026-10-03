@@ -13,6 +13,7 @@
 #if CMESH_BOT_ENABLED
 #include "BotCommandRegistry.h"
 #include "BotCommands.h"
+#include "BotPathLookup.h"
 #include "BotPolicy.h"
 #include "BotPrefs.h"
 #include "EmergencyForwarder.h"
@@ -1459,15 +1460,15 @@ bool MyMesh::handleBotAdminCommand(const BotMessage &message, const ContactInfo 
   }
   const char *response = nullptr;
   if (adminHelp) {
-    response = "Admin help: advert\ncheck <repeater>\nsync <repeater>.";
+    response = "Admin help:\nadvert\ncheck <repeater>\nsync <repeater>";
   } else if (command.id == BOT_COMMAND_SYNC) {
     response = repeaterMonitor->startAdminCheck(direct_recipient->id.pub_key, command.args, true);
-    if (!response) response = "Syncing; I will send the result when finished";
+    if (!response) response = "Syncing... I will send the result when finished";
   } else if (command.id == BOT_COMMAND_CHECK) {
     response = repeaterMonitor->startAdminCheck(direct_recipient->id.pub_key, command.args);
     // Worst case: 10 requests x 180s, eight 15s retry pauses, and 3s after login.
     // Round 1923 seconds up to 33 minutes; successful checks usually finish sooner.
-    if (!response) response = "Checking, this might take up to 33 minutes";
+    if (!response) response = "Checking... this might take up to 33 minutes";
   } else if (command.args_len) {
     response = "Usage: advert";
   } else {
@@ -1571,10 +1572,33 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
       command.id == BOT_COMMAND_TEST ||
       command.id == BOT_COMMAND_SIG) {
     context.path_len = message.path_len;
-    context.path_hash_size = command.args_len > 0 ? botConfiguredTraceHashSize(_prefs.path_hash_mode) : message.path_hash_size;
+    context.path_hash_size = command.args_len > 0 ?
+      (command.id == BOT_COMMAND_PATH ? _prefs.path_hash_mode + 1 : botConfiguredTraceHashSize(_prefs.path_hash_mode)) : message.path_hash_size;
     context.path_hash_count = message.path_hash_count;
     context.path_snr_quarters = message.packet_snr_quarters;
     context.path = message.path;
+  }
+  if (command.id == BOT_COMMAND_PATH) {
+    BotPath::Route route;
+    if (BotCommands::pathRoute(command,context,route)) {
+      resolveLocalPathNames(route);
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+      if (!pending_bot_path.active && BotPathLookup::start(route)) {
+        auto& q=pending_bot_path;
+        q.active=true; q.ready=false; q.route=route; q.message=message;
+        q.message.path=nullptr; // The received packet will be freed after this call.
+        q.channel=channel_idx; q.lookupDeadline=futureMillis(12000); q.expires=futureMillis(30000);
+        if(direct_recipient) memcpy(q.key,direct_recipient->id.pub_key,PUB_KEY_SIZE);
+        bot_stats.eligible_messages++;
+        FirmwareBot::recordCommandCooldown(bot_command_cooldowns,BOT_COMMAND_COOLDOWN_SLOTS,
+          command.id,_ms->getMillis(),BOT_COMMAND_COOLDOWN_MILLIS);
+        return;
+      }
+#endif
+      const size_t budget=FirmwareBot::maxResponseLenForChannel(message.channel_kind);
+      result=BotPath::format(route,context.response_target,response,budget+1);
+      result_ready=true;
+    }
   }
   char last_repeater_name[BOT_MAX_SENDER_NAME_LEN + 1] = {};
   if (command.id == BOT_COMMAND_SIG && message.path_is_inbound && message.path &&
@@ -1829,6 +1853,44 @@ void MyMesh::pollAdminAdvert() {
 #endif
 }
 
+void MyMesh::resolveLocalPathNames(BotPath::Route& route) {
+  for(size_t hop=0;hop<route.count;++hop) {
+    ContactsIterator iter; ContactInfo contact; unsigned matches=0;
+    char local[33]{};
+    while(iter.hasNext(this,contact)) {
+      if(contact.type!=ADV_TYPE_REPEATER || memcmp(contact.id.pub_key,route.bytes+hop*route.width,route.width)) continue;
+      if(++matches>1) break;
+      BotPath::shortName(contact.name,local);
+    }
+    if(matches>1) { route.ambiguous[hop]=true; route.names[hop][0]=0; }
+    else if(matches==1 && local[0]) { memcpy(route.names[hop],local,33); route.ambiguous[hop]=false; }
+  }
+}
+
+void MyMesh::pollBotPath() {
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+  auto& q=pending_bot_path;
+  if(!q.active) { BotPathLookup::take(q.route); return; } // Drain a late worker result.
+  if(!q.ready) q.ready=BotPathLookup::take(q.route);
+  if(!q.ready && millisHasNowPassed(q.lookupDeadline)) q.ready=true;
+  if(!q.ready) return;
+  if(!bot_prefs.enabled || !BotPrefsCodec::commandEnabled(bot_prefs,BOT_COMMAND_PATH) || millisHasNowPassed(q.expires)) {
+    q.active=false; return;
+  }
+  if(q.message.channel_kind==BOT_CHANNEL_DM && (pending_bot_dm_ack.active || pending_voltage_list.active)) return;
+  resolveLocalPathNames(q.route); // Adverts received during the lookup take priority.
+  char response[BOT_MAX_RESPONSE_LEN+1], formatted[BOT_MAX_RESPONSE_LEN+1];
+  const size_t budget=FirmwareBot::maxResponseLenForChannel(q.message.channel_kind);
+  const auto result=BotPath::format(q.route,q.message.sender_name,response,budget+1);
+  size_t written=0;
+  auto* recipient=q.message.channel_kind==BOT_CHANNEL_DM ? lookupContactByPubKey(q.key,PUB_KEY_SIZE) : nullptr;
+  q.active=false;
+  if(result.code!=BOT_COMMAND_RESULT_OK ||
+     !botFormatResponseForChannel(q.message,response,result.text_len,formatted,sizeof(formatted),&written) ||
+     !sendBotResponse(q.message,recipient,q.channel,formatted,written)) ++bot_stats.send_failures;
+#endif
+}
+
 void MyMesh::scheduleBotLocalAdvert(unsigned long interval_millis) {
   next_bot_local_advert = interval_millis > 0 ? futureMillis(interval_millis) : 0;
 }
@@ -1891,6 +1953,7 @@ void MyMesh::sendNextVoltageListPart() {
 
 void MyMesh::tickBot() {
   pollAdminAdvert();
+  pollBotPath();
   sendNextVoltageListPart();
   uint32_t now = _ms->getMillis();
 

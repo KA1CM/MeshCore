@@ -104,7 +104,7 @@ bool parseHexByte(const char* text, uint8_t* value) {
 bool parsePathArgument(const char* text, size_t len, uint8_t configured_hash_size, ParsedPathArg* parsed) {
   memset(parsed, 0, sizeof(*parsed));
   if (!text || len == 0) return false;
-  if (configured_hash_size != 0 && configured_hash_size != 1 && configured_hash_size != 2 && configured_hash_size != 4) return false;
+  if (configured_hash_size != 0 && configured_hash_size != 1 && configured_hash_size != 2 && configured_hash_size != 3 && configured_hash_size != 4) return false;
 
   bool has_comma = false;
   for (size_t i = 0; i < len; i++) {
@@ -121,7 +121,7 @@ bool parsePathArgument(const char* text, size_t len, uint8_t configured_hash_siz
         pos++;
       }
       size_t token_len = pos - start;
-      if (token_len != 2 && token_len != 4 && token_len != 8) return false;
+      if (token_len != 2 && token_len != 4 && token_len != 6 && token_len != 8) return false;
       if (configured_hash_size != 0 && token_len != (size_t)configured_hash_size * 2) return false;
       if (chunk_hex_len == 0) chunk_hex_len = token_len;
       if (token_len != chunk_hex_len) return false;
@@ -167,14 +167,6 @@ void appendPathHex(char* output, size_t output_len, size_t* pos, const uint8_t* 
   if (output_len > 0) output[*pos < output_len ? *pos : output_len - 1] = 0;
 }
 
-void appendPathHops(char* output, size_t output_len, size_t* pos, const uint8_t* path, uint8_t hash_size,
-                    uint8_t hash_count) {
-  for (uint8_t hop = 0; hop < hash_count; hop++) {
-    if (hop != 0) appendText(output, output_len, pos, ", ");
-    appendPathHex(output, output_len, pos, &path[(size_t)hop * hash_size], hash_size);
-  }
-}
-
 void formatQuarters(int8_t quarters, char* output, size_t output_len) {
   if (!output || output_len == 0) return;
   int value = quarters;
@@ -217,44 +209,11 @@ BotCommandResult executeHelp(const BotCommand& command, char* output, size_t out
                         metadata->name, metadata->details, metadata->usage);
 }
 
-BotCommandResult executePathLike(const BotCommandContext& context, char* output, size_t output_len, const char* label) {
-  if (context.path_hash_size == 0) return writeFormatted(output, output_len, "%s unavailable", label);
-  if (!output || output_len == 0) return makeResult(BOT_COMMAND_RESULT_NO_SPACE, 0);
-
-  const char* target = context.response_target[0] ? context.response_target : NULL;
-  if (context.path_hash_count == 0 || context.path_len == 0) {
-    if (target) return writeFormatted(output, output_len, "@[%s] Direct", target);
-    return writeText(output, output_len, "Direct");
-  }
-  if (!context.path) return writeFormatted(output, output_len, "%s unavailable", label);
-
-  output[0] = 0;
-  size_t pos = 0;
-  if (target) {
-    appendText(output, output_len, &pos, "@[");
-    appendText(output, output_len, &pos, target);
-    appendText(output, output_len, &pos, "] ");
-  }
-  appendPathHops(output, output_len, &pos, context.path, context.path_hash_size, context.path_hash_count);
-  size_t actual = boundedStrLen(output, output_len);
-  return makeResult(pos >= output_len ? BOT_COMMAND_RESULT_TRUNCATED : BOT_COMMAND_RESULT_OK, actual);
-}
-
-BotCommandResult executePathArg(const BotCommand& command, const BotCommandContext& context, char* output, size_t output_len) {
-  ParsedPathArg path;
-  if (!parsePathArgument(command.args, command.args_len, context.path_hash_size, &path)) return writeText(output, output_len, "Usage: path [path]");
-  if (!output || output_len == 0) return makeResult(BOT_COMMAND_RESULT_NO_SPACE, 0);
-
-  output[0] = 0;
-  size_t pos = 0;
-  appendPathHops(output, output_len, &pos, path.bytes, path.hash_size, path.hash_count);
-  size_t actual = boundedStrLen(output, output_len);
-  return makeResult(pos >= output_len ? BOT_COMMAND_RESULT_TRUNCATED : BOT_COMMAND_RESULT_OK, actual);
-}
-
 BotCommandResult executePath(const BotCommand& command, const BotCommandContext& context, char* output, size_t output_len) {
-  if (command.args_len != 0) return executePathArg(command, context, output, output_len);
-  return executePathLike(context, output, output_len, "Path");
+  BotPath::Route route;
+  if (!BotCommands::pathRoute(command,context,route))
+    return writeText(output,output_len,command.args_len ? "Usage: path [path]" : "Path unavailable");
+  return BotPath::format(route,context.response_target,output,output_len);
 }
 
 void formatSecondsHms(uint32_t timestamp, char* output, size_t output_len) {
@@ -403,6 +362,25 @@ BotCommandResult executeTest(const BotCommand& command, const BotCommandContext&
 }
 
 namespace BotCommands {
+
+bool pathRoute(const BotCommand& command, const BotCommandContext& context, BotPath::Route& route) {
+  route=BotPath::Route{};
+  if(command.args_len) {
+    ParsedPathArg parsed{};
+    if(!parsePathArgument(command.args,command.args_len,context.path_hash_size,&parsed)) return false;
+    route.width=parsed.hash_size; route.count=parsed.hash_count;
+    memcpy(route.bytes,parsed.bytes,parsed.byte_len);
+    return true;
+  }
+  if(!context.path_hash_size || context.path_hash_size>4 ||
+     context.path_hash_count*context.path_hash_size>BOT_MAX_PATH_BYTES) return false;
+  route.width=context.path_hash_size;
+  route.count=context.path_len ? context.path_hash_count : 0;
+  if(route.count && !context.path) return false;
+  if(route.count) memcpy(route.bytes,context.path,route.count*route.width);
+  return true;
+}
+
 
 size_t formatTraceResult(char* output, size_t output_len, const char* target, uint32_t tag, uint8_t hash_size,
                          const uint8_t* path_snrs, const uint8_t* path_hashes, uint8_t hop_count,

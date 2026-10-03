@@ -10,6 +10,7 @@
 #endif
 #if CMESH_BOT_ENABLED
 #include "BotTypes.h"
+#include "BotPath.h"
 #define BOT_COMMAND_COOLDOWN_SLOTS 9
 #endif
 
@@ -254,6 +255,17 @@ private:
   void logTxFail(mesh::Packet* packet, int len) override;
   void completeAdminAdvert(mesh::Packet* packet, bool success);
   void pollAdminAdvert();
+  void resolveLocalPathNames(BotPath::Route& route);
+  void pollBotPath();
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+  struct {
+    bool active=false, ready=false;
+    BotPath::Route route;
+    BotMessage message{};
+    uint8_t key[PUB_KEY_SIZE]{}, channel=0xFF;
+    uint32_t lookupDeadline=0, expires=0;
+  } pending_bot_path;
+#endif
   uint32_t last_bot_advert_time = 0;
   struct {
     bool active=false; uint8_t result=0;
