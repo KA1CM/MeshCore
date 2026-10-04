@@ -87,6 +87,8 @@ enum BotCommandId : uint8_t {
   BOT_COMMAND_REMOVE = 32,
   BOT_COMMAND_ENABLE = 33,
   BOT_COMMAND_DISABLE = 34,
+  BOT_COMMAND_NOTES = 35,
+  BOT_COMMAND_PASSWORD = 36,
   BOT_COMMAND_UNKNOWN = 26
 };
 
@@ -184,7 +186,7 @@ struct BotMessage {
 struct BotCommand {
   BotCommandId id;
   char name[BOT_MAX_COMMAND_NAME_LEN + 1];
-  char args[BOT_MAX_COMMAND_ARGS_LEN + 1];
+  char args[BOT_MAX_TEXT_LEN + 1];
   size_t args_len;
 };
 
@@ -314,7 +316,8 @@ struct BotStats {
 
 static_assert(BOT_COMMAND_UNKNOWN < 32, "BotCommandId must fit uint32_t command masks");
 static_assert(sizeof(BotMessage) <= 264, "BotMessage RAM budget exceeded");
-static_assert(sizeof(BotCommand) <= 120, "BotCommand RAM budget exceeded");
+// Notes replacements retain a full DM payload rather than the normal 79-byte arguments.
+static_assert(sizeof(BotCommand) <= 200, "BotCommand RAM budget exceeded");
 static_assert(sizeof(BotCommandContext) <= 320, "BotCommandContext RAM budget exceeded");
 static_assert(sizeof(BotCommandResult) <= 16, "BotCommandResult RAM budget exceeded");
 static_assert(sizeof(BotCommandCooldown) <= 8, "BotCommandCooldown RAM budget exceeded");

@@ -311,6 +311,7 @@ void RepeaterMonitor::routes() {
     JsonDocument doc; exportState(doc, true);
     uint32_t utc = now();
     doc["canManage"] = requestIsAdmin;
+    mesh.exportBotStats(doc["commandStats"].to<JsonObject>());
     doc["clockSyncRunning"] = syncPhase != SyncIdle;
     doc["clockSyncResult"] = syncResult;
     if (syncTarget >= 0 && syncTarget < (int)count) {
@@ -550,6 +551,91 @@ void RepeaterMonitor::begin() {
   routes(); server.begin();
 }
 
+const char* RepeaterMonitor::adminPassword(const uint8_t* sender, const char* args) {
+  if(!adminContacts.allows(sender,BotAdminContacts::Commands)) return "Not authorized";
+  const char* separator=args ? strchr(args,'|') : nullptr;
+  if(!separator) return "Usage: password <rpt> | <passwd>";
+  std::string target(args,size_t(separator-args));
+  while(!target.empty() && target.back()==' ') target.pop_back();
+  while(!target.empty() && target.front()==' ') target.erase(0,1);
+  if(target.empty()) return "Usage: password <rpt> | <passwd>";
+  const char* password=separator+1;
+  if(*password==' ') ++password;
+  const size_t length=strlen(password);
+  if(!length || length>15) return "Password must be 1-15 bytes; existing password unchanged";
+  for(size_t i=0;i<length;++i)
+    if((unsigned char)password[i]<32 || (unsigned char)password[i]==127)
+      return "Password cannot contain control characters; existing password unchanged";
+  if(!storageOK || !credentials.available() || busy() || adminCheckPending)
+    return "Bot busy or private storage unavailable; try again shortly";
+  int found=-1;
+  for(size_t i=0;i<count;++i) {
+    auto* c=mesh.lookupContactByPubKey(entries[i].key,32);
+    const char* name=c && c->name[0] ? c->name : entries[i].learnedName[0] ? entries[i].learnedName : entries[i].name;
+    bool match=false;
+    for(const char* p=name;*p;++p) if(!strncasecmp(p,target.c_str(),target.size())) {match=true;break;}
+    char key[65];formatKey(entries[i].key,key);
+    if(target.size()>=4 && target.size()<=64 && !strncasecmp(key,target.c_str(),target.size())) match=true;
+    if(!match) continue;
+    if(found>=0) return "Multiple repeaters match; use a more specific name or key";
+    found=(int)i;
+  }
+  if(found<0) return "No matching repeater";
+  if(!credentials.set(entries,count,entries[found].key,password))
+    return "Could not save password; change not applied";
+  adminConfirmed[found]=false;
+  return "Password saved";
+}
+
+const char* RepeaterMonitor::adminNotes(const uint8_t* sender, const char* args, BotVoltageList::Snapshot& out) {
+  out.count=0;
+  if(!adminContacts.allows(sender,BotAdminContacts::Commands)) return "Not authorized";
+  const bool set=args && !strncasecmp(args,"set ",4);
+  const char* query=args ? args+(set ? 4 : 0) : "";
+  const char* separator=set ? strchr(query,'|') : nullptr;
+  if(set && !separator) return "Usage: notes set <rpt> | <text>";
+  std::string target(query,set ? size_t(separator-query) : strlen(query));
+  while(!target.empty() && target.back()==' ') target.pop_back();
+  while(!target.empty() && target.front()==' ') target.erase(0,1);
+  if(target.empty()) return "Usage: notes <rpt> or notes set <rpt> | <text>";
+  int found=-1;
+  for(size_t i=0;i<count;++i) {
+    auto* c=mesh.lookupContactByPubKey(entries[i].key,32);
+    const char* name=c && c->name[0] ? c->name : entries[i].learnedName[0] ? entries[i].learnedName : entries[i].name;
+    bool match=false;
+    for(const char* p=name;*p;++p) if(!strncasecmp(p,target.c_str(),target.size())) {match=true;break;}
+    char key[65];formatKey(entries[i].key,key);
+    if(target.size()>=4 && target.size()<=64 && !strncasecmp(key,target.c_str(),target.size())) match=true;
+    if(!match) continue;
+    if(found>=0) return "Multiple repeaters match; use a more specific name or key";
+    found=(int)i;
+  }
+  if(found<0) return "No matching repeater";
+  auto& entry=entries[found];
+  if(set) {
+    if(!storageOK || busy() || adminCheckPending) return "Bot busy or storage unavailable; try again shortly";
+    const char* text=separator+1;
+    if(*text==' ') ++text;
+    if(!*text) return "Notes text is required; existing notes unchanged";
+    if(!validNotes(text,strlen(text))) return "Invalid notes; maximum 512 characters";
+    std::string previous=entry.notes;entry.notes=text;
+    if(!save()) {entry.notes.swap(previous);return "Could not save notes; change not applied";}
+    return "Notes saved";
+  }
+  auto* c=mesh.lookupContactByPubKey(entry.key,32);
+  char name[33];BotVoltageList::shortName(c && c->name[0] ? c->name : entry.learnedName[0] ? entry.learnedName : entry.name,entry.key,name);
+  snprintf(out.lines[out.count++],BotVoltageList::LINE_SIZE,"%s notes:",name);
+  if(entry.notes.empty()) {strcpy(out.lines[out.count++],"No notes saved");return nullptr;}
+  // Wrap at UTF-8 boundaries. 2048 bytes need at most 36 bounded lines.
+  for(size_t pos=0;pos<entry.notes.size();) {
+    size_t end=std::min(pos+60,entry.notes.size());
+    while(end<entry.notes.size() && ((unsigned char)entry.notes[end]&0xc0)==0x80) --end;
+    const size_t length=end-pos;
+    memcpy(out.lines[out.count],entry.notes.data()+pos,length);out.lines[out.count++][length]=0;pos=end;
+  }
+  return nullptr;
+}
+
 const char* RepeaterMonitor::adminEditRepeater(const uint8_t* sender, const char* action, const char* query) {
   if (!adminContacts.allows(sender, BotAdminContacts::Commands)) return "Not authorized";
   const bool add=!strcmp(action,"add"), remove=!strcmp(action,"remove");
@@ -558,9 +644,21 @@ const char* RepeaterMonitor::adminEditRepeater(const uint8_t* sender, const char
   if (!query || !query[0]) return add ? "Usage: add <full key>" : remove ? "Usage: remove <repeater>" : enable ? "Usage: enable <repeater>" : "Usage: disable <repeater>";
   if (!storageOK || busy() || adminCheckPending) return "Bot busy or storage unavailable; try again shortly";
   int target=-1; uint8_t key[32]{};
+  char shortName[33]{};
+  auto nameForEdit=[&](const uint8_t* publicKey, const Entry* entry) {
+    auto* c=mesh.lookupContactByPubKey(publicKey,32);
+    const char* name=c && c->name[0] ? c->name : entry ? (entry->learnedName[0] ? entry->learnedName : entry->name) : "";
+    BotShortName::write(name,shortName);
+    if(!shortName[0]) strcpy(shortName,"Repeater");
+  };
   if (add) {
     if (!parseKey(query,key)) return "Use a full 64-digit repeater public key";
-    for(size_t i=0;i<count;++i) if(!memcmp(entries[i].key,key,32)) return "Repeater already in the list";
+    for(size_t i=0;i<count;++i) if(!memcmp(entries[i].key,key,32)) {
+      nameForEdit(key,&entries[i]);
+      snprintf(adminEditReply,sizeof(adminEditReply),"%s is already in the list",shortName);
+      return adminEditReply;
+    }
+    nameForEdit(key,nullptr);
     if(count>=MAX_REPEATERS) return "Repeater list is full (32 maximum)";
     target=(int)count;
   } else {
@@ -576,7 +674,16 @@ const char* RepeaterMonitor::adminEditRepeater(const uint8_t* sender, const char
       target=(int)i;
     }
     if(target<0) return "No matching repeater";
-    if(!remove && entries[target].enabled==enable) return enable ? "Repeater already enabled" : "Repeater already disabled";
+    if(remove) nameForEdit(entries[target].key,&entries[target]);
+    if(enable || disable) {
+      auto* c=mesh.lookupContactByPubKey(entries[target].key,32);
+      const char* name=c && c->name[0] ? c->name : entries[target].learnedName[0] ? entries[target].learnedName : entries[target].name;
+      BotVoltageList::shortName(name,entries[target].key,shortName);
+      if(entries[target].enabled==enable) {
+        snprintf(adminEditReply,sizeof(adminEditReply),"%s is already %s",shortName,enable ? "enabled" : "disabled");
+        return adminEditReply;
+      }
+    }
   }
   std::unique_ptr<Entry[]> backup(new Entry[MAX_REPEATERS]);
   std::copy_n(entries,MAX_REPEATERS,backup.get()); const size_t oldCount=count;
@@ -594,11 +701,17 @@ const char* RepeaterMonitor::adminEditRepeater(const uint8_t* sender, const char
   memset(adminConfirmed,0,sizeof(adminConfirmed));
   if(remove && !credentials.retain(entries,count)) {
     lastError="Private credential storage unavailable.";
-    return "Repeater removed; private password cleanup failed";
+    snprintf(adminEditReply,sizeof(adminEditReply),"%s is removed; private password cleanup failed",shortName);
+    return adminEditReply;
   }
   if(add) protectListedContacts();
-  return add ? "Repeater added and enabled; set its password in the dashboard" :
-    remove ? "Repeater removed from managed list" : enable ? "Repeater enabled" : "Repeater disabled";
+  if(enable || disable) {
+    snprintf(adminEditReply,sizeof(adminEditReply),"%s is %s",shortName,enable ? "enabled" : "disabled");
+    return adminEditReply;
+  }
+  snprintf(adminEditReply,sizeof(adminEditReply),add ? "%s is added and enabled; set its password in the dashboard" :
+    "%s is removed from managed list",shortName);
+  return adminEditReply;
 }
 
 

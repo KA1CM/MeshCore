@@ -1,5 +1,9 @@
 #include "BotVoltageList.h"
 #include "BotStatsWindow.h"
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+#include "MonitorBotStatsHistory.h"
+#include <ArduinoJson.h>
+#endif
 #pragma once
 
 #include <Arduino.h>
@@ -106,6 +110,7 @@ public:
   void begin(bool has_display);
   void startInterface(BaseSerialInterface &serial);
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+  void exportBotStats(JsonObject out);
   bool sendAdminCheckResult(const uint8_t* key, const char* text);
   bool queueSunriseNotification(const uint8_t* key, const BotVoltageList::Snapshot& snapshot);
   uint32_t getLastBotAdvertTime() const { return last_bot_advert_time; }
@@ -333,6 +338,7 @@ private:
     BotVoltageList::Snapshot snapshot;
     BotCommandId command = BOT_COMMAND_LIST;
     bool notification = false;
+    bool adminOnly = false;
     bool active=false;
     BotChannelKind kind=BOT_CHANNEL_DM;
     uint8_t channel=0xFF, key[PUB_KEY_SIZE]{};
@@ -344,6 +350,10 @@ private:
   BotStats bot_stats;
   BotStatsWindow bot_stats_window;
   void sampleBotStatsWindow();
+  void recordBotCommandStats(BotCommandId id);
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+  MonitorBotStatsHistory bot_stats_history;
+#endif
   PendingBotDmAck pending_bot_dm_ack;
   PendingEmergencyForward pending_emergency_forwards[BOT_PENDING_EMERGENCY_SLOTS];
   BotCommandCooldown bot_command_cooldowns[BOT_COMMAND_COOLDOWN_SLOTS];

@@ -19,6 +19,7 @@ class RepeaterMonitor {
   bool adminCheckPending = false, adminCheckIsSync = false;
   uint8_t adminCheckRecipient[32]{};
   char adminCheckName[33]{}, adminCheckReply[96]{};
+  char adminEditReply[128]{};
   uint32_t adminCheckExpires = 0;
   void pollAdminCheckReply();
   BotVoltageList::Snapshot sunriseNotification;
@@ -94,8 +95,11 @@ class RepeaterMonitor {
   ContactInfo* contact();
   void poll();
 public:
+  const char* adminPassword(const uint8_t* sender, const char* args);
+  const char* adminNotes(const uint8_t* sender, const char* args, BotVoltageList::Snapshot& out);
   const char* adminEditRepeater(const uint8_t* sender, const char* action, const char* query);
   const char* startAdminCheck(const uint8_t* sender, const char* query, bool sync = false);
+  bool clockReady() const { return synced; }
   const BotAdminContacts& botAdmins() const { return adminContacts; }
   explicit RepeaterMonitor(MyMesh& m) : mesh(m) {}
   void onVerifiedAdvert(const uint8_t* key, uint32_t timestamp, uint8_t pathLen);

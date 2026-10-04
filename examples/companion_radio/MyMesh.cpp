@@ -1448,7 +1448,7 @@ bool MyMesh::handleBotAdminCommand(const BotMessage &message, const ContactInfo 
   const bool adminHelp = command.id == BOT_COMMAND_HELP && command.args_len == 0 &&
       message.channel_kind == BOT_CHANNEL_DM && direct_recipient && repeaterMonitor &&
       repeaterMonitor->botAdmins().allows(direct_recipient->id.pub_key, BotAdminContacts::Commands);
-  if (command.id != BOT_COMMAND_ADVERT && command.id != BOT_COMMAND_CHECK && command.id != BOT_COMMAND_SYNC && command.id != BOT_COMMAND_ADD && command.id != BOT_COMMAND_REMOVE && command.id != BOT_COMMAND_ENABLE && command.id != BOT_COMMAND_DISABLE && !adminHelp) return false;
+  if (command.id != BOT_COMMAND_ADVERT && command.id != BOT_COMMAND_CHECK && command.id != BOT_COMMAND_SYNC && command.id != BOT_COMMAND_ADD && command.id != BOT_COMMAND_REMOVE && command.id != BOT_COMMAND_ENABLE && command.id != BOT_COMMAND_DISABLE && command.id != BOT_COMMAND_NOTES && command.id != BOT_COMMAND_PASSWORD && !adminHelp) return false;
   // Use the authenticated DM contact's full key, never a channel name or key prefix.
   if (message.channel_kind != BOT_CHANNEL_DM || !direct_recipient || !repeaterMonitor ||
       !repeaterMonitor->botAdmins().allows(direct_recipient->id.pub_key, BotAdminContacts::Commands) ||
@@ -1460,7 +1460,25 @@ bool MyMesh::handleBotAdminCommand(const BotMessage &message, const ContactInfo 
   }
   const char *response = nullptr;
   if (adminHelp) {
-    response = "Admin help:\nadvert\ncheck <repeater>\nsync <repeater>\nadd <full key>\nremove <repeater>\nenable <repeater>\ndisable <repeater>";
+    auto& q=pending_voltage_list;
+    q.snapshot.count=0;
+    const char* lines[]={"Admin help:","advert","check <rpt>","sync <rpt>","add <full key>",
+      "remove <rpt>","enable <rpt>","disable <rpt>","notes <rpt>",
+      "notes set <rpt> | <text>","password <rpt> | <passwd>"};
+    for(const char* line:lines) strcpy(q.snapshot.lines[q.snapshot.count++],line);
+    q.command=BOT_COMMAND_HELP;q.notification=false;q.adminOnly=true;q.kind=BOT_CHANNEL_DM;q.channel=0xFF;
+    memcpy(q.key,direct_recipient->id.pub_key,PUB_KEY_SIZE);
+    q.next=0;q.part=1;q.failures=0;q.deadline=_ms->getMillis();q.expires=q.deadline+600000;q.active=true;
+  } else if (command.id == BOT_COMMAND_PASSWORD) {
+    response=repeaterMonitor->adminPassword(direct_recipient->id.pub_key,command.args);
+  } else if (command.id == BOT_COMMAND_NOTES) {
+    response=repeaterMonitor->adminNotes(direct_recipient->id.pub_key,command.args,pending_voltage_list.snapshot);
+    if(!response) {
+      auto& q=pending_voltage_list;
+      q.command=BOT_COMMAND_NOTES;q.notification=false;q.adminOnly=true;q.kind=BOT_CHANNEL_DM;q.channel=0xFF;
+      memcpy(q.key,direct_recipient->id.pub_key,PUB_KEY_SIZE);
+      q.next=0;q.part=1;q.failures=0;q.deadline=_ms->getMillis();q.expires=q.deadline+600000;q.active=true;
+    }
   } else if (command.id == BOT_COMMAND_ADD || command.id == BOT_COMMAND_REMOVE ||
              command.id == BOT_COMMAND_ENABLE || command.id == BOT_COMMAND_DISABLE) {
     response = repeaterMonitor->adminEditRepeater(direct_recipient->id.pub_key, command.name, command.args);
@@ -1485,14 +1503,15 @@ bool MyMesh::handleBotAdminCommand(const BotMessage &message, const ContactInfo 
       bot_stats.send_failures++;
     }
   }
-  bot_stats.eligible_messages++; bot_stats_window.accepted(command.id,_ms->getMillis());
+  // Authorized admin help belongs to the combined admin stats category.
+  bot_stats.eligible_messages++; recordBotCommandStats(adminHelp ? BOT_COMMAND_NOTES : command.id);
   FirmwareBot::recordCommandCooldown(bot_command_cooldowns, BOT_COMMAND_COOLDOWN_SLOTS,
                                     command.id, _ms->getMillis(), BOT_COMMAND_COOLDOWN_MILLIS);
   if (response && !sendBotResponse(message, direct_recipient, 0xFF, response, strlen(response))) {
     bot_stats.send_failures++;
   }
 #else
-  if (command.id != BOT_COMMAND_ADVERT && command.id != BOT_COMMAND_CHECK && command.id != BOT_COMMAND_SYNC && command.id != BOT_COMMAND_ADD && command.id != BOT_COMMAND_REMOVE && command.id != BOT_COMMAND_ENABLE && command.id != BOT_COMMAND_DISABLE) return false;
+  if (command.id != BOT_COMMAND_ADVERT && command.id != BOT_COMMAND_CHECK && command.id != BOT_COMMAND_SYNC && command.id != BOT_COMMAND_ADD && command.id != BOT_COMMAND_REMOVE && command.id != BOT_COMMAND_ENABLE && command.id != BOT_COMMAND_DISABLE && command.id != BOT_COMMAND_NOTES && command.id != BOT_COMMAND_PASSWORD) return false;
   (void)message;
   (void)direct_recipient;
   bot_stats.ignored_messages++;
@@ -1534,10 +1553,10 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
 
   if(command.id==BOT_COMMAND_STATS) {
     if(pending_voltage_list.active || pending_bot_dm_ack.active) {++bot_stats.ignored_messages;return;}
-    ++bot_stats.eligible_messages;bot_stats_window.accepted(command.id,_ms->getMillis());
+    ++bot_stats.eligible_messages;recordBotCommandStats(command.id);
     sampleBotStatsWindow();
     auto& q=pending_voltage_list;bot_stats_window.snapshot(_ms->getMillis(),q.snapshot);
-    q.command=command.id;q.notification=false;q.kind=message.channel_kind;q.channel=channel_idx;
+    q.command=command.id;q.notification=false;q.adminOnly=false;q.kind=message.channel_kind;q.channel=channel_idx;
     q.next=0;q.part=1;q.failures=0;
     if(direct_recipient)memcpy(q.key,direct_recipient->id.pub_key,PUB_KEY_SIZE);
     q.deadline=_ms->getMillis();q.expires=q.deadline+600000;q.active=true;
@@ -1563,11 +1582,11 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
     } else repeaterMonitor->voltageList(pending_voltage_list.snapshot,listLow);
     if (pending_voltage_list.snapshot.count) {
       auto& q=pending_voltage_list;
-      q.command=command.id; q.notification=false;
+      q.command=command.id; q.notification=false;q.adminOnly=false;
       q.kind=message.channel_kind; q.channel=channel_idx; q.next=0; q.part=1; q.failures=0;
       if (direct_recipient) memcpy(q.key,direct_recipient->id.pub_key,PUB_KEY_SIZE);
       q.deadline=_ms->getMillis(); q.expires=q.deadline+600000; q.active=true;
-      bot_stats.eligible_messages++; bot_stats_window.accepted(command.id,_ms->getMillis());
+      bot_stats.eligible_messages++; recordBotCommandStats(command.id);
       FirmwareBot::recordCommandCooldown(bot_command_cooldowns,BOT_COMMAND_COOLDOWN_SLOTS,
         command.id,_ms->getMillis(),BOT_COMMAND_COOLDOWN_MILLIS);
       return;
@@ -1605,7 +1624,7 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
         q.message.path=nullptr; // The received packet will be freed after this call.
         q.channel=channel_idx; q.lookupDeadline=futureMillis(28000); q.expires=futureMillis(45000);
         if(direct_recipient) memcpy(q.key,direct_recipient->id.pub_key,PUB_KEY_SIZE);
-        bot_stats.eligible_messages++; bot_stats_window.accepted(command.id,_ms->getMillis());
+        bot_stats.eligible_messages++; recordBotCommandStats(command.id);
         FirmwareBot::recordCommandCooldown(bot_command_cooldowns,BOT_COMMAND_COOLDOWN_SLOTS,
           command.id,_ms->getMillis(),BOT_COMMAND_COOLDOWN_MILLIS);
         return;
@@ -1686,7 +1705,7 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
     return;
   }
 
-  bot_stats.eligible_messages++; bot_stats_window.accepted(command.id,_ms->getMillis());
+  bot_stats.eligible_messages++; recordBotCommandStats(command.id);
   FirmwareBot::recordCommandCooldown(bot_command_cooldowns, BOT_COMMAND_COOLDOWN_SLOTS,
                                      command.id, _ms->getMillis(),
                                      BOT_COMMAND_COOLDOWN_MILLIS);
@@ -1931,7 +1950,7 @@ bool MyMesh::queueSunriseNotification(const uint8_t* key, const BotVoltageList::
   if (!bot_prefs.enabled || pending_voltage_list.active || pending_bot_dm_ack.active ||
       !repeaterMonitor || !repeaterMonitor->botAdmins().allows(key, BotAdminContacts::Notifications)) return false;
   auto& q = pending_voltage_list;
-  q.snapshot = snapshot; q.command = BOT_COMMAND_LIST; q.notification = true;
+  q.snapshot = snapshot; q.command = BOT_COMMAND_LIST; q.notification = true;q.adminOnly=false;
   q.kind = BOT_CHANNEL_DM; q.channel = 0xFF; memcpy(q.key, key, PUB_KEY_SIZE);
   q.next = 0; q.part = 1; q.failures = 0;
   q.deadline = _ms->getMillis(); q.expires = q.deadline + 600000; q.active = true;
@@ -1942,10 +1961,12 @@ bool MyMesh::queueSunriseNotification(const uint8_t* key, const BotVoltageList::
 void MyMesh::sendNextVoltageListPart() {
   auto& q=pending_voltage_list;
   if (!q.active) return;
-  if (!bot_prefs.enabled || (!q.notification && !BotPrefsCodec::commandEnabled(bot_prefs,q.command)) || millisHasNowPassed(q.expires)) {
+  if (!bot_prefs.enabled || (!q.notification && !q.adminOnly && !BotPrefsCodec::commandEnabled(bot_prefs,q.command)) || millisHasNowPassed(q.expires)) {
     q.active=false; return;
   }
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+  if (q.adminOnly && (!repeaterMonitor ||
+      !repeaterMonitor->botAdmins().allows(q.key,BotAdminContacts::Commands))) {q.active=false;return;}
   if (q.notification && (!repeaterMonitor ||
       !repeaterMonitor->botAdmins().allows(q.key, BotAdminContacts::Notifications))) { q.active=false; return; }
 #endif
@@ -1967,7 +1988,55 @@ void MyMesh::sendNextVoltageListPart() {
   q.deadline=_ms->getMillis()+5000;
 }
 
+void MyMesh::recordBotCommandStats(BotCommandId id) {
+  bot_stats_window.accepted(id,_ms->getMillis());
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+  const uint32_t utc=getRTCClock()->getCurrentTime();
+  if(repeaterMonitor && repeaterMonitor->clockReady() && utc>=MonitorCore::VALID_TIME)bot_stats_history.accepted(id,MonitorCore::easternDay(utc),_ms->getMillis());
+#endif
+}
+
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+void MyMesh::exportBotStats(JsonObject out) {
+  const uint32_t utc=getRTCClock()->getCurrentTime(), ticks=_ms->getMillis();
+  const uint32_t today=repeaterMonitor && repeaterMonitor->clockReady() && utc>=MonitorCore::VALID_TIME ? MonitorCore::easternDay(utc) : 0;
+  bot_stats_history.begin(ticks);
+  if(today)bot_stats_history.observe(today,ticks);
+  out["today"]=today;out["startedDay"]=bot_stats_history.counters().store().startedDay;
+  out["storageReady"]=bot_stats_history.available();
+  out["rollingSinceReboot"]=true;
+  JsonArray categories=out["categories"].to<JsonArray>();
+  size_t ids[BotStatsHistory::COMMANDS]{}, count=0;
+  for(size_t i=1;i<BotStatsHistory::COMMANDS;++i) {
+    const auto* meta=BotCommandRegistry::findById((BotCommandId)i);
+    if(!meta || (meta->visibility!=BOT_COMMAND_VISIBILITY_DISCOVERABLE && i!=BOT_COMMAND_ADVERT))continue;
+    categories.add(i==BOT_COMMAND_ADVERT ? "admin" : meta->name);ids[count++]=i;
+  }
+  uint64_t rolling[BotStatsHistory::COMMANDS]{};bot_stats_window.totals(ticks,rolling);
+  for(size_t i=0;i<BotStatsHistory::COMMANDS;++i) {
+    const auto* meta=BotCommandRegistry::findById((BotCommandId)i);
+    if(i!=BOT_COMMAND_ADVERT && meta && meta->visibility==BOT_COMMAND_VISIBILITY_HIDDEN)rolling[BOT_COMMAND_ADVERT]+=rolling[i];
+  }
+  JsonArray last=out["last24h"].to<JsonArray>();for(size_t i=0;i<count;++i)last.add(rolling[ids[i]]);
+  JsonArray days=out["days"].to<JsonArray>();
+  for(uint32_t offset=0;today && offset<30;++offset) {
+    const uint32_t day=today-29+offset;const auto* record=bot_stats_history.counters().at(day);
+    JsonObject item=days.add<JsonObject>();item["day"]=day;
+    const uint32_t started=bot_stats_history.counters().store().startedDay;
+    item["available"]=started && day>=started;
+    JsonArray values=item["counts"].to<JsonArray>();
+    for(size_t i=0;i<count;++i)values.add(record ? record->counts[ids[i]] : 0);
+  }
+}
+#endif
+
 void MyMesh::sampleBotStatsWindow() {
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+  const uint32_t utc=getRTCClock()->getCurrentTime(),ticks=_ms->getMillis();
+  bot_stats_history.begin(ticks);
+  if(repeaterMonitor && repeaterMonitor->clockReady() && utc>=MonitorCore::VALID_TIME)bot_stats_history.observe(MonitorCore::easternDay(utc),ticks);
+  bot_stats_history.poll(ticks);
+#endif
   bot_stats_window.sample(_ms->getMillis(),bot_stats,radio_driver.getPacketsRecv(),
     radio_driver.getPacketsSent(),radio_driver.getPacketsRecvErrors());
 }

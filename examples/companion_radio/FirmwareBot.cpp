@@ -274,9 +274,22 @@ bool parseCommand(const char* text, size_t text_len, BotCommand* command, bool a
   const BotCommandMetadata* metadata = name_len > BOT_MAX_COMMAND_NAME_LEN ? NULL : BotCommandRegistry::findByName(command->name, copy_name_len);
   command->id = metadata ? metadata->id : BOT_COMMAND_UNKNOWN;
   if (!has_prefix && (!metadata || (metadata->visibility != BOT_COMMAND_VISIBILITY_DISCOVERABLE &&
-                                   metadata->id != BOT_COMMAND_ADVERT && metadata->id != BOT_COMMAND_CHECK && metadata->id != BOT_COMMAND_SYNC && metadata->id != BOT_COMMAND_ADD && metadata->id != BOT_COMMAND_REMOVE && metadata->id != BOT_COMMAND_ENABLE && metadata->id != BOT_COMMAND_DISABLE))) return false;
+                                   metadata->id != BOT_COMMAND_ADVERT && metadata->id != BOT_COMMAND_CHECK && metadata->id != BOT_COMMAND_SYNC && metadata->id != BOT_COMMAND_ADD && metadata->id != BOT_COMMAND_REMOVE && metadata->id != BOT_COMMAND_ENABLE && metadata->id != BOT_COMMAND_DISABLE && metadata->id != BOT_COMMAND_NOTES && metadata->id != BOT_COMMAND_PASSWORD))) return false;
 
   while (pos < normalized_len && isCommandDelimiter(normalized[pos])) pos++;
+  // Notes and passwords are copied verbatim from the original DM.
+  if (command->id == BOT_COMMAND_NOTES || command->id == BOT_COMMAND_PASSWORD) {
+    size_t raw=0;
+    while(raw<text_len && isSpaceByte(text[raw])) ++raw;
+    if(raw<text_len && (text[raw]=='!' || text[raw]=='/')) ++raw;
+    while(raw<text_len && isSpaceByte(text[raw])) ++raw;
+    while(raw<text_len && !isCommandDelimiter(text[raw])) ++raw;
+    while(raw<text_len && isCommandDelimiter(text[raw])) ++raw;
+    const size_t length=text_len-raw;
+    if(length>BOT_MAX_TEXT_LEN) return false;
+    memcpy(command->args,text+raw,length);command->args[length]=0;command->args_len=length;
+    return true;
+  }
   size_t args_len = normalized_len - pos;
   if (args_len > BOT_MAX_COMMAND_ARGS_LEN) args_len = BOT_MAX_COMMAND_ARGS_LEN;
   if (args_len > 0) memcpy(command->args, &normalized[pos], args_len);

@@ -28,17 +28,13 @@ inline void write(const char* name, char* out) {
   if(!name) return;
   while(*name==' ') ++name;
   size_t n=0, characters=0;
-  bool firstWord=true;
   while(name[n] && characters<24) {
-    if(name[n]==' ') firstWord=false;
-    size_t bytes=0;
-    if(firstWord) bytes=leadingBytes(name+n);
-    else if((name[n]>='A' && name[n]<='Z') || (name[n]>='a' && name[n]<='z') ||
-            (name[n]>='0' && name[n]<='9') || name[n]==' ') bytes=1;
+    if(!strncmp(name+n,"- FN31",6)) break;
+    const size_t bytes=leadingBytes(name+n);
     if(!bytes || n+bytes>32) break;
     memcpy(out+n,name+n,bytes); n+=bytes; ++characters;
     // Keep an emoji presentation selector with its preceding character.
-    if(firstWord && bytes>1 && (unsigned char)name[n]==0xef &&
+    if(bytes>1 && (unsigned char)name[n]==0xef &&
        (unsigned char)name[n+1]==0xb8 &&
        ((unsigned char)name[n+2]==0x8f || (unsigned char)name[n+2]==0x8e)) {
       if(n+3>32) break;
