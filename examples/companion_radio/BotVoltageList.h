@@ -6,7 +6,7 @@
 namespace BotVoltageList {
 constexpr size_t LINE_SIZE = 64;
 constexpr const char* EMPTY_LOW = "no repeaters with voltage lower than 3.6v or N/A";
-struct Snapshot { char lines[MonitorCore::MAX_REPEATERS][LINE_SIZE]{}; size_t count = 0; };
+struct Snapshot { char lines[40][LINE_SIZE]{}; size_t count = 0; };
 inline void shortName(const char* name, const uint8_t* key, char* out) {
   BotShortName::write(name,out);
   if (!out[0]) snprintf(out, 33, "[%02x%02x%02x%02x]", key[0],key[1],key[2],key[3]);

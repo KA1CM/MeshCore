@@ -94,6 +94,7 @@ class RepeaterMonitor {
   ContactInfo* contact();
   void poll();
 public:
+  const char* adminEditRepeater(const uint8_t* sender, const char* action, const char* query);
   const char* startAdminCheck(const uint8_t* sender, const char* query, bool sync = false);
   const BotAdminContacts& botAdmins() const { return adminContacts; }
   explicit RepeaterMonitor(MyMesh& m) : mesh(m) {}

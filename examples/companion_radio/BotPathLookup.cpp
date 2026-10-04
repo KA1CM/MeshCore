@@ -20,14 +20,23 @@ namespace BotPathLookup {
 namespace {
 portMUX_TYPE statusMux=portMUX_INITIALIZER_UNLOCKED;
 Status lastStatus;
-void report(const char* stage,int detail=0,bool failure=false) {
+void report(const char* stage,int detail=0,bool failure=false,uint32_t verifyFlags=0) {
   Status next; next.stage=stage; next.detail=detail;
+  if(failure) {
+    next.failureUtc=(uint32_t)time(nullptr);
+    next.verifyFlags=verifyFlags;
+    if(verifyFlags) mbedtls_x509_crt_verify_info(next.verifyInfo,sizeof(next.verifyInfo),"",verifyFlags);
+  }
   next.freeHeap=ESP.getFreeHeap(); next.largestBlock=ESP.getMaxAllocHeap();
   portENTER_CRITICAL(&statusMux);
   next.lastFailure=failure ? stage : lastStatus.lastFailure;
   next.lastFailureDetail=failure ? detail : lastStatus.lastFailureDetail;
   next.failureHeap=failure ? next.freeHeap : lastStatus.failureHeap;
   next.failureBlock=failure ? next.largestBlock : lastStatus.failureBlock;
+  if(!failure) {
+    next.failureUtc=lastStatus.failureUtc; next.verifyFlags=lastStatus.verifyFlags;
+    memcpy(next.verifyInfo,lastStatus.verifyInfo,sizeof(next.verifyInfo));
+  }
   lastStatus=next;
   portEXIT_CRITICAL(&statusMux);
 }
@@ -54,15 +63,30 @@ public:
     _timeout=timeout;
     report("Connecting with verified TLS");
     errno=0;
-    const int connected=WiFiClientSecure::connect(ip,port,host,_CA_cert,_cert,_private_key);
+    // Mirror the pinned Arduino secure-client connect, but record verification
+    // flags before stop() frees the TLS context. Verification remains required.
+    const uint32_t connectStarted=millis();
+    const int result=start_ssl_client(sslclient,ip,port,host,_timeout,_CA_cert,
+      _use_ca_bundle,_cert,_private_key,nullptr,nullptr,_use_insecure,_alpn_protos);
+    _lastError=result;
+    const int connected=result>=0;
     if(!connected) {
       const int socketError=errno;
-      char message[160]{};
-      const int tlsError=lastError(message,sizeof(message));
-      report(tlsError < -1 ? "TLS handshake failed" : "TCP connection failed",
-             tlsError < -1 ? tlsError : socketError,true);
+      const uint32_t flags=result==MBEDTLS_ERR_X509_CERT_VERIFY_FAILED ?
+        mbedtls_ssl_get_verify_result(&sslclient->ssl_ctx) : 0;
+      // The pinned SDK frees/closes the socket on TCP connect failure. A -1
+      // with a live TLS context after the configured deadline is its handshake timeout.
+      const uint32_t elapsed=millis()-connectStarted;
+      const bool handshakeTimeout=result==-1 && sslclient->socket>=0 &&
+        sslclient->ssl_ctx.state!=MBEDTLS_SSL_HELLO_REQUEST &&
+        elapsed>=sslclient->handshake_timeout;
+      report(handshakeTimeout ? "TLS handshake timed out (milliseconds)" :
+             result==MBEDTLS_ERR_X509_CERT_VERIFY_FAILED ? "TLS certificate verification failed" :
+             result < -1 ? "TLS handshake failed" : "TCP connection failed",
+             handshakeTimeout ? (int)elapsed : result < -1 ? result : socketError,true,flags);
+      stop();
       connectionFailed=true;
-    }
+    } else _connected=true;
     return connected;
   }
 };
@@ -118,7 +142,7 @@ void resolve(BotPath::Route* route) {
     throttled=true; nextFetch=millis()+60000; // Failure backoff.
     LookupClient client;
     client.setCACert(BOT_PATH_ROOT_CA);
-    client.setHandshakeTimeout(5);
+    client.setHandshakeTimeout(15);
     HTTPClient http;
     http.setConnectTimeout(4000); http.setTimeout(4000);
     http.useHTTP10(true); // The analyzer may close-delimit the body (no length header).

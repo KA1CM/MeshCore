@@ -8,6 +8,8 @@ struct Status {
   const char* lastFailure="";
   int lastFailureDetail=0;
   uint32_t failureHeap=0, failureBlock=0;
+  uint32_t failureUtc=0, verifyFlags=0;
+  char verifyInfo[256]{};
   uint32_t freeHeap=0, largestBlock=0;
 };
 Status status();

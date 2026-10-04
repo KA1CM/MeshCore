@@ -29,13 +29,13 @@ inline BotCommandResult format(const Route& route, const char* target, char* out
   if(route.width==1 && route.count) {
     const char* text="1-byte paths are not supported.";
     const int length=target && *target ?
-      snprintf(out,capacity,"@%.*s %s",BOT_MAX_SENDER_NAME_LEN,target,text) :
+      snprintf(out,capacity,"@[%.*s] %s",BOT_MAX_SENDER_NAME_LEN,target,text) :
       snprintf(out,capacity,"%s",text);
     if(length<0 || (size_t)length>=capacity) { out[0]=0; return {BOT_COMMAND_RESULT_NO_SPACE,0}; }
     return {BOT_COMMAND_RESULT_OK,(size_t)length};
   }
-  char heading[BOT_MAX_SENDER_NAME_LEN+3]{};
-  if (target && *target) snprintf(heading,sizeof(heading),"@%.*s\n",BOT_MAX_SENDER_NAME_LEN,target);
+  char heading[BOT_MAX_SENDER_NAME_LEN+5]{};
+  if (target && *target) snprintf(heading,sizeof(heading),"@[%.*s]\n",BOT_MAX_SENDER_NAME_LEN,target);
   const size_t head=strlen(heading);
   if (!route.count) {
     if (head+6>=capacity) return {BOT_COMMAND_RESULT_NO_SPACE,0};

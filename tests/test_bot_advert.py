@@ -7,7 +7,7 @@ repo = Path(__file__).resolve().parents[1]
 src = repo / 'examples/companion_radio'
 mesh = (src / 'MyMesh.cpp').read_text(encoding='utf-8')
 handler = mesh[mesh.index('bool MyMesh::handleBotAdminCommand('):mesh.index('void MyMesh::recordBotObservation(')]
-completion = mesh[mesh.index('void MyMesh::completeAdminAdvert('):mesh.index('void MyMesh::scheduleBotLocalAdvert(')]
+completion = mesh[mesh.index('void MyMesh::completeAdminAdvert('):mesh.index('void MyMesh::resolveLocalPathNames(')]
 harness = r'''
 #include "FirmwareBot.h"
 #include "BotCommandRegistry.h"
@@ -28,7 +28,7 @@ struct BotAdminContacts {
  uint8_t key[32]{}; unsigned permissions = Commands;
  bool allows(const uint8_t* k, Permission p) const { return !memcmp(k,key,32) && (permissions&p); }
 };
-struct Monitor { int checks=0;const char* startAdminCheck(const uint8_t*,const char*,bool=false){++checks;return nullptr;} BotAdminContacts admins; BotAdminContacts& botAdmins() { return admins; } };
+struct Monitor { int edits=0;const char* adminEditRepeater(const uint8_t*,const char*,const char*){++edits;return "List updated";} int checks=0;const char* startAdminCheck(const uint8_t*,const char*,bool=false){++checks;return nullptr;} BotAdminContacts admins; BotAdminContacts& botAdmins() { return admins; } };
 struct Clock { uint32_t now=10000; uint32_t getMillis() { return now; } };
 struct MyMesh : BaseChatMesh {
  struct {bool active=false;uint8_t result=0,key[32]{},hash[8]{};mesh::Packet* packet=nullptr;uint32_t deadline=0;} pending_admin_advert;
@@ -41,6 +41,7 @@ struct MyMesh : BaseChatMesh {
  void completeAdminAdvert(mesh::Packet*,bool);void logTx(mesh::Packet*,int);void logTxFail(mesh::Packet*,int);void pollAdminAdvert();
  Monitor monitor; Monitor* repeaterMonitor=&monitor;
  Clock clock; Clock* _ms=&clock;
+ struct {void accepted(BotCommandId,uint32_t){}}bot_stats_window;
  BotStats bot_stats{}; BotCommandCooldown bot_command_cooldowns[BOT_COMMAND_COOLDOWN_SLOTS]{};
  struct Pending {bool active=false;} pending_voltage_list,pending_bot_dm_ack;
  bool queue_ok=true,reply_ok=true; unsigned adverts=0,replies=0; std::string reply;
@@ -95,18 +96,28 @@ int main() {
  MyMesh timeout;prepare(timeout);timeout.handleBotAdminCommand(message,&admin,command);timeout.clock.now+=600001;timeout.pollAdminAdvert();assert(timeout.reply=="Advert transmission not confirmed");
  MyMesh revoked;prepare(revoked);revoked.handleBotAdminCommand(message,&admin,command);revoked.monitor.admins.permissions=0;revoked.logTx(&revoked.packet,20);revoked.pollAdminAdvert();assert(!revoked.replies&&!revoked.pending_admin_advert.active);
  command.id=BOT_COMMAND_HELP;command.args_len=0;
- MyMesh help;prepare(help);assert(help.handleBotAdminCommand(message,&admin,command));assert(help.reply=="Admin help: advert\ncheck <repeater>\nsync <repeater>."&&!help.adverts);
+ MyMesh help;prepare(help);assert(help.handleBotAdminCommand(message,&admin,command));assert(help.reply=="Admin help:\nadvert\ncheck <repeater>\nsync <repeater>\nadd <full key>\nremove <repeater>\nenable <repeater>\ndisable <repeater>"&&!help.adverts);
  MyMesh guestHelp;prepare(guestHelp);guestHelp.monitor.admins.permissions=BotAdminContacts::Notifications;
  assert(!guestHelp.handleBotAdminCommand(message,&admin,command)&&!guestHelp.replies);
  MyMesh channelHelp;prepare(channelHelp);BotMessage channel=message;channel.channel_kind=BOT_CHANNEL_BOT;
  assert(!channelHelp.handleBotAdminCommand(channel,&admin,command));
  command.args_len=6;MyMesh specificHelp;prepare(specificHelp);assert(!specificHelp.handleBotAdminCommand(message,&admin,command));command.args_len=0;
  assert(FirmwareBot::parseCommand("check Chestnut",14,&command,true)&&command.id==BOT_COMMAND_CHECK);
- MyMesh check;prepare(check);check.handleBotAdminCommand(message,&admin,command);assert(check.monitor.checks==1&&check.replies==1&&!check.adverts&&check.reply=="Checking, this might take up to 33 minutes");
+ MyMesh check;prepare(check);check.handleBotAdminCommand(message,&admin,command);assert(check.monitor.checks==1&&check.replies==1&&!check.adverts&&check.reply=="Checking... this might take up to 33 minutes");
  MyMesh denied;prepare(denied);denied.monitor.admins.permissions=0;denied.handleBotAdminCommand(message,&admin,command);assert(!denied.monitor.checks&&!denied.replies);
  assert(FirmwareBot::parseCommand("sync Chestnut",13,&command,true)&&command.id==BOT_COMMAND_SYNC);
- MyMesh sync;prepare(sync);sync.handleBotAdminCommand(message,&admin,command);assert(sync.monitor.checks==1&&sync.reply=="Syncing; I will send the result when finished"&&!sync.adverts);
+ MyMesh sync;prepare(sync);sync.handleBotAdminCommand(message,&admin,command);assert(sync.monitor.checks==1&&sync.reply=="Syncing... I will send the result when finished"&&!sync.adverts);
  MyMesh noSync;prepare(noSync);noSync.monitor.admins.permissions=BotAdminContacts::Notifications;noSync.handleBotAdminCommand(message,&admin,command);assert(!noSync.monitor.checks&&!noSync.replies);
+ for(const char* text : {"add abc", "remove Hill", "enable Hill", "disable Hill"}) {
+   assert(FirmwareBot::parseCommand(text,strlen(text),&command,true));
+   MyMesh edit;prepare(edit);message.channel_kind=BOT_CHANNEL_DM;
+   edit.handleBotAdminCommand(message,&admin,command);assert(edit.monitor.edits==1&&edit.reply=="List updated");
+   MyMesh guest;prepare(guest);guest.monitor.admins.permissions=0;
+   guest.handleBotAdminCommand(message,&admin,command);assert(!guest.monitor.edits&&!guest.replies);
+   MyMesh channel;prepare(channel);message.channel_kind=BOT_CHANNEL_PUBLIC;
+   channel.handleBotAdminCommand(message,&admin,command);assert(!channel.monitor.edits&&!channel.replies);
+ }
+ message.channel_kind=BOT_CHANNEL_DM;
  command.id=BOT_COMMAND_PING;MyMesh normal;
  assert(!normal.handleBotAdminCommand(message,&admin,command));assert(!normal.adverts && !normal.replies);
 }

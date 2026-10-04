@@ -5,6 +5,8 @@
 #include <math.h>
 #include <time.h>
 #include <stdio.h>
+#include <string>
+#include <algorithm>
 
 // Hardware-independent scheduling and wire-format helpers.
 namespace MonitorCore {
@@ -34,7 +36,7 @@ inline bool validNotes(const char* text, size_t length) {
 struct Entry {
   uint8_t key[32] = {};
   char name[33] = {};
-  char notes[2049] = {}; // Up to 512 Unicode characters, four UTF-8 bytes each.
+  std::string notes; // Allocate only actual UTF-8 text; validNotes enforces the limit.
   char learnedName[33] = {};
   int32_t learnedLatitude = 0, learnedLongitude = 0;
   bool enabled = true;

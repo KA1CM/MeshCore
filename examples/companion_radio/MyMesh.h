@@ -1,4 +1,5 @@
 #include "BotVoltageList.h"
+#include "BotStatsWindow.h"
 #pragma once
 
 #include <Arduino.h>
@@ -341,6 +342,8 @@ private:
   void sendNextVoltageListPart();
   BotPrefs bot_prefs;
   BotStats bot_stats;
+  BotStatsWindow bot_stats_window;
+  void sampleBotStatsWindow();
   PendingBotDmAck pending_bot_dm_ack;
   PendingEmergencyForward pending_emergency_forwards[BOT_PENDING_EMERGENCY_SLOTS];
   BotCommandCooldown bot_command_cooldowns[BOT_COMMAND_COOLDOWN_SLOTS];

@@ -40,7 +40,7 @@ void RepeaterMonitor::exportState(JsonDocument& doc, bool history, bool ordered)
     const Entry& e = entries[ordered ? order[i] : i];
     char key[65]; formatKey(e.key, key);
     JsonObject item = list.add<JsonObject>();
-    item["notes"] = e.notes;
+    item["notes"] = e.notes.c_str();
     item["key"] = key; item["name"] = e.name; item["enabled"] = e.enabled;
     auto* known = mesh.lookupContactByPubKey(e.key, 32);
     const char* displayName = known && known->name[0] ? known->name : e.learnedName[0] ? e.learnedName : e.name;
@@ -99,7 +99,7 @@ bool RepeaterMonitor::importState(JsonDocument& doc, bool history) {
       if (!item["notes"].is<const char*>()) return false;
       JsonString notes = item["notes"].as<JsonString>();
       if (!validNotes(notes.c_str(), notes.size())) return false;
-      strlcpy(e.notes, notes.c_str(), sizeof(e.notes));
+      e.notes.assign(notes.c_str(), notes.size());
     }
     strlcpy(e.name, name, sizeof(e.name));
     e.enabled = item["enabled"];
@@ -158,7 +158,7 @@ bool RepeaterMonitor::importState(JsonDocument& doc, bool history) {
     }
     ++n;
   }
-  memcpy(entries, candidate.get(), sizeof(entries));
+  std::copy_n(candidate.get(), sizeof(entries)/sizeof(entries[0]), entries);
   count = n;
   return true;
 }
@@ -348,6 +348,8 @@ void RepeaterMonitor::routes() {
     lookupState["freeHeap"]=lookup.freeHeap; lookupState["largestBlock"]=lookup.largestBlock;
     lookupState["lastFailure"]=lookup.lastFailure; lookupState["lastFailureDetail"]=lookup.lastFailureDetail;
     lookupState["failureHeap"]=lookup.failureHeap; lookupState["failureBlock"]=lookup.failureBlock;
+    lookupState["failureUtc"]=lookup.failureUtc; lookupState["verifyFlags"]=lookup.verifyFlags;
+    lookupState["verifyInfo"]=lookup.verifyInfo;
     doc["lastAdvert"] = mesh.getLastBotAdvertTime();
     JsonArray neighbors = doc["neighbors"].to<JsonArray>();
 #if CMESH_BOT_ENABLED
@@ -408,10 +410,10 @@ void RepeaterMonitor::routes() {
     JsonDocument doc;
     if (body.length() > 131072 || deserializeJson(doc, body)) { server.send(400, "text/plain", "Invalid list file."); return; }
     std::unique_ptr<Entry[]> backup(new Entry[MAX_REPEATERS]);
-    memcpy(backup.get(), entries, sizeof(entries)); size_t oldCount = count;
+    std::copy_n(entries, MAX_REPEATERS, backup.get()); size_t oldCount = count;
     if (!importState(doc, false)) { server.send(400, "text/plain", "Use unique 64-digit public keys, names up to 32 bytes, and at most 32 repeaters."); return; }
     if (!save()) {
-      memcpy(entries, backup.get(), sizeof(entries)); count = oldCount;
+      std::copy_n(backup.get(), MAX_REPEATERS, entries); count = oldCount;
       server.send(507, "text/plain", "Could not save settings."); return;
     }
     lastError = "";
@@ -435,10 +437,10 @@ void RepeaterMonitor::routes() {
       server.send(400, "text/plain", "Notes must contain at most 512 characters."); return;
     }
     for (size_t i=0; i<count; ++i) if (!memcmp(entries[i].key,key,32)) {
-      String previous(entries[i].notes);
-      strlcpy(entries[i].notes,notes.c_str(),sizeof(entries[i].notes));
+      std::string previous = entries[i].notes;
+      entries[i].notes.assign(notes.c_str(),notes.size());
       if (!save()) {
-        strlcpy(entries[i].notes,previous.c_str(),sizeof(entries[i].notes));
+        entries[i].notes.swap(previous);
         server.send(507,"text/plain","Could not save notes."); return;
       }
       server.send(200,"application/json","{\"ok\":true}"); return;
@@ -547,6 +549,58 @@ void RepeaterMonitor::begin() {
   wifiAttempt = wifiWindowStart = millis(); wifiStopped = false; board.setInhibitSleep(true);
   routes(); server.begin();
 }
+
+const char* RepeaterMonitor::adminEditRepeater(const uint8_t* sender, const char* action, const char* query) {
+  if (!adminContacts.allows(sender, BotAdminContacts::Commands)) return "Not authorized";
+  const bool add=!strcmp(action,"add"), remove=!strcmp(action,"remove");
+  const bool enable=!strcmp(action,"enable"), disable=!strcmp(action,"disable");
+  if (!add && !remove && !enable && !disable) return "Unknown list command";
+  if (!query || !query[0]) return add ? "Usage: add <full key>" : remove ? "Usage: remove <repeater>" : enable ? "Usage: enable <repeater>" : "Usage: disable <repeater>";
+  if (!storageOK || busy() || adminCheckPending) return "Bot busy or storage unavailable; try again shortly";
+  int target=-1; uint8_t key[32]{};
+  if (add) {
+    if (!parseKey(query,key)) return "Use a full 64-digit repeater public key";
+    for(size_t i=0;i<count;++i) if(!memcmp(entries[i].key,key,32)) return "Repeater already in the list";
+    if(count>=MAX_REPEATERS) return "Repeater list is full (32 maximum)";
+    target=(int)count;
+  } else {
+    for(size_t i=0;i<count;++i) {
+      auto* c=mesh.lookupContactByPubKey(entries[i].key,32);
+      const char* name=c && c->name[0] ? c->name : entries[i].learnedName[0] ? entries[i].learnedName : entries[i].name;
+      bool match=false;
+      for(const char* part=name;*part;++part) if(!strncasecmp(part,query,strlen(query))) {match=true;break;}
+      char hex[65]; formatKey(entries[i].key,hex);
+      if(strlen(query)>=4 && strlen(query)<=64 && !strncasecmp(hex,query,strlen(query))) match=true;
+      if(!match) continue;
+      if(target>=0) return "Multiple repeaters match; use a more specific name or key";
+      target=(int)i;
+    }
+    if(target<0) return "No matching repeater";
+    if(!remove && entries[target].enabled==enable) return enable ? "Repeater already enabled" : "Repeater already disabled";
+  }
+  std::unique_ptr<Entry[]> backup(new Entry[MAX_REPEATERS]);
+  std::copy_n(entries,MAX_REPEATERS,backup.get()); const size_t oldCount=count;
+  if(add) {
+    entries[count]=Entry{};memcpy(entries[count].key,key,32);entries[count].enabled=true;++count;
+  } else if(remove) {
+    for(size_t i=target;i+1<count;++i) entries[i]=entries[i+1];
+    entries[--count]=Entry{};
+  } else entries[target].enabled=enable;
+  if(!save()) {
+    std::copy_n(backup.get(),MAX_REPEATERS,entries);count=oldCount;
+    return "Could not save repeater list; change not applied";
+  }
+  syncTarget=-1;syncResult="";active=-1;singleTarget=-1;
+  memset(adminConfirmed,0,sizeof(adminConfirmed));
+  if(remove && !credentials.retain(entries,count)) {
+    lastError="Private credential storage unavailable.";
+    return "Repeater removed; private password cleanup failed";
+  }
+  if(add) protectListedContacts();
+  return add ? "Repeater added and enabled; set its password in the dashboard" :
+    remove ? "Repeater removed from managed list" : enable ? "Repeater enabled" : "Repeater disabled";
+}
+
 
 const char* RepeaterMonitor::startAdminCheck(const uint8_t* sender, const char* query, bool sync) {
   if (!adminContacts.allows(sender, BotAdminContacts::Commands)) return "Not authorized";
