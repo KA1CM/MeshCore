@@ -69,7 +69,8 @@ enum BotCommandId : uint8_t {
   BOT_COMMAND_STATS = 12,
   BOT_COMMAND_MAGIC8 = 13,
   BOT_COMMAND_PATH = 14,
-  // Command IDs 15 and 16 intentionally unused.
+  BOT_COMMAND_USER = 15,
+  // Command ID 16 intentionally unused.
   BOT_COMMAND_PREFIX = 17,
   BOT_COMMAND_TIME = 18,
   BOT_COMMAND_LORA = 19,

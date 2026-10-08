@@ -4,7 +4,7 @@
 #include <string.h>
 namespace BotShortName {
 // Callers provide 33 bytes. Preserve UTF-8 boundaries and the storage limit,
-// as well as the 24-character display limit.
+// as well as the 20-character display limit.
 inline size_t leadingBytes(const char* text) {
   if(!text || !*text) return 0;
   const unsigned char first=(unsigned char)text[0];
@@ -23,23 +23,56 @@ inline size_t leadingBytes(const char* text) {
      (value>=0x2060 && value<=0x206f) || value==0xfeff) return 0;
   return size;
 }
+inline bool gridWord(const char* p) {
+  return (p[0]=='f' || p[0]=='F') && (p[1]=='n' || p[1]=='N') && p[2]=='3' && p[3]=='1';
+}
 inline void write(const char* name, char* out) {
   out[0]=0;
   if(!name) return;
   while(*name==' ') ++name;
   size_t n=0, characters=0;
-  while(name[n] && characters<24) {
-    if(!strncmp(name+n,"- FN31",6)) break;
-    const size_t bytes=leadingBytes(name+n);
-    if(!bytes || n+bytes>32) break;
-    memcpy(out+n,name+n,bytes); n+=bytes; ++characters;
-    // Keep an emoji presentation selector with its preceding character.
-    if(bytes>1 && (unsigned char)name[n]==0xef &&
-       (unsigned char)name[n+1]==0xb8 &&
-       ((unsigned char)name[n+2]==0x8f || (unsigned char)name[n+2]==0x8e)) {
-      if(n+3>32) break;
-      memcpy(out+n,name+n,3); n+=3;
+  const char* start=name;
+  while(*name && characters<20) {
+    // Preserve the existing trailing grid-suffix rule, now case-insensitive.
+    if(name[0]=='-' && name[1]==' ' && gridWord(name+2)) break;
+    // Remove whole space-delimited words before applying display limits.
+    if((name==start || name[-1]==' ') && gridWord(name)) {
+      while(*name && *name!=' ' && leadingBytes(name)) name+=leadingBytes(name);
+      while(*name==' ') ++name;
+      continue;
     }
+    const size_t bytes=leadingBytes(name);
+    if(!bytes || n+bytes>32) break;
+    memcpy(out+n,name,bytes); n+=bytes; name+=bytes; ++characters;
+    // Keep an emoji presentation selector with its preceding character.
+    if(bytes>1 && (unsigned char)name[0]==0xef &&
+       (unsigned char)name[1]==0xb8 &&
+       ((unsigned char)name[2]==0x8f || (unsigned char)name[2]==0x8e)) {
+      if(n+3>32) break;
+      memcpy(out+n,name,3); n+=3; name+=3;
+    }
+  }
+  // A multiword name must not retain the word hit by the character cutoff.
+  // Ignore discarded grid suffixes and trailing spaces when checking for overflow.
+  const char* remainder=name;
+  while(*remainder) {
+    while(*remainder==' ')++remainder;
+    if(remainder[0]=='-' && remainder[1]==' ' && gridWord(remainder+2)){remainder+=strlen(remainder);break;}
+    if((remainder==start || remainder[-1]==' ') && gridWord(remainder)) {
+      while(*remainder && *remainder!=' ' && leadingBytes(remainder))remainder+=leadingBytes(remainder);
+      if(*remainder && *remainder!=' ')break;
+      continue;
+    }
+    break;
+  }
+  bool multipleWords=false;
+  for(const char* p=start;*p;++p)if(*p==' ') {
+    while(*p==' ')++p;
+    if(*p)multipleWords=true;
+    break;
+  }
+  if(characters==20 && leadingBytes(remainder) && multipleWords && n && out[n-1]!=' ') {
+    while(n && out[n-1]!=' ')--n;
   }
   while(n && out[n-1]==' ') --n;
   out[n]=0;

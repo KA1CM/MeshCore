@@ -9,11 +9,28 @@
 #include "BotAdminContacts.h"
 #include "BotVoltageList.h"
 #include "RepeaterOrder.h"
+#include "BatterySignature.h"
+#include "UsbPowerDetector.h"
+#include "BotConnectivity.h"
 class MyMesh;
 struct ContactInfo;
 
 class RepeaterMonitor {
   MyMesh& mesh;
+  BotConnectivity::Monitor connectivity;
+  BotConnectivity::Event connectivityEvents[16];
+  uint8_t connectivityHead=0,connectivityCount=0;
+  size_t connectivityRecipient=0;
+  bool connectivityRawWifi=false;
+  uint32_t connectivityWifiChanged=0,connectivityWifiUtc=0,connectivityPathSequence=0;
+  uint32_t connectivityBoot=0,connectivityProbeWifiChanged=0;
+  BotVoltageList::Snapshot connectivityMessage;
+  bool connectivityMessageReady=false;
+  void pollConnectivity();
+  void queueConnectivityEvent(BotConnectivity::Kind kind);
+  void pollConnectivityNotifications();
+  UsbPowerDetector usbPowerDetector;
+  std::unique_ptr<BatterySignature> batterySignature;
   MonitorCredentials credentials;
   BotAdminContacts adminContacts;
   bool adminCheckPending = false, adminCheckIsSync = false;
@@ -67,7 +84,9 @@ class RepeaterMonitor {
   uint32_t deadline = 0, tag = 0, runDay = 0, lastManual = 0;
   uint32_t wifiAttempt = 0, nextPrune = 0;
   uint32_t wifiWindowStart = 0;
-  bool wifiStopped = false;
+  bool wifiEverConnected = false;
+  uint32_t wifiDisconnects=0, wifiReconnects=0, wifiAttempts=0;
+  uint32_t wifiLastDisconnect=0, wifiLastConnect=0;
   size_t wifiIndex = 0;
   void connectWifi(size_t index);
   String lastError;
@@ -99,6 +118,7 @@ public:
   const char* adminNotes(const uint8_t* sender, const char* args, BotVoltageList::Snapshot& out);
   const char* adminEditRepeater(const uint8_t* sender, const char* action, const char* query);
   const char* startAdminCheck(const uint8_t* sender, const char* query, bool sync = false);
+  void onUSBPowerChanged(bool present);
   bool clockReady() const { return synced; }
   const BotAdminContacts& botAdmins() const { return adminContacts; }
   explicit RepeaterMonitor(MyMesh& m) : mesh(m) {}

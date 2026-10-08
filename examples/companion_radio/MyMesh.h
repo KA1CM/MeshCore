@@ -1,5 +1,6 @@
 #include "BotVoltageList.h"
 #include "BotStatsWindow.h"
+#include "BotTopUsers.h"
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
 #include "MonitorBotStatsHistory.h"
 #include <ArduinoJson.h>
@@ -111,7 +112,9 @@ public:
   void startInterface(BaseSerialInterface &serial);
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
   void exportBotStats(JsonObject out);
+  bool hasPendingPathReplies() const { return bot_path_count != 0; }
   bool sendAdminCheckResult(const uint8_t* key, const char* text);
+  bool queueStatusNotification(const uint8_t* key, const BotVoltageList::Snapshot& snapshot);
   bool queueSunriseNotification(const uint8_t* key, const BotVoltageList::Snapshot& snapshot);
   uint32_t getLastBotAdvertTime() const { return last_bot_advert_time; }
   void setRepeaterMonitor(RepeaterMonitor* monitor) { repeaterMonitor = monitor; }
@@ -196,6 +199,7 @@ protected:
   }
 
 public:
+  uint16_t sampleBatteryMillivolts();
   void savePrefs() { _store->savePrefs(_prefs, sensors.node_lat, sensors.node_lon); }
 
 #if ENV_INCLUDE_GPS == 1
@@ -264,13 +268,14 @@ private:
   void resolveLocalPathNames(BotPath::Route& route);
   void pollBotPath();
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
-  struct {
-    bool active=false, ready=false;
+  struct PendingBotPath {
+    bool active=false, ready=false, started=false, lookupRunning=false, sent=false;
     BotPath::Route route;
     BotMessage message{};
     uint8_t key[PUB_KEY_SIZE]{}, channel=0xFF;
     uint32_t lookupDeadline=0, expires=0;
-  } pending_bot_path;
+  } pending_bot_paths[4];
+  size_t bot_path_head=0, bot_path_count=0;
 #endif
   uint32_t last_bot_advert_time = 0;
   struct {
@@ -338,6 +343,7 @@ private:
     BotVoltageList::Snapshot snapshot;
     BotCommandId command = BOT_COMMAND_LIST;
     bool notification = false;
+    bool statusNotification = false;
     bool adminOnly = false;
     bool active=false;
     BotChannelKind kind=BOT_CHANNEL_DM;
@@ -349,6 +355,7 @@ private:
   BotPrefs bot_prefs;
   BotStats bot_stats;
   BotStatsWindow bot_stats_window;
+  BotTopUsers bot_top_users;
   void sampleBotStatsWindow();
   void recordBotCommandStats(BotCommandId id);
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)

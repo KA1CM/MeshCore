@@ -42,7 +42,7 @@ public:
     for(const auto& b:buckets){for(size_t i=0;i<COMMANDS;++i)sum.commands[i]+=b.commands[i];for(size_t i=0;i<METRICS;++i)sum.metrics[i]+=b.metrics[i];}
     auto line=[&]()->char*{return out.lines[out.count++];};
     uint64_t total=0;for(auto n:sum.commands)total+=n;
-    snprintf(line(),BotVoltageList::LINE_SIZE,"Last 24h: %lu responses",(unsigned long)total);
+    snprintf(line(),BotVoltageList::LINE_SIZE,"%lu responses in the last 24h",(unsigned long)total);
     // Fold hidden admin DM commands into one category before sorting.
     uint64_t counts[COMMANDS]{};
     uint64_t admin=0;

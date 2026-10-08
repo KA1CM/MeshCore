@@ -1,3 +1,4 @@
+#include "BotInternetProbe.h"
 #include "BotPathLookup.h"
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
 #include "BotPathTrust.h"
@@ -20,6 +21,26 @@ namespace BotPathLookup {
 namespace {
 portMUX_TYPE statusMux=portMUX_INITIALIZER_UNLOCKED;
 Status lastStatus;
+HistoryEntry lookupHistory[30];
+size_t historyNext=0, historyCount=0;
+int historyActive=-1;
+void beginHistory(const char* requester, const char* channel="") {
+  const uint32_t utc=(uint32_t)time(nullptr), ticks=millis(), heap=ESP.getFreeHeap(), block=ESP.getMaxAllocHeap();
+  portENTER_CRITICAL(&statusMux);
+  historyActive=(int)historyNext;
+  auto& entry=lookupHistory[historyNext];entry=HistoryEntry{};
+  snprintf(entry.requester,sizeof(entry.requester),"%s",requester && *requester ? requester : "Unknown user");
+  snprintf(entry.channel,sizeof(entry.channel),"%s",channel && *channel ? channel : "Unknown channel");
+  entry.timestamp=utc;entry.startedMillis=ticks;entry.minHeap=heap;entry.minBlock=block;
+  historyNext=(historyNext+1)%30;if(historyCount<30)++historyCount;
+  portEXIT_CRITICAL(&statusMux);
+}
+void finishHistory() {
+  const uint32_t ticks=millis();
+  portENTER_CRITICAL(&statusMux);
+  if(historyActive>=0){auto& e=lookupHistory[historyActive];e.finished=true;e.elapsedMs=ticks-e.startedMillis;historyActive=-1;}
+  portEXIT_CRITICAL(&statusMux);
+}
 void report(const char* stage,int detail=0,bool failure=false,uint32_t verifyFlags=0) {
   Status next; next.stage=stage; next.detail=detail;
   if(failure) {
@@ -36,6 +57,12 @@ void report(const char* stage,int detail=0,bool failure=false,uint32_t verifyFla
   if(!failure) {
     next.failureUtc=lastStatus.failureUtc; next.verifyFlags=lastStatus.verifyFlags;
     memcpy(next.verifyInfo,lastStatus.verifyInfo,sizeof(next.verifyInfo));
+  }
+  if(historyActive>=0) {
+    auto& e=lookupHistory[historyActive];e.stage=stage;e.detail=detail;e.elapsedMs=millis()-e.startedMillis;
+    if(next.freeHeap<e.minHeap)e.minHeap=next.freeHeap;
+    if(next.largestBlock<e.minBlock)e.minBlock=next.largestBlock;
+    if(failure){e.failure=stage;e.failureDetail=detail;}
   }
   lastStatus=next;
   portEXIT_CRITICAL(&statusMux);
@@ -113,13 +140,19 @@ struct Cached {
 Cached cache[64]; // Worker-owned. No flash writes and no contact-table imports.
 size_t nextCache=0;
 uint32_t nextFetch=0;
+uint32_t successfulRequests=0;
+struct InternetPolicy { bool available=true;uint32_t recovery=0; } internetPolicy;
+uint32_t workerRecovery=0; // worker-owned, just like cache/nextFetch
+InternetPolicy internetPolicySnapshot() {
+  portENTER_CRITICAL(&statusMux);auto result=internetPolicy;portEXIT_CRITICAL(&statusMux);return result;
+}
 bool throttled=false, busy=false;
 QueueHandle_t completed=nullptr;
 bool future(uint32_t deadline) { return (int32_t)(millis()-deadline)<0; }
 void resolve(BotPath::Route* route) {
   bool missing[BOT_MAX_PATH_BYTES]{};
   String hops;
-  for(size_t i=0;i<route->count;++i) {
+  for(size_t i=0;i<lookupHopCount(*route);++i) {
     if(route->names[i][0] || route->ambiguous[i]) continue;
     char prefix[9]; BotPath::hash(*route,i,prefix);
     bool found=false;
@@ -133,7 +166,24 @@ void resolve(BotPath::Route* route) {
     hops+=prefix;
   }
   if(!hops.length()) { report("Using cached names"); return; }
-  if(throttled && future(nextFetch)) { report("Waiting before retry"); return; }
+  const auto policy=internetPolicySnapshot();
+  if(!policy.available) {report("Internet unavailable; using local/cached names");return;}
+  if(policy.recovery!=workerRecovery) {
+    // A confirmed recovery supersedes the failed lookup's old retry backoff.
+    workerRecovery=policy.recovery;throttled=false;nextFetch=0;
+  }
+  if(throttled && future(nextFetch)) {
+    const uint32_t wait=nextFetch-millis();
+    // Wait out the short success pause in this worker, never in the radio loop.
+    // Keep failure backoff as a fallback rather than holding the queue for a minute.
+    if(wait>5000) { report("Waiting before retry"); return; }
+    report("Waiting for lookup interval");
+    while(future(nextFetch)) {
+      if(!internetPolicySnapshot().available){report("Internet unavailable; using local/cached names");return;}
+      vTaskDelay(pdMS_TO_TICKS(20));
+    }
+  }
+  if(!internetPolicySnapshot().available){report("Internet unavailable; using local/cached names");return;}
   if(WiFi.status()!=WL_CONNECTED) { report("Wi-Fi disconnected",0,true); return; }
   if(time(nullptr)<=1700000000) { report("System clock not ready for HTTPS",0,true); return; }
   // No radio, contact, or dashboard state is touched from this task.
@@ -170,8 +220,9 @@ void resolve(BotPath::Route* route) {
           if(resolved.isNull()) report("Analyzer missing resolved object",0,true);
           if(!resolved.isNull()) {
             unsigned matched=0;
-            nextFetch=millis()+10000;
-            for(size_t i=0;i<route->count;++i) if(missing[i]) {
+            nextFetch=millis()+5000;
+            portENTER_CRITICAL(&statusMux);++successfulRequests;portEXIT_CRITICAL(&statusMux);
+            for(size_t i=0;i<lookupHopCount(*route);++i) if(missing[i]) {
               char prefix[9]; BotPath::hash(*route,i,prefix);
               JsonObjectConst entry=resolved[prefix].as<JsonObjectConst>();
               Cached result{};
@@ -195,32 +246,62 @@ void resolve(BotPath::Route* route) {
 void worker(void* argument) {
   auto* route=static_cast<BotPath::Route*>(argument);
   resolve(route); // Destroy Strings/HTTP/JSON objects before deleting the task.
+  finishHistory();
   xQueueSend(completed,&route,portMAX_DELAY);
   vTaskDelete(nullptr);
 }
+}
+void setInternetAvailable(bool available) {
+  portENTER_CRITICAL(&statusMux);
+  if(available && !internetPolicy.available)++internetPolicy.recovery;
+  internetPolicy.available=available;
+  portEXIT_CRITICAL(&statusMux);
+}
+uint32_t successSequence() {
+  portENTER_CRITICAL(&statusMux);auto result=successfulRequests;portEXIT_CRITICAL(&statusMux);return result;
 }
 Status status() {
   portENTER_CRITICAL(&statusMux); Status result=lastStatus; portEXIT_CRITICAL(&statusMux);
   return result;
 }
-bool start(const BotPath::Route& route) {
-  if(busy) return false;
+void recordEvent(const char* requester, const char* outcome, const char* channel) {
+  const uint32_t utc=(uint32_t)time(nullptr), heap=ESP.getFreeHeap(), block=ESP.getMaxAllocHeap();
+  portENTER_CRITICAL(&statusMux);
+  // An active entry can age out after 30 newer events; never update its reused slot.
+  if(historyActive==(int)historyNext)historyActive=-1;
+  auto& e=lookupHistory[historyNext];e=HistoryEntry{};
+  snprintf(e.requester,sizeof(e.requester),"%s",requester && *requester ? requester : "Unknown user");
+  snprintf(e.channel,sizeof(e.channel),"%s",channel && *channel ? channel : "Unknown channel");
+  e.timestamp=utc;e.stage=outcome;e.finished=true;e.minHeap=heap;e.minBlock=block;
+  historyNext=(historyNext+1)%30;if(historyCount<30)++historyCount;
+  portEXIT_CRITICAL(&statusMux);
+}
+bool history(size_t index, HistoryEntry& entry) {
+  portENTER_CRITICAL(&statusMux);
+  const bool found=index<historyCount;
+  if(found)entry=lookupHistory[(historyNext+29-index)%30];
+  portEXIT_CRITICAL(&statusMux);return found;
+}
+bool start(const BotPath::Route& route, const char* requester, const char* channel) {
+  if(busy || BotInternetProbe::busy()) return false;
   if(!route.count) return false;
-  if(route.width!=2 && route.width!=3) { report("Unsupported hash width",route.width); return false; }
+  beginHistory(requester,channel);
+  if(route.width!=2 && route.width!=3) { report("Unsupported hash width",route.width); finishHistory(); return false; }
   bool missing=false;
-  for(size_t i=0;i<route.count;++i) if(!route.names[i][0] && !route.ambiguous[i]) missing=true;
-  if(!missing) { report("Using local contacts"); return false; }
+  for(size_t i=0;i<lookupHopCount(route);++i) if(!route.names[i][0] && !route.ambiguous[i]) missing=true;
+  if(!missing) { report("Using local contacts"); finishHistory(); return false; }
   if(!completed) completed=xQueueCreate(1,sizeof(BotPath::Route*));
-  if(!completed) { report("Cannot allocate lookup queue",0,true); return false; }
+  if(!completed) { report("Cannot allocate lookup queue",0,true); finishHistory(); return false; }
   auto* copy=new(std::nothrow) BotPath::Route(route);
-  if(!copy) { report("Cannot allocate lookup request",0,true); return false; }
+  if(!copy) { report("Cannot allocate lookup request",0,true); finishHistory(); return false; }
   report("Starting lookup");
   busy=true;
   if(xTaskCreate(worker,"pathLookup",12288,copy,1,nullptr)!=pdPASS) {
-    report("Cannot allocate lookup task",0,true); busy=false; delete copy; return false;
+    report("Cannot allocate lookup task",0,true); busy=false; delete copy; finishHistory(); return false;
   }
   return true;
 }
+bool inProgress() { return busy; }
 bool take(BotPath::Route& route) {
   BotPath::Route* result=nullptr;
   if(!busy || xQueueReceive(completed,&result,0)!=pdTRUE) return false;

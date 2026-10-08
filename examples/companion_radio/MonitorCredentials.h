@@ -1,5 +1,7 @@
 #pragma once
 #include <Preferences.h>
+#include <memory>
+#include <new>
 #include "RepeaterMonitorCore.h"
 
 // Private NVS blob. Never serialize this store into dashboard or list JSON.
@@ -56,14 +58,16 @@ public:
   }
   bool set(const MonitorCore::Entry* entries, size_t count, const uint8_t* key, const char* password) {
     if (!ready || count > MonitorCore::MAX_REPEATERS || strlen(password) > 15) return false;
-    Store candidate = data;
+    // Called from the radio receive handler: keep the 1540-byte store off its stack.
+    std::unique_ptr<Store> candidate(new (std::nothrow) Store(data));
+    if (!candidate) return false;
     bool found = false;
     for (size_t i = 0; i < count; ++i) {
       if (key && memcmp(entries[i].key, key, 32)) continue;
       found = true;
       Record* slot = nullptr;
-      for (auto& r : candidate.records) if (!memcmp(r.key, entries[i].key, 32)) { slot = &r; break; }
-      if (!slot) for (auto& r : candidate.records) if (!r.password[0]) { slot = &r; break; }
+      for (auto& r : candidate->records) if (!memcmp(r.key, entries[i].key, 32)) { slot = &r; break; }
+      if (!slot) for (auto& r : candidate->records) if (!r.password[0]) { slot = &r; break; }
       if (!slot) return false;
       *slot = Record{};
       if (password[0]) {
@@ -71,7 +75,7 @@ public:
         memcpy(slot->password, password, strlen(password) + 1);
       }
     }
-    return found && commit(candidate);
+    return found && commit(*candidate);
   }
   bool retain(const MonitorCore::Entry* entries, size_t count) {
     if (!ready || count > MonitorCore::MAX_REPEATERS) return false;

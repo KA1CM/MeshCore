@@ -177,13 +177,13 @@ void formatQuarters(int8_t quarters, char* output, size_t output_len) {
 
 BotCommandResult executeCmd(const BotCommand& command, char* output, size_t output_len) {
   return writeText(output, output_len,
-                   "help  cmd  hello  about  version  time  status  stats  air  ping  test  path  snr  channels  lora  id  neighbors  list");
+                   "help  cmd  hello  about  version  time  status  stats  users  air  ping  test  path  snr  channels  lora  id  neighbors  list");
 }
 
 BotCommandResult executeHelp(const BotCommand& command, char* output, size_t output_len) {
   if (command.args_len == 0) {
     return writeText(output, output_len,
-                     "help  cmd  hello  about  version  time  status  stats  air  ping  test  path  snr  channels  lora  id  neighbors  list");
+                     "help  cmd  hello  about  version  time  status  stats  users  air  ping  test  path  snr  channels  lora  id  neighbors  list");
   }
 
   if (command.args_len == 4 && !strcmp(command.args,"list"))

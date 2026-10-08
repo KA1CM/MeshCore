@@ -32,26 +32,41 @@ inline void build(const MonitorCore::Entry* entries, const char names[][33], siz
     else snprintf(out.lines[outputRow],LINE_SIZE,"%s N/A",label);
   }
 }
+// One message, keeping complete rows in their existing priority order.
+inline bool singleMessage(const Snapshot& s, char* out, size_t capacity) {
+  if (!capacity) return false;
+  size_t used=0;out[0]=0;
+  for(size_t i=0;i<s.count;++i) {
+    const size_t len=strlen(s.lines[i]), separator=i ? 1 : 0;
+    if(used+separator+len>=capacity) break;
+    if(separator)out[used++]='\n';
+    memcpy(out+used,s.lines[i],len);used+=len;out[used]=0;
+  }
+  return used!=0;
+}
 // Reserve enough room for the largest possible heading: 32/32 plus newline.
-inline size_t pageEnd(const Snapshot& s, size_t next, size_t capacity) {
-  size_t used=6;
+inline size_t pageEnd(const Snapshot& s, size_t next, size_t capacity, bool noteChunks=false) {
+  size_t used=6; const size_t start=next;
   while(next<s.count) {
     const size_t len=strlen(s.lines[next]);
-    if(used+len+1>=capacity) break;
-    used+=len+1; ++next;
+    const size_t separator=next>start && (!noteChunks || next==1) ? 1 : 0;
+    if(used+len+separator>=capacity) break;
+    used+=len+separator; ++next;
   }
   return next;
 }
-inline bool page(const Snapshot& s, size_t& next, unsigned part, char* out, size_t capacity) {
+inline bool page(const Snapshot& s, size_t& next, unsigned part, char* out, size_t capacity, bool noteChunks=false) {
   if(capacity<80 || next>=s.count) return false;
   unsigned total=0;
-  for(size_t cursor=0;cursor<s.count;++total) cursor=pageEnd(s,cursor,capacity);
-  const size_t end=pageEnd(s,next,capacity);
+  for(size_t cursor=0;cursor<s.count;++total) cursor=pageEnd(s,cursor,capacity,noteChunks);
+  const size_t end=pageEnd(s,next,capacity,noteChunks);
   size_t used=snprintf(out,capacity,"%u/%u\n",part,total);
+  const size_t start=next;
   while(next<end) {
     const size_t len=strlen(s.lines[next]);
-    memcpy(out+used,s.lines[next],len);used+=len;out[used++]='\n';++next;
+    if(next>start && (!noteChunks || next==1)) out[used++]='\n';
+    memcpy(out+used,s.lines[next],len);used+=len;++next;
   }
-  out[used-1]=0;return true;
+  out[used]=0;return true;
 }
 }

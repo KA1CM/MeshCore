@@ -1,9 +1,13 @@
+#include "BotNoteFields.h"
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
 #include "RepeaterMonitor.h"
 #include "RepeaterMonitorPage.h"
 #include "MyMesh.h"
 #include "BotPathLookup.h"
+#include "BotInternetProbe.h"
+#include "FirmwareBot.h"
 #include <WiFi.h>
+#include <new>
 #include <ESPmDNS.h>
 #include <SPIFFS.h>
 #include <esp_sntp.h>
@@ -287,6 +291,7 @@ void RepeaterMonitor::routes() {
       while(index<adminContacts.count() && memcmp(adminContacts.at(index)->key,key,32)) ++index;
       if(!adminContacts.remove(key)) {server.send(400,"text/plain","Could not remove admin contact.");return;}
       if(sunriseNotificationPending && index<sunriseRecipient) --sunriseRecipient;
+      if(connectivityCount && index<connectivityRecipient)--connectivityRecipient;
     } else {
       if(!doc["commands"].is<bool>() || !doc["notifications"].is<bool>()) {
         server.send(400,"text/plain","Invalid admin contact permissions.");return;
@@ -306,8 +311,75 @@ void RepeaterMonitor::routes() {
     }
     server.send(200,"application/json","{\"ok\":true}");
   });
+  server.on("/api/battery-test", HTTP_POST, [this]() {
+    if(!authorized(true))return;
+    JsonDocument doc;
+    if(deserializeJson(doc,server.arg("plain"))) {server.send(400,"text/plain","Invalid request");return;}
+    const char* action=doc["action"] | "";
+    if(!strcmp(action,"start")) {
+      if(batterySignature && batterySignature->running) {server.send(409,"text/plain","Stop the current test first.");return;}
+      if(!batterySignature)batterySignature.reset(new(std::nothrow) BatterySignature);
+      if(!batterySignature) {server.send(503,"text/plain","Not enough memory for test");return;}
+      batterySignature->start(millis(),synced ? now() : 0);
+    } else if(!strcmp(action,"clear")) {
+      batterySignature.reset();
+    } else if(batterySignature && !strcmp(action,"stop")) {
+      batterySignature->running=false;
+    } else if(batterySignature && (!strcmp(action,"lost") || !strcmp(action,"restored"))) {
+      if(!batterySignature->mark(!strcmp(action,"lost")?1:2,millis())) {
+        server.send(409,"text/plain","Start test, mark unplugged, then mark restored.");return;
+      }
+    } else {server.send(400,"text/plain","Unknown action or no test");return;}
+    server.send(200,"application/json","{\"ok\":true}");
+  });
+  server.on("/api/battery-test", HTTP_GET, [this]() {
+    if(!authorized())return;
+    if(!requestIsAdmin){server.send(403,"text/plain","Admin only");return;}
+    JsonDocument doc;
+    auto* t=batterySignature.get();
+    doc["running"]=t && t->running;
+    doc["count"]=t ? t->count : 0;
+    doc["elapsed"]=t && t->count ? t->samples[t->count-1].elapsed : 0;
+    doc["mv"]=t && t->count ? t->samples[t->count-1].mv : 0;
+    doc["phase"]=t ? t->phase : 0;
+    doc["detected"]=t ? t->detected : 0;
+    doc["averageMv"]=t ? t->average : 0;
+    String json;serializeJson(doc,json);server.send(200,"application/json",json);
+  });
+  server.on("/api/battery-test.csv", HTTP_GET, [this]() {
+    if(!authorized())return;
+    if(!requestIsAdmin){server.send(403,"text/plain","Admin only");return;}
+    auto* t=batterySignature.get();
+    if(!t || !t->count){server.send(404,"text/plain","No test recorded");return;}
+    if(t->running){server.send(409,"text/plain","Stop test before downloading");return;}
+    server.sendHeader("Content-Disposition","attachment; filename=battery-signature.csv");
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200,"text/csv","");
+    char row[160];
+    snprintf(row,sizeof(row),"start_utc,unplugged_ms,restored_ms\n%lu,%lu,%lu\nelapsed_ms,battery_mv,manual_phase,lookup_active,experimental_detection\n",
+      (unsigned long)t->utc,(unsigned long)t->lostAt,(unsigned long)t->restoredAt);
+    server.sendContent(row);
+    String chunk;chunk.reserve(1100);
+    for(size_t i=0;i<t->count;++i) {
+      const auto& v=t->samples[i];
+      snprintf(row,sizeof(row),"%lu,%u,%s,%u,%s\n",(unsigned long)v.elapsed,v.mv,
+        v.phase==0?"connected":v.phase==1?"unplugged":"restored",v.lookup,
+        v.detected==0?"calibrating":v.detected==1?"connected":v.detected==2?"suspected_lost":"suspected_restored");
+      chunk+=row;
+      if(chunk.length()>900){server.sendContent(chunk);chunk="";}
+    }
+    if(chunk.length())server.sendContent(chunk);
+    server.sendContent("");
+  });
   server.on("/api/state", HTTP_GET, [this]() {
     if (!authorized()) return;
+    // Both this handler and start() run on the main loop, so no new worker can
+    // start between this check and destruction of the JSON/serialized buffers.
+    // Keep refresh paused between workers until every queued reply is finished.
+    if(mesh.hasPendingPathReplies() || BotPathLookup::inProgress()) {
+      server.sendHeader("Retry-After","5");
+      server.send(503,"text/plain","Path lookup in progress");return;
+    }
     JsonDocument doc; exportState(doc, true);
     uint32_t utc = now();
     doc["canManage"] = requestIsAdmin;
@@ -342,6 +414,7 @@ void RepeaterMonitor::routes() {
       for(size_t i=0;i<count;++i) if(!strcmp(doc["repeaters"][i]["key"] | "",activeKey)) doc["active"] = i;
     }
     doc["error"] = lastError; doc["ip"] = WiFi.localIP().toString();
+    doc["botBatteryMillivolts"] = mesh.sampleBatteryMillivolts();
     doc["node"] = mesh.getNodeName();
     const auto lookup=BotPathLookup::status();
     JsonObject lookupState=doc["pathLookup"].to<JsonObject>();
@@ -351,6 +424,23 @@ void RepeaterMonitor::routes() {
     lookupState["failureHeap"]=lookup.failureHeap; lookupState["failureBlock"]=lookup.failureBlock;
     lookupState["failureUtc"]=lookup.failureUtc; lookupState["verifyFlags"]=lookup.verifyFlags;
     lookupState["verifyInfo"]=lookup.verifyInfo;
+    JsonArray lookupLog=lookupState["history"].to<JsonArray>();
+    BotPathLookup::HistoryEntry lookupEntry;
+    for(size_t i=0;BotPathLookup::history(i,lookupEntry);++i) {
+      auto row=lookupLog.add<JsonObject>();
+      row["channel"]=lookupEntry.channel;row["requester"]=lookupEntry.requester;row["timestamp"]=lookupEntry.timestamp;
+      row["stage"]=lookupEntry.stage;row["detail"]=lookupEntry.detail;
+      row["failure"]=lookupEntry.failure;row["failureDetail"]=lookupEntry.failureDetail;
+      row["elapsedMs"]=lookupEntry.elapsedMs;row["finished"]=lookupEntry.finished;
+      row["minHeap"]=lookupEntry.minHeap;row["minBlock"]=lookupEntry.minBlock;
+    }
+    auto wifiState=doc["wifiDiagnostics"].to<JsonObject>();
+    wifiState["connected"]=WiFi.status()==WL_CONNECTED;
+    wifiState["status"]=(int)WiFi.status();wifiState["rssi"]=WiFi.RSSI();
+    wifiState["attempts"]=wifiAttempts;wifiState["disconnects"]=wifiDisconnects;wifiState["reconnects"]=wifiReconnects;
+    wifiState["uptimeSeconds"]=millis()/1000;
+    if(wifiEverConnected)wifiState["connectedAgoSeconds"]=(uint32_t)(millis()-wifiLastConnect)/1000;
+    if(wifiDisconnects)wifiState["disconnectedAgoSeconds"]=(uint32_t)(millis()-wifiLastDisconnect)/1000;
     doc["lastAdvert"] = mesh.getLastBotAdvertTime();
     JsonArray neighbors = doc["neighbors"].to<JsonArray>();
 #if CMESH_BOT_ENABLED
@@ -524,6 +614,7 @@ void RepeaterMonitor::routes() {
 }
 
 void RepeaterMonitor::connectWifi(size_t index) {
+  ++wifiAttempts;
   wifiIndex = index;
   WiFi.disconnect();
   WiFi.begin(wifiNetworks[index].ssid, wifiNetworks[index].password);
@@ -547,7 +638,7 @@ void RepeaterMonitor::begin() {
   if (restoredNames) mesh.saveMonitorContacts();
   rememberNames();
   WiFi.persistent(false); WiFi.mode(WIFI_STA); WiFi.setAutoReconnect(false); connectWifi(0);
-  wifiAttempt = wifiWindowStart = millis(); wifiStopped = false; board.setInhibitSleep(true);
+  wifiAttempt = wifiWindowStart = millis(); board.setInhibitSleep(true);
   routes(); server.begin();
 }
 
@@ -584,7 +675,11 @@ const char* RepeaterMonitor::adminPassword(const uint8_t* sender, const char* ar
   if(!credentials.set(entries,count,entries[found].key,password))
     return "Could not save password; change not applied";
   adminConfirmed[found]=false;
-  return "Password saved";
+  const auto& entry=entries[found];
+  auto* c=mesh.lookupContactByPubKey(entry.key,32);
+  char name[33];BotVoltageList::shortName(c && c->name[0] ? c->name : entry.learnedName[0] ? entry.learnedName : entry.name,entry.key,name);
+  snprintf(adminEditReply,sizeof(adminEditReply),"%s password saved",name);
+  return adminEditReply;
 }
 
 const char* RepeaterMonitor::adminNotes(const uint8_t* sender, const char* args, BotVoltageList::Snapshot& out) {
@@ -612,21 +707,25 @@ const char* RepeaterMonitor::adminNotes(const uint8_t* sender, const char* args,
   }
   if(found<0) return "No matching repeater";
   auto& entry=entries[found];
+  auto* c=mesh.lookupContactByPubKey(entry.key,32);
+  char name[33];BotVoltageList::shortName(c && c->name[0] ? c->name : entry.learnedName[0] ? entry.learnedName : entry.name,entry.key,name);
   if(set) {
     if(!storageOK || busy() || adminCheckPending) return "Bot busy or storage unavailable; try again shortly";
     const char* text=separator+1;
     if(*text==' ') ++text;
     if(!*text) return "Notes text is required; existing notes unchanged";
-    if(!validNotes(text,strlen(text))) return "Invalid notes; maximum 512 characters";
-    std::string previous=entry.notes;entry.notes=text;
+    std::string updated;
+    if(const char* error=BotNoteFields::edit(entry.notes,text,updated))return error;
+    if(!validNotes(updated.c_str(),updated.size())) return "Invalid notes; maximum 512 characters";
+    std::string previous=entry.notes;entry.notes.swap(updated);
     if(!save()) {entry.notes.swap(previous);return "Could not save notes; change not applied";}
-    return "Notes saved";
+    snprintf(adminEditReply,sizeof(adminEditReply),"%s notes saved",name);
+    return adminEditReply;
   }
-  auto* c=mesh.lookupContactByPubKey(entry.key,32);
-  char name[33];BotVoltageList::shortName(c && c->name[0] ? c->name : entry.learnedName[0] ? entry.learnedName : entry.name,entry.key,name);
   snprintf(out.lines[out.count++],BotVoltageList::LINE_SIZE,"%s notes:",name);
   if(entry.notes.empty()) {strcpy(out.lines[out.count++],"No notes saved");return nullptr;}
-  // Wrap at UTF-8 boundaries. 2048 bytes need at most 36 bounded lines.
+  // UTF-8-safe chunks: the notes pager joins them without adding newlines.
+  // 2048 bytes need at most 36 bounded chunks.
   for(size_t pos=0;pos<entry.notes.size();) {
     size_t end=std::min(pos+60,entry.notes.size());
     while(end<entry.notes.size() && ((unsigned char)entry.notes[end]&0xc0)==0x80) --end;
@@ -1164,6 +1263,109 @@ bool RepeaterMonitor::onCommandResponse(const ContactInfo& from, const char* tex
   return true;
 }
 
+// Outage timestamps use Eastern time consistently with bot responses.
+static void connectivityTime(uint32_t utc,char* out,size_t size) {
+  if(utc<MonitorCore::VALID_TIME){snprintf(out,size,"Time unavailable");return;}
+  time_t local=(time_t)utc+FirmwareBot::easternUtcOffsetSeconds(utc);
+  tm calendar;gmtime_r(&local,&calendar);
+  strftime(out,size,"%b %d %H:%M",&calendar);
+}
+void RepeaterMonitor::onUSBPowerChanged(bool present) {
+  if(connectivity.setPower(present,now(),millis()))
+    queueConnectivityEvent(present ? BotConnectivity::PowerRestored : BotConnectivity::PowerLost);
+}
+void RepeaterMonitor::queueConnectivityEvent(BotConnectivity::Kind kind) {
+  auto event=connectivity.event(millis(),now(),kind);
+  event.battery=mesh.sampleBatteryMillivolts();
+  // Preserve the event already being delivered; bound RAM during long radio congestion.
+  if(connectivityCount==16) {
+    connectivityEvents[(connectivityHead+15)%16]=event;return;
+  }
+  connectivityEvents[(connectivityHead+connectivityCount)%16]=event;++connectivityCount;
+}
+void RepeaterMonitor::pollConnectivity() {
+  const uint32_t ms=millis();const bool wifi=WiFi.status()==WL_CONNECTED;
+  if(!connectivity.initialized) {
+    connectivity.begin(ms);connectivityBoot=ms;
+    connectivityRawWifi=wifi;connectivityWifiChanged=ms;connectivityWifiUtc=now();
+    connectivityPathSequence=BotPathLookup::successSequence();
+  }
+  if(wifi!=connectivityRawWifi) {
+    connectivityRawWifi=wifi;connectivityWifiChanged=ms;connectivityWifiUtc=now();
+  }
+  // Ignore startup association and short reconnects; keep the original loss time.
+  if(ms-connectivityBoot>=30000 && ms-connectivityWifiChanged>=10000) {
+    if(connectivity.setWifi(wifi,connectivityWifiUtc,connectivityWifiChanged)) {
+      if(wifi)connectivity.nextProbe=ms; // Check now, then report Wi-Fi and internet together.
+      else queueConnectivityEvent(BotConnectivity::WifiLost);
+    }
+  }
+  const uint32_t sequence=BotPathLookup::successSequence();
+  bool pathSucceeded=false;
+  if(sequence!=connectivityPathSequence) {
+    connectivityPathSequence=sequence;
+    if(wifi) {
+      pathSucceeded=true;
+      const bool checkingRestore=connectivity.wifiRestorePending;
+      if(connectivity.result(true,ms,now()))queueConnectivityEvent(checkingRestore ? BotConnectivity::WifiRestoredOnline : BotConnectivity::InternetRestored);
+    }
+  }
+  bool ok=false;
+  if(BotInternetProbe::take(ok) && wifi && !pathSucceeded && connectivityProbeWifiChanged==connectivityWifiChanged) {
+    const bool checkingRestore=connectivity.wifiRestorePending;
+    if(connectivity.result(ok,ms,now()))queueConnectivityEvent(checkingRestore ? (ok ? BotConnectivity::WifiRestoredOnline : BotConnectivity::WifiRestoredOffline) : (ok ? BotConnectivity::InternetRestored : BotConnectivity::InternetLost));
+  }
+  if(connectivity.due(ms) && wifi && !BotInternetProbe::busy() &&
+     !BotPathLookup::inProgress() && !mesh.hasPendingPathReplies()) {
+    // Resource failure/deferred checks are not evidence of a network outage.
+    if(BotInternetProbe::start()) {connectivity.attempted(ms);connectivityProbeWifiChanged=connectivityWifiChanged;}
+    else connectivity.nextProbe=ms+5000;
+  }
+  BotPathLookup::setInternetAvailable(connectivity.internet.state!=BotConnectivity::Lost);
+  for(auto kind : {BotConnectivity::PowerReminder,BotConnectivity::WifiReminder,BotConnectivity::InternetReminder})
+    if(connectivity.reminder(ms,kind))queueConnectivityEvent(kind);
+}
+void RepeaterMonitor::pollConnectivityNotifications() {
+  if(!connectivityCount || busy())return;
+  const auto& event=connectivityEvents[connectivityHead];
+  if(!connectivityMessageReady) {
+    auto& message=connectivityMessage;message.count=0;
+    const auto add=[&](const char* text){strlcpy(message.lines[message.count++],text,BotVoltageList::LINE_SIZE);};
+    const auto timestamp=[&](uint32_t utc){connectivityTime(utc,message.lines[message.count++],BotVoltageList::LINE_SIZE);};
+    const auto duration=[&](){
+      const uint32_t minutes=event.durationMs/60000;
+      snprintf(message.lines[message.count++],BotVoltageList::LINE_SIZE,"Total time %luh %lum",
+        (unsigned long)(minutes/60),(unsigned long)(minutes%60));
+    };
+    using namespace BotConnectivity;
+    switch(event.kind) {
+      case PowerLost:add("USB power lost");timestamp(event.utc);break;
+      case PowerReminder:add("USB power lost since");timestamp(event.since);break;
+      case PowerRestored:add("USB power restored");duration();break;
+      case WifiLost:add("Wi-Fi disconnected");timestamp(event.utc);break;
+      case WifiReminder:add("Wi-Fi disconnected since");timestamp(event.since);break;
+      case WifiRestoredOnline:add("Wi-Fi: Restored");add("Internet: Restored");duration();break;
+      case WifiRestoredOffline:add("Wi-Fi: Restored");add("Internet: Lost since");timestamp(event.since);break;
+      case InternetLost:add("Internet lost since");timestamp(event.since);break;
+      case InternetReminder:add("Internet lost since");timestamp(event.since);break;
+      case InternetRestored:add("Internet restored");duration();break;
+    }
+    if(event.kind<=PowerRestored) {
+      const uint16_t mv=event.battery;
+      snprintf(message.lines[message.count++],BotVoltageList::LINE_SIZE,"Battery %u.%02uV",((mv+5)/10)/100,((mv+5)/10)%100);
+    }
+    connectivityMessageReady=true;
+  }
+  while(connectivityRecipient<adminContacts.count()) {
+    const auto* admin=adminContacts.at(connectivityRecipient);
+    if(!(admin->permissions & BotAdminContacts::Notifications) || !mesh.lookupContactByPubKey(admin->key,32)) {++connectivityRecipient;continue;}
+    if(!mesh.queueStatusNotification(admin->key,connectivityMessage))return;
+    ++connectivityRecipient;return;
+  }
+  connectivityHead=(connectivityHead+1)%16;--connectivityCount;
+  connectivityRecipient=0;connectivityMessageReady=false;
+}
+
 void RepeaterMonitor::scheduleSunriseNotification() {
   voltageList(sunriseNotification, true);
   if (!sunriseNotification.count) {
@@ -1192,23 +1394,35 @@ void RepeaterMonitor::pollSunriseNotification() {
 }
 
 void RepeaterMonitor::loop() {
+  if(usbPowerDetector.due(millis())) {
+    // One ADC measurement serves continuous detection and any active CSV test.
+    const uint16_t mv=mesh.sampleBatteryMillivolts();
+    const uint32_t sampledAt=millis();
+    const auto event=usbPowerDetector.add(sampledAt,mv);
+    if(event==UsbPowerDetector::Calibrated || event==UsbPowerDetector::PowerRestored)
+      onUSBPowerChanged(true);
+    else if(event==UsbPowerDetector::PowerLost)onUSBPowerChanged(false);
+    if(batterySignature)batterySignature->add(sampledAt,mv,BotPathLookup::inProgress());
+  }
   bool connected = WiFi.status() == WL_CONNECTED;
   if (connected && !wasConnected) {
+    if(wifiEverConnected)++wifiReconnects;
+    wifiEverConnected=true;wifiLastConnect=millis();
+    // Close any stale HTTP client left over from the previous Wi-Fi connection.
+    server.stop();server.begin();
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
     if (!mdnsStarted) { mdnsStarted = MDNS.begin("mesh-bot"); if (mdnsStarted) MDNS.addService("http", "tcp", 80); }
     // USB carries the companion binary protocol; do not inject dashboard logs into it.
   }
-  // Each outage gets a fresh ten-minute window. Stop until reboot if exhausted.
-  // Unsigned subtraction also handles millis() rollover.
   if (!connected && wasConnected) {
-    wifiWindowStart = millis(); wifiStopped = false; connectWifi(0);
-  } else if (!connected && !wifiStopped) {
-    if (millis() - wifiWindowStart >= 600000UL) {
-      wifiStopped = true;
-      WiFi.disconnect(true); // stop the station; automatic reconnect is disabled
-    } else if (millis() - wifiAttempt >= 30000) {
-      connectWifi((wifiIndex + 1) % wifiNetworkCount);
-    }
+    ++wifiDisconnects;wifiLastDisconnect=millis();
+    if(mdnsStarted){MDNS.end();mdnsStarted=false;}
+    wifiWindowStart = millis();connectWifi(0);
+  } else if (!connected) {
+    // Retry every 30 seconds initially, then once a minute indefinitely.
+    // No sleep and no permanent station shutdown: the radio loop keeps running.
+    const uint32_t retryInterval=millis()-wifiWindowStart>=600000UL ? 60000UL : 30000UL;
+    if(millis()-wifiAttempt>=retryInterval)connectWifi((wifiIndex+1)%wifiNetworkCount);
   }
   wasConnected = connected;
   if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED && time(nullptr) >= VALID_TIME) {
@@ -1222,5 +1436,7 @@ void RepeaterMonitor::loop() {
   poll();
   pollAdminCheckReply();
   pollSunriseNotification();
+  pollConnectivity();
+  pollConnectivityNotifications();
 }
 #endif
