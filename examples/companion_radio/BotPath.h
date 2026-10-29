@@ -5,7 +5,13 @@
 #include <cstring>
 
 namespace BotPath {
+// Explicit local exception for a known forwarding companion. Match only the
+// configured two-byte hash; do not guess identities for wider prefixes.
+inline const char* fixedName(const uint8_t* hash, size_t width) {
+  return width==2 && hash[0]==0x08 && hash[1]==0x83 ? "SUPER_SQUIRREL 🐿️" : nullptr;
+}
 struct Route {
+  bool all = false;
   uint8_t bytes[BOT_MAX_PATH_BYTES]{};
   uint8_t width = 0, count = 0;
   char names[BOT_MAX_PATH_BYTES][33]{};
@@ -21,6 +27,66 @@ inline void hash(const Route& route, size_t hop, char* out) {
 }
 // Share the 20-character short-name rule with list and signal responses.
 inline void shortName(const char* name, char* out) { BotShortName::write(name,out); }
+inline BotCommandResult format(const Route& route, const char* target, char* out, size_t capacity);
+inline BotCommandResult formatAll(const Route& route, const char* target, size_t first,
+                                  size_t& next, char* out, size_t capacity) {
+  next=first;
+  if (!out || !capacity || !route.width || route.width>4 ||
+      route.count*route.width>BOT_MAX_PATH_BYTES || (route.count && first>=route.count))
+    return {BOT_COMMAND_RESULT_NO_SPACE,0};
+  auto label=[&](size_t hop,char* text) {
+    if(route.names[hop][0] && !route.ambiguous[hop])strcpy(text,route.names[hop]);
+    else {
+      hash(route,hop,text);
+      // A dot means no reliable name, including colliding prefixes.
+      // Bare hashes are reserved for deliberately displaying a known hash.
+      text[route.width*2]='.';text[route.width*2+1]=0;
+    }
+  };
+  // Reserve the largest possible page number (64/64) so counting and
+  // writing use identical boundaries, without shortening any resolved name.
+  char heading[BOT_MAX_SENDER_NAME_LEN+12];
+  const int reserved=target && *target ?
+    snprintf(heading,sizeof(heading),"@[%.*s] 64/64\n",BOT_MAX_SENDER_NAME_LEN,target) :
+    snprintf(heading,sizeof(heading),"64/64\n");
+  if(reserved<0 || (size_t)reserved>=capacity)return {BOT_COMMAND_RESULT_NO_SPACE,0};
+  auto endOfPart=[&](size_t start) {
+    size_t used=reserved,end=start;
+    while(end<route.count) {
+      char text[33];label(end,text);
+      const size_t length=strlen(text)+(end>start ? 1 : 0);
+      if(used+length>=capacity)break;
+      used+=length;++end;
+    }
+    return end;
+  };
+  size_t total=0,page=0,end=0;
+  for(size_t start=0;start<route.count;) {
+    const size_t limit=endOfPart(start);
+    if(limit==start)return {BOT_COMMAND_RESULT_NO_SPACE,0};
+    ++total;
+    if(start==first){page=total;end=limit;}
+    start=limit;
+  }
+  if(!route.count){total=page=1;}
+  if(!page)return {BOT_COMMAND_RESULT_NO_SPACE,0};
+  int written=target && *target ?
+    snprintf(out,capacity,"@[%.*s] %u/%u\n",BOT_MAX_SENDER_NAME_LEN,target,(unsigned)page,(unsigned)total) :
+    snprintf(out,capacity,"%u/%u\n",(unsigned)page,(unsigned)total);
+  if(written<0 || (size_t)written>=capacity)return {BOT_COMMAND_RESULT_NO_SPACE,0};
+  size_t pos=written;
+  if(!route.count) {
+    if(pos+6>=capacity)return {BOT_COMMAND_RESULT_NO_SPACE,0};
+    memcpy(out+pos,"Direct",6);pos+=6;
+  }
+  for(size_t hop=first;hop<end;++hop) {
+    char text[33];label(hop,text);
+    if(hop>first)out[pos++]='\n';
+    const size_t length=strlen(text);memcpy(out+pos,text,length);pos+=length;
+  }
+  out[pos]=0;next=end;
+  return {BOT_COMMAND_RESULT_OK,pos};
+}
 inline BotCommandResult format(const Route& route, const char* target, char* out, size_t capacity) {
   if (!out || !capacity) return {BOT_COMMAND_RESULT_NO_SPACE,0};
   out[0]=0;
@@ -50,7 +116,8 @@ inline BotCommandResult format(const Route& route, const char* target, char* out
     displayLen[i]=named[i] ? strlen(route.names[i]) : route.width*2;
   }
   auto unresolvedName=[&](size_t i) {
-    return i<5 && (route.width==2 || route.width==3) && !route.names[i][0] && !route.ambiguous[i];
+    // Retain the special-case marker if the fixed name is compacted to a hash.
+    return !route.names[i][0] || route.ambiguous[i] || fixedName(route.bytes+i*route.width,route.width);
   };
   size_t omitted=0;
   auto required = [&]() {

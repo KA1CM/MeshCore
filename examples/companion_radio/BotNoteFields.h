@@ -3,9 +3,9 @@
 #include <strings.h>
 namespace BotNoteFields {
 inline std::string trim(std::string s){while(!s.empty()&&(s.back()==' '||s.back()=='\t'||s.back()=='\r'))s.pop_back();size_t i=0;while(i<s.size()&&(s[i]==' '||s[i]=='\t'))++i;return s.substr(i);}
-inline const char* edit(const std::string& previous,const char* text,std::string& result){
+inline const char* edit(const std::string& previous,const char* text,std::string& result,std::string* changed=nullptr){
  const std::string input=text;const size_t pipe=input.find('|'),newline=input.find('\n');
- if(pipe==std::string::npos||(newline!=std::string::npos&&newline<pipe)){result=input;return nullptr;}
+ if(pipe==std::string::npos||(newline!=std::string::npos&&newline<pipe)){result=input;if(changed)*changed=input;return nullptr;}
  const std::string field=trim(input.substr(0,pipe)),value=trim(input.substr(pipe+1));
  const char* label=nullptr;
  for(const char* name:{"Enclosure","Antenna","Board","Firmware","RXPS"})if(!strcasecmp(field.c_str(),name)){label=name;break;}
@@ -22,6 +22,7 @@ inline const char* edit(const std::string& previous,const char* text,std::string
   pos=end+1;
  }
  const std::string replacement=std::string(label)+":"+(value.empty()?"":" ")+value;
+ if(changed)*changed=replacement;
  result=previous;
  if(found!=std::string::npos){const bool cr=finish>found&&previous[finish-1]=='\r';result.replace(found,finish-found,replacement+(cr?"\r":""));}
  else if(!strcasecmp(label,"Enclosure"))result=replacement+(previous.empty()?"":"\n")+previous;

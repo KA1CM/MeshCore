@@ -4,11 +4,13 @@
 #include "BotPathTrust.h"
 #include "BotPathLookupResult.h"
 #include "BotLookupBody.h"
+#include "BotSnapshotFile.h"
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <mbedtls/platform.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
@@ -24,8 +26,11 @@ Status lastStatus;
 HistoryEntry lookupHistory[30];
 size_t historyNext=0, historyCount=0;
 int historyActive=-1;
+uint32_t tlsPsramAllocations=0; // Worker-owned; copied into Status at lookup stages.
+uint32_t internalFree() { return heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT); }
+uint32_t internalBlock() { return heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT); }
 void beginHistory(const char* requester, const char* channel="") {
-  const uint32_t utc=(uint32_t)time(nullptr), ticks=millis(), heap=ESP.getFreeHeap(), block=ESP.getMaxAllocHeap();
+  const uint32_t utc=(uint32_t)time(nullptr), ticks=millis(), heap=internalFree(), block=internalBlock();
   portENTER_CRITICAL(&statusMux);
   historyActive=(int)historyNext;
   auto& entry=lookupHistory[historyNext];entry=HistoryEntry{};
@@ -48,7 +53,10 @@ void report(const char* stage,int detail=0,bool failure=false,uint32_t verifyFla
     next.verifyFlags=verifyFlags;
     if(verifyFlags) mbedtls_x509_crt_verify_info(next.verifyInfo,sizeof(next.verifyInfo),"",verifyFlags);
   }
-  next.freeHeap=ESP.getFreeHeap(); next.largestBlock=ESP.getMaxAllocHeap();
+  next.freeHeap=internalFree(); next.largestBlock=internalBlock();
+  next.psramFree=heap_caps_get_free_size(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+  next.psramBlock=heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+  next.tlsPsramAllocations=tlsPsramAllocations;
   portENTER_CRITICAL(&statusMux);
   next.lastFailure=failure ? stage : lastStatus.lastFailure;
   next.lastFailureDetail=failure ? detail : lastStatus.lastFailureDetail;
@@ -108,6 +116,7 @@ public:
         sslclient->ssl_ctx.state!=MBEDTLS_SSL_HELLO_REQUEST &&
         elapsed>=sslclient->handshake_timeout;
       report(handshakeTimeout ? "TLS handshake timed out (milliseconds)" :
+             result==MBEDTLS_ERR_SSL_ALLOC_FAILED ? "TLS allocation failed" :
              result==MBEDTLS_ERR_X509_CERT_VERIFY_FAILED ? "TLS certificate verification failed" :
              result < -1 ? "TLS handshake failed" : "TCP connection failed",
              handshakeTimeout ? (int)elapsed : result < -1 ? result : socketError,true,flags);
@@ -133,12 +142,32 @@ public:
   void flush() override {}
 };
 struct Cached {
-  char prefix[7]{}, name[33]{};
-  uint32_t expires=0;
+  char prefix[7]{}, name[97]{};
+  uint32_t expires=0, expiresUtc=0;
   bool ambiguous=false;
 };
-Cached cache[64]; // Worker-owned. No flash writes and no contact-table imports.
+constexpr size_t CacheCapacity=128;
+constexpr uint32_t PositiveCacheSeconds=100UL*60*60;
+Cached* cache=nullptr; // Allocated once, preferably outside TLS's internal heap.
+static_assert(sizeof(Cached)*CacheCapacity<=16384,"Bound lookup name cache memory");
+bool ensureCache() {
+  if(cache) return true;
+  auto* memory=static_cast<Cached*>(allocateBulk(sizeof(Cached)*CacheCapacity));
+  if(!memory) return false;
+  for(size_t i=0;i<CacheCapacity;++i) new(memory+i) Cached{};
+  cache=memory;
+  return true;
+}
 size_t nextCache=0;
+struct SavedCacheEntry { char prefix[7], name[97]; uint32_t expiresUtc; };
+struct SavedCache {
+  uint32_t version,count,savedUtc,savedDay;
+  SavedCacheEntry entries[CacheCapacity];
+};
+BotSnapshotFile cacheSnapshots{"/pathnames0.bin","/pathnames1.bin"};
+bool cacheRestored=false,cacheSaveAttempted=false;
+uint32_t cacheDailyDay=0,cacheLastSaveUtc=0,cacheLastAttempt=0,cacheRestoreRetry=0;
+const char* cacheSaveError="NTP not confirmed";
 uint32_t nextFetch=0;
 uint32_t successfulRequests=0;
 struct InternetPolicy { bool available=true;uint32_t recovery=0; } internetPolicy;
@@ -147,20 +176,60 @@ InternetPolicy internetPolicySnapshot() {
   portENTER_CRITICAL(&statusMux);auto result=internetPolicy;portEXIT_CRITICAL(&statusMux);return result;
 }
 bool throttled=false, busy=false;
-QueueHandle_t completed=nullptr;
+bool historyStoragePending=false; // Main loop only; existing worker may finish.
+QueueHandle_t requests=nullptr, completed=nullptr;
+TaskHandle_t workerTask=nullptr;
+#if defined(CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC) && defined(MBEDTLS_PLATFORM_MEMORY) && \
+    !defined(MBEDTLS_PLATFORM_CALLOC_MACRO) && !defined(MBEDTLS_PLATFORM_FREE_MACRO)
+// Install once before TLS starts; never swap global allocators around a request.
+// Only this worker's large TLS allocations prefer PSRAM. Everything else keeps
+// the pinned SDK's internal-RAM allocation policy and compatible heap free.
+void* tlsCalloc(size_t count,size_t size) {
+  if(size && count>SIZE_MAX/size) return nullptr;
+  if(workerTask && xTaskGetCurrentTaskHandle()==workerTask && count*size>=16384) {
+    if(void* memory=heap_caps_calloc(count,size,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT)) {
+      ++tlsPsramAllocations;
+      return memory;
+    }
+  }
+  return heap_caps_calloc(count,size,MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+}
+void tlsFree(void* memory) { heap_caps_free(memory); }
+bool installTlsAllocator() {
+  static bool installed=false;
+  if(!installed) installed=mbedtls_platform_set_calloc_free(tlsCalloc,tlsFree)==0;
+  return installed;
+}
+#else
+bool installTlsAllocator() { return true; } // Preserve other SDK configurations.
+#endif
+// Reserve the worker's internal stack at startup instead of carving a new
+// 12 KB block out of the heap for every TLS request.
+constexpr size_t WorkerStackBytes=12288;
+alignas(16) StackType_t workerStack[WorkerStackBytes/sizeof(StackType_t)];
+static_assert(sizeof(workerStack)==WorkerStackBytes,"Lookup stack must remain 12 KB");
+StaticTask_t workerControl;
+StaticQueue_t requestsControl, completedControl;
+uint8_t requestsStorage[sizeof(BotPath::Route*)], completedStorage[sizeof(BotPath::Route*)];
 bool future(uint32_t deadline) { return (int32_t)(millis()-deadline)<0; }
 void resolve(BotPath::Route* route) {
   bool missing[BOT_MAX_PATH_BYTES]{};
   String hops;
-  for(size_t i=0;i<lookupHopCount(*route);++i) {
+  // Cached identities are cheap and apply to the entire route. Only new
+  // internet requests retain the ordinary PATH first-five-hop restriction.
+  for(size_t i=0;i<route->count;++i) {
     if(route->names[i][0] || route->ambiguous[i]) continue;
     char prefix[9]; BotPath::hash(*route,i,prefix);
     bool found=false;
-    for(const auto& item:cache) if(!strcmp(item.prefix,prefix) && future(item.expires)) {
-      memcpy(route->names[i],item.name,33); route->ambiguous[i]=item.ambiguous;
-      found=true; break;
+    for(size_t j=0;j<CacheCapacity;++j) {
+      const auto& item=cache[j];
+      if(!strcmp(item.prefix,prefix) && future(item.expires)) {
+        BotPath::shortName(item.name,route->names[i]); route->ambiguous[i]=item.ambiguous;
+        found=true; break;
+      }
     }
     if(found) continue;
+    if(i>=lookupHopCount(*route)) continue;
     missing[i]=true;
     if(hops.length()) hops+=',';
     hops+=prefix;
@@ -227,11 +296,17 @@ void resolve(BotPath::Route* route) {
               JsonObjectConst entry=resolved[prefix].as<JsonObjectConst>();
               Cached result{};
               snprintf(result.prefix,sizeof(result.prefix),"%s",prefix);
-              if(!readEntry(entry,prefix,result.name,result.ambiguous)) continue;
+              // Cache missing entries as unresolved too, avoiding repeated
+              // background requests for a prefix absent from the analyzer.
+              readEntry(entry,prefix,result.name,result.ambiguous,true,sizeof(result.name));
               // Refuse the analyzer's heuristic best pick for colliding prefixes.
-              result.expires=millis()+(result.name[0] ? 86400000UL : 900000UL);
-              cache[nextCache++%64]=result;
-              memcpy(route->names[i],result.name,33); route->ambiguous[i]=result.ambiguous;
+              // Keep resolved names for 100 hours; retry missing/ambiguous
+              // identities after 15 minutes so new analyzer data can be found.
+              const bool positive=result.name[0] && !result.ambiguous;
+              result.expires=millis()+(positive ? PositiveCacheSeconds*1000 : 900000UL);
+              result.expiresUtc=positive ? (uint32_t)time(nullptr)+PositiveCacheSeconds : 0;
+              cache[nextCache++%CacheCapacity]=result;
+              BotPath::shortName(result.name,route->names[i]); route->ambiguous[i]=result.ambiguous;
               if(result.name[0]) ++matched;
             }
             report("Names resolved",matched);
@@ -243,13 +318,117 @@ void resolve(BotPath::Route* route) {
     } else report("Could not initialize HTTPS",0,true);
   }
 }
-void worker(void* argument) {
-  auto* route=static_cast<BotPath::Route*>(argument);
-  resolve(route); // Destroy Strings/HTTP/JSON objects before deleting the task.
-  finishHistory();
-  xQueueSend(completed,&route,portMAX_DELAY);
-  vTaskDelete(nullptr);
+void worker(void*) {
+  for(;;) {
+    BotPath::Route* route=nullptr;
+    if(xQueueReceive(requests,&route,portMAX_DELAY)!=pdTRUE) continue;
+    resolve(route); // Destroy per-request Strings/HTTP/JSON before publishing.
+    finishHistory();
+    xQueueSend(completed,&route,portMAX_DELAY);
+    // Block on the next request; retain the same task and stack for its lifetime.
+  }
 }
+// Main loop only, while busy==false. Large snapshot staging stays off the
+// radio receive stack and prefers PSRAM, like the live cache itself.
+bool restoreNameCache(uint32_t utc) {
+  if(cacheRestored) return true;
+  if(!ensureCache()) { cacheSaveError="cache allocation failed"; return false; }
+  std::unique_ptr<char[],FreeBulk> memory(static_cast<char*>(allocateBulk(sizeof(SavedCache))));
+  if(!memory) { cacheSaveError="snapshot allocation failed"; return false; }
+  auto* saved=new(memory.get()) SavedCache;
+  const auto loaded=cacheSnapshots.load(saved,sizeof(*saved));
+  if(loaded==BotSnapshotFile::Unavailable) { cacheSaveError=cacheSnapshots.lastError(); return false; }
+  cacheRestored=true; // Missing/invalid optional cache must not disable lookups.
+  if(loaded==BotSnapshotFile::Missing) { cacheSaveError=""; return true; }
+  if(loaded!=BotSnapshotFile::Loaded) { cacheSaveError=cacheSnapshots.lastError(); return true; }
+  bool valid=saved->version==1 && saved->count<=CacheCapacity &&
+    saved->savedUtc>=1700000000UL && saved->savedUtc<=utc && saved->savedDay<=utc/86400UL;
+  for(size_t i=0;valid && i<saved->count;++i) {
+    const auto& entry=saved->entries[i];
+    valid=memchr(entry.prefix,0,sizeof(entry.prefix)) && memchr(entry.name,0,sizeof(entry.name)) && entry.name[0];
+    if(!valid) break;
+    const size_t length=strlen(entry.prefix);
+    valid=(length==4 || length==6) && entry.expiresUtc>saved->savedUtc &&
+      entry.expiresUtc-saved->savedUtc<=PositiveCacheSeconds;
+    for(size_t k=0;valid && k<length;++k)
+      valid=(entry.prefix[k]>='0' && entry.prefix[k]<='9') || (entry.prefix[k]>='a' && entry.prefix[k]<='f');
+    for(size_t k=0;valid && entry.name[k];++k) valid=(uint8_t)entry.name[k]>=32 && entry.name[k]!=127;
+    for(size_t k=0;valid && k<i;++k) valid=strcmp(entry.prefix,saved->entries[k].prefix)!=0;
+  }
+  if(!valid) { cacheSaveError="cache snapshot invalid"; return true; }
+  cacheDailyDay=saved->savedDay;cacheLastSaveUtc=saved->savedUtc;
+  for(size_t i=0;i<saved->count;++i) {
+    const auto& entry=saved->entries[i];
+    if(entry.expiresUtc<=utc) continue;
+    bool present=false;
+    for(size_t j=0;j<CacheCapacity;++j)
+      if(!strcmp(cache[j].prefix,entry.prefix) && future(cache[j].expires)) { present=true;break; }
+    if(present) continue; // Preserve any fresher in-memory lookup result.
+    auto& item=cache[nextCache++%CacheCapacity];
+    memcpy(item.prefix,entry.prefix,sizeof(item.prefix));memcpy(item.name,entry.name,sizeof(item.name));
+    item.ambiguous=false;item.expiresUtc=entry.expiresUtc;
+    item.expires=millis()+(entry.expiresUtc-utc)*1000UL;
+  }
+  cacheSaveError="";return true;
+}
+bool writeNameCache(uint32_t utc,uint32_t dailyDay) {
+  std::unique_ptr<char[],FreeBulk> memory(static_cast<char*>(allocateBulk(sizeof(SavedCache))));
+  if(!memory) { cacheSaveError="snapshot allocation failed"; return false; }
+  auto* saved=new(memory.get()) SavedCache;
+  memset(saved,0,sizeof(*saved));saved->version=1;saved->savedUtc=utc;saved->savedDay=dailyDay;
+  for(size_t i=0;i<CacheCapacity;++i) {
+    const auto& item=cache[i];
+    if(!item.name[0] || item.ambiguous || !future(item.expires) || item.expiresUtc<=utc ||
+       item.expiresUtc-utc>PositiveCacheSeconds) continue;
+    // A route may contain the same prefix more than once. Persist one copy,
+    // retaining the freshest expiry rather than rejecting it after restart.
+    size_t slot=0;
+    while(slot<saved->count && strcmp(saved->entries[slot].prefix,item.prefix)) ++slot;
+    if(slot<saved->count && saved->entries[slot].expiresUtc>=item.expiresUtc) continue;
+    if(slot==saved->count) ++saved->count;
+    auto& entry=saved->entries[slot];
+    memcpy(entry.prefix,item.prefix,sizeof(entry.prefix));memcpy(entry.name,item.name,sizeof(entry.name));
+    entry.expiresUtc=item.expiresUtc;
+  }
+  if(!cacheSnapshots.save(saved,sizeof(*saved))) { cacheSaveError=cacheSnapshots.lastError(); return false; }
+  cacheDailyDay=dailyDay;cacheLastSaveUtc=utc;cacheSaveError="";return true;
+}
+}
+void pollNameCache(uint32_t utc,uint32_t day,bool saveDaily) {
+  if(utc<1700000000UL || busy) return; // Caller supplies UTC only after NTP confirmation.
+  if(!cacheRestored) {
+    if(cacheRestoreRetry && future(cacheRestoreRetry)) return;
+    cacheRestoreRetry=millis()+60000;
+    if(!restoreNameCache(utc)) return;
+  }
+  if(!saveDaily || !day || day<=cacheDailyDay ||
+     (cacheSaveAttempted && uint32_t(millis()-cacheLastAttempt)<3600000UL)) return;
+  cacheSaveAttempted=true;cacheLastAttempt=millis();
+  if(writeNameCache(utc,day)) cacheSaveAttempted=false;
+}
+bool saveNameCacheNow(uint32_t utc) {
+  if(utc<1700000000UL) { cacheSaveError="NTP not confirmed"; return false; }
+  if(busy) { cacheSaveError="lookup busy; retry"; return false; }
+  return restoreNameCache(utc) && writeNameCache(utc,cacheDailyDay);
+}
+const char* nameCacheSaveError() { return cacheSaveError; }
+uint32_t nameCacheLastSavedUtc() { return cacheLastSaveUtc; }
+bool begin() {
+  if(workerTask) return true;
+  if(!installTlsAllocator()) { report("Cannot initialize TLS allocator",0,true); return false; }
+  if(!requests) requests=xQueueCreateStatic(1,sizeof(BotPath::Route*),requestsStorage,&requestsControl);
+  if(!completed) completed=xQueueCreateStatic(1,sizeof(BotPath::Route*),completedStorage,&completedControl);
+  if(!requests || !completed) { report("Cannot initialize lookup queues",0,true); return false; }
+  // ESP-IDF's task API specifies stack depth in bytes, unlike vanilla FreeRTOS.
+  // A TLS key-exchange step can spend seconds in crypto without blocking.
+  // Keep it off the Wi-Fi core (whose idle task is watchdog-monitored).
+  // Use normal priority: idle priority can starve behind loopTask long enough
+  // for the peer to close the TLS handshake. Equal priority shares CPU time
+  // with loopTask through the pinned SDK's preemptive scheduler.
+  workerTask=xTaskCreateStaticPinnedToCore(worker,"pathLookup",WorkerStackBytes,nullptr,
+    tskIDLE_PRIORITY+1,workerStack,&workerControl,ARDUINO_RUNNING_CORE);
+  if(!workerTask) { report("Cannot initialize lookup task",0,true); return false; }
+  return true;
 }
 void setInternetAvailable(bool available) {
   portENTER_CRITICAL(&statusMux);
@@ -265,7 +444,7 @@ Status status() {
   return result;
 }
 void recordEvent(const char* requester, const char* outcome, const char* channel) {
-  const uint32_t utc=(uint32_t)time(nullptr), heap=ESP.getFreeHeap(), block=ESP.getMaxAllocHeap();
+  const uint32_t utc=(uint32_t)time(nullptr), heap=internalFree(), block=internalBlock();
   portENTER_CRITICAL(&statusMux);
   // An active entry can age out after 30 newer events; never update its reused slot.
   if(historyActive==(int)historyNext)historyActive=-1;
@@ -283,29 +462,65 @@ bool history(size_t index, HistoryEntry& entry) {
   portEXIT_CRITICAL(&statusMux);return found;
 }
 bool start(const BotPath::Route& route, const char* requester, const char* channel) {
-  if(busy || BotInternetProbe::busy()) return false;
+  if(busy || historyStoragePending || BotInternetProbe::busy()) return false;
   if(!route.count) return false;
   beginHistory(requester,channel);
   if(route.width!=2 && route.width!=3) { report("Unsupported hash width",route.width); finishHistory(); return false; }
+  if(size_t(route.count)*route.width>BOT_MAX_PATH_BYTES) { report("Invalid route length",route.count); finishHistory(); return false; }
   bool missing=false;
-  for(size_t i=0;i<lookupHopCount(route);++i) if(!route.names[i][0] && !route.ambiguous[i]) missing=true;
+  for(size_t i=0;i<route.count;++i) if(!route.names[i][0] && !route.ambiguous[i]) missing=true;
   if(!missing) { report("Using local contacts"); finishHistory(); return false; }
-  if(!completed) completed=xQueueCreate(1,sizeof(BotPath::Route*));
-  if(!completed) { report("Cannot allocate lookup queue",0,true); finishHistory(); return false; }
+  if(!ensureCache()) { report("Cannot allocate name cache",0,true); finishHistory(); return false; }
+  if(!begin()) { finishHistory(); return false; }
   auto* copy=new(std::nothrow) BotPath::Route(route);
   if(!copy) { report("Cannot allocate lookup request",0,true); finishHistory(); return false; }
   report("Starting lookup");
   busy=true;
-  if(xTaskCreate(worker,"pathLookup",12288,copy,1,nullptr)!=pdPASS) {
-    report("Cannot allocate lookup task",0,true); busy=false; delete copy; finishHistory(); return false;
+  if(xQueueSend(requests,&copy,0)!=pdTRUE) {
+    report("Lookup request queue full",0,true); busy=false; delete copy; finishHistory(); return false;
   }
   return true;
 }
 bool inProgress() { return busy; }
+void setStoragePending(bool pending) { historyStoragePending=pending; }
+bool storagePending() { return historyStoragePending; }
+bool cachedName(const char* prefix,char* name,size_t capacity,bool& ambiguous) {
+  if(!name || !capacity)return false;
+  name[0]=0;ambiguous=false;
+  if(busy || !prefix || !cache)return false;
+  for(size_t j=0;j<CacheCapacity;++j) {
+    const auto& item=cache[j];
+    if(!strcmp(item.prefix,prefix) && future(item.expires)) {
+      snprintf(name,capacity,"%s",item.name);ambiguous=item.ambiguous;return true;
+    }
+  }
+  return false;
+}
+size_t cachedNameCount() {
+  if(busy || !cache) return 0;
+  size_t count=0;
+  for(size_t i=0;i<CacheCapacity;++i) {
+    const auto& item=cache[i];
+    if(!item.name[0] || item.ambiguous || !future(item.expires)) continue;
+    bool duplicate=false;
+    for(size_t j=0;j<i;++j) {
+      const auto& previous=cache[j];
+      if(previous.name[0] && !previous.ambiguous && future(previous.expires) &&
+         !strcmp(previous.prefix,item.prefix)) {duplicate=true;break;}
+    }
+    if(!duplicate) ++count;
+  }
+  return count;
+}
 bool take(BotPath::Route& route) {
   BotPath::Route* result=nullptr;
   if(!busy || xQueueReceive(completed,&result,0)!=pdTRUE) return false;
   route=*result; delete result; busy=false; return true;
+}
+bool discard() {
+  BotPath::Route* result=nullptr;
+  if(!busy || xQueueReceive(completed,&result,0)!=pdTRUE)return false;
+  delete result;busy=false;return true;
 }
 }
 #endif

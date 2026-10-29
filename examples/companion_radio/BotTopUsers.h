@@ -46,7 +46,7 @@ public:
     }return n;
   }
   void snapshot(uint32_t now,BotVoltageList::Snapshot& out){
-    out.count=0;strcpy(out.lines[out.count++],"Top 5 users in the last 24h");
+    out.count=0;
     const User* users[5]{};uint32_t counts[5]{};const size_t n=top(now,users,counts);
     for(size_t i=0;i<n;++i){
       char name[BOT_MAX_SENDER_NAME_LEN+1];memcpy(name,users[i]->name,sizeof(name));

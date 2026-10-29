@@ -4,16 +4,17 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include "BotLookupMemory.h"
 namespace BotPathLookup {
 // HTTP bodies may be close-delimited or chunked, with no Content-Length.
 // Independently cap decoded bytes, and reject failed/truncated transfers.
 class Body {
   static constexpr size_t LIMIT=32768;
-  std::unique_ptr<char[]> buffer;
+  std::unique_ptr<char[],FreeBulk> buffer;
   size_t used=0;
   bool failed=false;
 public:
-  Body() : buffer(new(std::nothrow) char[LIMIT+1]) { if(buffer) buffer[0]=0; }
+  Body() : buffer(static_cast<char*>(allocateBulk(LIMIT+1))) { if(buffer) buffer[0]=0; }
   static bool accepts(int status, int length) {
     return status==200 && (length==-1 || (length>0 && length<=(int)LIMIT));
   }

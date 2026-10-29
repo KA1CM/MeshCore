@@ -14,7 +14,9 @@
 #if CMESH_BOT_ENABLED
 #include "BotCommandRegistry.h"
 #include "BotAdminHelp.h"
+#include "BotFairfieldHelp.h"
 #include "BotCommands.h"
+#include "BotScopedHashList.h"
 #include "BotPathLookup.h"
 #include "BotPolicy.h"
 #include "BotPrefs.h"
@@ -571,6 +573,10 @@ uint8_t MyMesh::getExtraAckTransmitCount() const {
   return _prefs.multi_acks;
 }
 
+#if CMESH_BOT_ENABLED
+static bool botPacketUsesFairfieldScope(const mesh::Packet* packet);
+#endif
+
 void MyMesh::logRx(mesh::Packet* packet, int len, float score) {
   (void)len;
   (void)score;
@@ -581,6 +587,15 @@ void MyMesh::logRx(mesh::Packet* packet, int len, float score) {
       !mesh::Packet::isValidPathLen((uint8_t)packet->path_len) ||
       packet->getPathHashCount() == 0) return;
   const uint8_t hash_size = packet->getPathHashSize();
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+  // Collect the full incoming route, including hashes absent from contacts.
+  if((hash_size==2 || hash_size==3) && repeaterMonitor && repeaterMonitor->clockReady() &&
+      botPacketUsesFairfieldScope(packet)) {
+    const uint32_t utc=getRTCClock()->getCurrentTime();
+    if(utc>=MonitorCore::VALID_TIME)
+      bot_scoped_repeaters.observe(packet->path,packet->getPathHashCount(),hash_size,MonitorCore::easternDay(utc));
+  }
+#endif
   const uint8_t* last_hash = packet->path + (packet->getPathHashCount() - 1) * hash_size;
   ContactsIterator iter;
   ContactInfo candidate;
@@ -1130,12 +1145,22 @@ void MyMesh::observeBotDirectMessage(const ContactInfo &from, uint32_t sender_ti
   recordBotObservation(message, &from, 0xFF);
 }
 
+static bool botPacketUsesFairfieldScope(const mesh::Packet* packet) {
+  if(!packet || !packet->hasTransportCodes())return false;
+  TransportKeyStore store;TransportKey scope;
+  store.getAutoKeyFor(0,"#ct-ffc",scope);
+  // Code 0 is the sending scope. Code 1 is only the suggested return region.
+  return packet->transport_codes[0]==scope.calcTransportCode(packet);
+}
+
 void MyMesh::observeBotChannelMessage(uint8_t channel_idx, const char *channel_name, const char *text,
                                       uint32_t sender_timestamp, const mesh::Packet *packet) {
   BotMessage message;
   memset(&message, 0, sizeof(message));
   size_t channel_len = botBoundedStrLen(channel_name, BOT_MAX_CHANNEL_NAME_LEN);
   message.channel_kind = BotPolicy::classifyChannel(channel_name, channel_len, false, bot_prefs);
+  if(message.channel_kind==BOT_CHANNEL_FAIRFIELD)
+    message.fairfield_scope_valid=botPacketUsesFairfieldScope(packet);
   if (channel_name && channel_len > 0) {
     memcpy(message.channel_name, channel_name, channel_len);
     message.channel_name[channel_len] = 0;
@@ -1241,6 +1266,22 @@ BotCommandResult MyMesh::executeBotHelloCommand(const BotMessage &message, char 
     }
   }
 
+  if(message.channel_kind==BOT_CHANNEL_FAIRFIELD) {
+    static const char welcome[]="\nWelcome to #fairfield-county. We are testing scoped messages to reduce the burden of the mesh.\nmore info on http://tiny.cc/ct-ffc";
+    static const char explanation[]="\nWe are testing scoped messages to reduce the burden of the mesh.\nmore info on http://tiny.cc/ct-ffc";
+    static const char compact[]="\nScoped messages reduce mesh traffic.\nmore info on http://tiny.cc/ct-ffc";
+    const size_t capacity=FirmwareBot::maxResponseLenForChannel(message.channel_kind)+1;
+    if(output_len>capacity)output_len=capacity;
+    const size_t prefix_length=strlen(greeting)+(target ? strlen(target)+4 : 0); // space, @[, ]
+    const char* suffix=welcome;
+    if(prefix_length+strlen(suffix)>=output_len)suffix=explanation;
+    if(prefix_length+strlen(suffix)>=output_len)suffix=compact;
+    if(target) {
+      return botWriteFormatted(output,output_len,"%s @[%s]%s",greeting,target,suffix);
+    }
+    return botWriteFormatted(output,output_len,"%s%s",greeting,suffix);
+  }
+
   if (target) {
     return botWriteFormatted(output, output_len, "%s @[%s]", greeting, target);
   }
@@ -1303,7 +1344,7 @@ BotCommandResult MyMesh::executeBotIdCommand(const BotMessage &message, char *ou
 }
 
 bool MyMesh::getBotNeighbor(size_t index, BotNeighbor& neighbor, uint32_t& ageSeconds) const {
-  if (index >= BOT_NEIGHBOR_SLOTS || !bot_neighbors[index].active) return false;
+  if (index >= BOT_NEIGHBOR_SLOTS || !bot_neighbors[index].heardWithin24Hours(_ms->getMillis())) return false;
   neighbor = bot_neighbors[index];
   ageSeconds = (uint32_t)(_ms->getMillis() - neighbor.last_heard_millis) / 1000;
   return true;
@@ -1316,6 +1357,7 @@ void MyMesh::recordBotNeighbor(const uint8_t *pub_key, int16_t rssi_dbm, int8_t 
   uint32_t oldest_millis = 0;
   bool found_oldest = false;
   for (size_t i = 0; i < BOT_NEIGHBOR_SLOTS; i++) {
+    if(!bot_neighbors[i].heardWithin24Hours(_ms->getMillis()))bot_neighbors[i]=BotNeighbor{};
     if (bot_neighbors[i].active &&
         memcmp(bot_neighbors[i].pub_key_prefix, pub_key, BOT_SENDER_KEY_PREFIX_LEN) == 0) {
       slot = i;
@@ -1352,7 +1394,7 @@ BotCommandResult MyMesh::executeBotNeighborsCommand(const BotMessage &message, c
   uint8_t idx[BOT_NEIGHBOR_SLOTS];
   uint8_t count = 0;
   for (size_t i = 0; i < BOT_NEIGHBOR_SLOTS; i++) {
-    if (!bot_neighbors[i].active) continue;
+    if (!bot_neighbors[i].heardWithin24Hours(_ms->getMillis())) continue;
     idx[count++] = (uint8_t)i;
   }
   for (uint8_t a = 0; a + 1 < count; a++) {
@@ -1456,7 +1498,7 @@ bool MyMesh::handleBotAdminCommand(const BotMessage &message, const ContactInfo 
   const bool adminHelp = adminHelpReply &&
       message.channel_kind == BOT_CHANNEL_DM && direct_recipient && repeaterMonitor &&
       repeaterMonitor->botAdmins().allows(direct_recipient->id.pub_key, BotAdminContacts::Commands);
-  if (command.id != BOT_COMMAND_ADVERT && command.id != BOT_COMMAND_CHECK && command.id != BOT_COMMAND_SYNC && command.id != BOT_COMMAND_ADD && command.id != BOT_COMMAND_REMOVE && command.id != BOT_COMMAND_ENABLE && command.id != BOT_COMMAND_DISABLE && command.id != BOT_COMMAND_NOTES && command.id != BOT_COMMAND_PASSWORD && !adminHelp) return false;
+  if (command.id != BOT_COMMAND_ADVERT && command.id != BOT_COMMAND_CHECK && command.id != BOT_COMMAND_SYNC && command.id != BOT_COMMAND_ADD && command.id != BOT_COMMAND_REMOVE && command.id != BOT_COMMAND_ENABLE && command.id != BOT_COMMAND_DISABLE && command.id != BOT_COMMAND_NOTES && command.id != BOT_COMMAND_PASSWORD && command.id != BOT_COMMAND_SAVE && !adminHelp) return false;
   // Use the authenticated DM contact's full key, never a channel name or key prefix.
   if (message.channel_kind != BOT_CHANNEL_DM || !direct_recipient || !repeaterMonitor ||
       !repeaterMonitor->botAdmins().allows(direct_recipient->id.pub_key, BotAdminContacts::Commands) ||
@@ -1467,8 +1509,11 @@ bool MyMesh::handleBotAdminCommand(const BotMessage &message, const ContactInfo 
     return true;
   }
   const char *response = nullptr;
+  char save_response[BOT_MAX_RESPONSE_LEN+1]{};
   if (adminHelp) {
     response=adminHelpReply;
+  } else if (command.id == BOT_COMMAND_SAVE) {
+    response=command.args_len ? "Usage: save" : nullptr;
   } else if (command.id == BOT_COMMAND_PASSWORD) {
     response=repeaterMonitor->adminPassword(direct_recipient->id.pub_key,command.args);
   } else if (command.id == BOT_COMMAND_NOTES) {
@@ -1491,7 +1536,8 @@ bool MyMesh::handleBotAdminCommand(const BotMessage &message, const ContactInfo 
     // Round 1923 seconds up to 33 minutes; successful checks usually finish sooner.
     if (!response) response = "Checking... I will send the result when finished";
   } else if (command.args_len) {
-    response = "Usage: advert";
+    response = repeaterMonitor->startAdminAdvert(direct_recipient->id.pub_key,command.args);
+    if(!response)response="Requesting repeater flood advert...";
   } else {
     memcpy(pending_admin_advert.key, direct_recipient->id.pub_key, PUB_KEY_SIZE);
     pending_admin_advert.result = 0;
@@ -1505,13 +1551,28 @@ bool MyMesh::handleBotAdminCommand(const BotMessage &message, const ContactInfo 
   }
   // Authorized admin help belongs to the combined admin stats category.
   bot_stats.eligible_messages++; recordBotCommandStats(adminHelp ? BOT_COMMAND_NOTES : command.id);bot_top_users.accepted(message,_ms->getMillis());
+  if(command.id==BOT_COMMAND_SAVE && !command.args_len) {
+    const uint32_t utc=getRTCClock()->getCurrentTime();
+    const uint32_t day=repeaterMonitor->clockReady() && utc>=MonitorCore::VALID_TIME ? MonitorCore::easternDay(utc) : 0;
+    const bool activity_saved=bot_stats_history.saveNow(_ms->getMillis(),day);
+    const bool scoped_saved=bot_scoped_repeaters.saveNow(day);
+    const bool names_saved=BotPathLookup::saveNameCacheNow(day ? utc : 0);
+    const bool names_pending=!names_saved && BotPathLookup::inProgress() && day &&
+      deferNameCacheSave(direct_recipient->id.pub_key);
+    snprintf(save_response,sizeof(save_response),"Command activity %s%s\nct-ffc list %s%s\nName cache %s%s",
+      activity_saved ? "saved" : "save failed: ",activity_saved ? "" : bot_stats_history.lastError(),
+      scoped_saved ? "saved" : "save failed: ",scoped_saved ? "" : bot_scoped_repeaters.lastError(),
+      names_saved ? "saved" : names_pending ? "pending; will notify when saved" : "save failed: ",
+      names_saved || names_pending ? "" : BotPathLookup::nameCacheSaveError());
+    response=save_response;
+  }
   FirmwareBot::recordCommandCooldown(bot_command_cooldowns, BOT_COMMAND_COOLDOWN_SLOTS,
                                     command.id, _ms->getMillis(), BOT_COMMAND_COOLDOWN_MILLIS);
   if (response && !sendBotResponse(message, direct_recipient, 0xFF, response, strlen(response))) {
     bot_stats.send_failures++;
   }
 #else
-  if (command.id != BOT_COMMAND_ADVERT && command.id != BOT_COMMAND_CHECK && command.id != BOT_COMMAND_SYNC && command.id != BOT_COMMAND_ADD && command.id != BOT_COMMAND_REMOVE && command.id != BOT_COMMAND_ENABLE && command.id != BOT_COMMAND_DISABLE && command.id != BOT_COMMAND_NOTES && command.id != BOT_COMMAND_PASSWORD) return false;
+  if (command.id != BOT_COMMAND_ADVERT && command.id != BOT_COMMAND_CHECK && command.id != BOT_COMMAND_SYNC && command.id != BOT_COMMAND_ADD && command.id != BOT_COMMAND_REMOVE && command.id != BOT_COMMAND_ENABLE && command.id != BOT_COMMAND_DISABLE && command.id != BOT_COMMAND_NOTES && command.id != BOT_COMMAND_PASSWORD && command.id != BOT_COMMAND_SAVE) return false;
   (void)message;
   (void)direct_recipient;
   bot_stats.ignored_messages++;
@@ -1537,6 +1598,17 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
     return;
   }
 
+  // A phone-set RTC value is not confirmation of NTP synchronization.
+  if(!botNtpReady()) {++bot_stats.ignored_messages;return;}
+  if(message.channel_kind==BOT_CHANNEL_FAIRFIELD && !message.fairfield_scope_valid) {
+    if(fairfield_scope_notices.accept(message.sender_name,_ms->getMillis())) {
+      char notice[BOT_MAX_RESPONSE_LEN+1];
+      const auto result=executeBotHelloCommand(message,notice,sizeof(notice));
+      if(result.text_len && sendBotGroupMessage(channel_idx,notice,result.text_len,true))++bot_stats.sent_messages;
+      else ++bot_stats.send_failures;
+    }
+    ++bot_stats.ignored_messages;return;
+  }
   BotCommand command;
   if (!FirmwareBot::parseCommand(message.text, message.text_len, &command,
                                  BotPolicy::isPrefixlessCommandAllowed(message.channel_kind))) {
@@ -1571,6 +1643,7 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
     return;
   }
   const bool neighborsAll = command.id == BOT_COMMAND_NEIGHBORS && command.args_len == 3 && !strcasecmp(command.args, "all");
+  const bool scopedList=command.id==BOT_COMMAND_LIST && message.channel_kind==BOT_CHANNEL_FAIRFIELD;
   const bool listLow = command.args_len == 3 &&
     (command.args[0]=='l' || command.args[0]=='L') &&
     (command.args[1]=='o' || command.args[1]=='O') &&
@@ -1580,11 +1653,41 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
     bot_stats.ignored_messages++; return;
   }
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
-  if (((command.id == BOT_COMMAND_LIST && (!command.args_len || listLow) && repeaterMonitor) || neighborsAll) &&
+  if (((command.id == BOT_COMMAND_LIST && (scopedList || !command.args_len || listLow) && repeaterMonitor) || neighborsAll) &&
       !pending_voltage_list.active && !pending_bot_dm_ack.active) {
+    pending_voltage_list.scopedNames.reset();
     if (neighborsAll) {
       char unused[1];
       executeBotNeighborsCommand(message, unused, sizeof(unused), &pending_voltage_list.snapshot);
+    } else if(scopedList) {
+      bot_scoped_repeaters.begin();
+      const uint32_t day=MonitorCore::easternDay(getRTCClock()->getCurrentTime());
+      if(command.args_len) {
+        // cachedName is deliberately unavailable while the TLS worker owns it.
+        // Avoid returning a misleading partial list during that interval.
+        if(BotPathLookup::inProgress()) {
+          strcpy(pending_voltage_list.snapshot.lines[0],"Name lookup busy; please retry shortly.");
+        } else if(auto names=BotScopedNameList::allocate()) {
+          const auto& saved=bot_scoped_repeaters.entries();
+          for(size_t i=0;i<saved.count && i<BotScopedRepeaters::Capacity;++i) {
+            const auto& entry=saved.entries[i];
+            if(!day || !entry.lastDay || entry.lastDay>day || day-entry.lastDay>=30)continue;
+            char name[97]{};bool ambiguous=false;
+            localScopedRepeaterName(entry.hash,name,sizeof(name),ambiguous);
+            if(!name[0] && !ambiguous) {
+              char hash[5];snprintf(hash,sizeof(hash),"%02x%02x",entry.hash[0],entry.hash[1]);
+              BotPathLookup::cachedName(hash,name,sizeof(name),ambiguous);
+            }
+            if(!ambiguous && BotScopedNameList::matches(name,command.args))
+              StrHelper::strzcpy(names->lines[names->count++],name,sizeof(names->lines[0]));
+          }
+          if(!names->count)strcpy(names->lines[names->count++],"No matching known ct-ffc repeater names.");
+          pending_voltage_list.scopedNames=std::move(names);
+        } else {
+          strcpy(pending_voltage_list.snapshot.lines[0],"Not enough memory; please retry shortly.");
+        }
+        pending_voltage_list.snapshot.count=1;
+      } else BotScopedHashList::build(bot_scoped_repeaters.entries(),day,pending_voltage_list.snapshot);
     } else repeaterMonitor->voltageList(pending_voltage_list.snapshot,listLow);
     if (pending_voltage_list.snapshot.count) {
       auto& q=pending_voltage_list;
@@ -1592,6 +1695,9 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
       q.kind=message.channel_kind; q.channel=channel_idx; q.next=0; q.part=1; q.failures=0;
       if (direct_recipient) memcpy(q.key,direct_recipient->id.pub_key,PUB_KEY_SIZE);
       q.deadline=_ms->getMillis(); q.expires=q.deadline+600000; q.active=true;
+      // Even a worst-case search (one long name per part) must have time to
+      // finish at the existing five-second pace before the queue expires.
+      if(q.scopedNames)q.expires+=uint32_t(q.scopedNames->count)*5000UL;
       bot_stats.eligible_messages++; recordBotCommandStats(command.id);bot_top_users.accepted(message,_ms->getMillis());
       FirmwareBot::recordCommandCooldown(bot_command_cooldowns,BOT_COMMAND_COOLDOWN_SLOTS,
         command.id,_ms->getMillis(),BOT_COMMAND_COOLDOWN_MILLIS);
@@ -1602,6 +1708,11 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
   char response[BOT_MAX_RESPONSE_LEN + 1];
   BotCommandResult result;
   bool result_ready = false;
+  if(message.channel_kind==BOT_CHANNEL_FAIRFIELD) {
+    if(const char* help=BotFairfieldHelp::reply(command)) {
+      result=botWriteText(response,sizeof(response),help);result_ready=true;
+    }
+  }
   if(command.id==BOT_COMMAND_USER){result=botWriteText(response,sizeof(response),"Usage: users");result_ready=true;}
   BotCommandContext context;
   buildBotCommandContext(context, command.id);
@@ -1621,8 +1732,18 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
     context.path = message.path;
   }
   if (command.id == BOT_COMMAND_PATH) {
+    const bool pathAll=command.args_len==3 && !strcasecmp(command.args,"all");
+    if(pathAll)context.path_hash_size=message.path_hash_size;
     BotPath::Route route;
     if (BotCommands::pathRoute(command,context,route)) {
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+      // Only one multipart route at a time, even after the acceptance cooldown.
+      if(route.all) for(size_t i=0;i<bot_path_count;++i) {
+        if(pending_bot_paths[(bot_path_head+i)%4].route.all) {
+          ++bot_stats.ignored_messages;return;
+        }
+      }
+#endif
       resolveLocalPathNames(route);
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
       if (bot_path_count < 4) {
@@ -1631,6 +1752,7 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
         // adds several KB to the already deep radio receive stack.
         q.ready=false;q.started=false;q.lookupRunning=false;q.sent=false;
         q.lookupDeadline=0;
+        q.nextHop=0;q.nextPart=0;q.failures=0;
         memset(q.key,0,sizeof(q.key));
         q.active=true;q.route=route;q.message=message;
         q.message.path=nullptr;
@@ -1643,10 +1765,21 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
         return;
       }
       BotPathLookup::recordEvent(message.sender_name,"Queue full: local-only fallback",message.channel_kind==BOT_CHANNEL_DM ? "DM" : message.channel_name);
+      if(route.all) {++bot_stats.ignored_messages;return;}
       // Queue is bounded; still reply with the locally known path when full.
 #endif
+      if(route.all) {
+        result=botWriteText(response,sizeof(response),"Path all requires the path lookup queue.");
+        result_ready=true;
+      } else {
       const size_t budget=FirmwareBot::maxResponseLenForChannel(message.channel_kind);
       result=BotPath::format(route,context.response_target,response,budget+1);
+      result_ready=true;
+      }
+    } else {
+      // Do not fall through to executePath: it allocates another Route and
+      // retries parsing on this already deep radio receive stack.
+      result=botWriteText(response,sizeof(response),command.args_len ? "Usage: path [path]" : "Path unavailable");
       result_ready=true;
     }
   }
@@ -1682,6 +1815,22 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
   }
   if (!result_ready) {
     switch (command.id) {
+      case BOT_COMMAND_PING: {
+        if(message.channel_kind==BOT_CHANNEL_FAIRFIELD) {
+          size_t repeater_count=0;
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+          bot_scoped_repeaters.begin();
+          const uint32_t utc=getRTCClock()->getCurrentTime();
+          const uint32_t today=MonitorCore::easternDay(utc);
+          const auto& list=bot_scoped_repeaters.entries();
+          for(size_t i=0;i<list.count;++i)
+            if(list.entries[i].lastDay<=today && today-list.entries[i].lastDay<30)++repeater_count;
+#endif
+          result=botWriteFormatted(response,sizeof(response),
+            "Pong!\nThere are %u confirmed repeaters forwarding ct-ffc scoped messages.",(unsigned)repeater_count);
+        } else result=BotCommands::executeCommand(command,context,response,sizeof(response));
+        break;
+      }
       case BOT_COMMAND_HELLO:
         result = executeBotHelloCommand(message, response, sizeof(response));
         break;
@@ -1695,7 +1844,8 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
         result = executeBotIdCommand(message, response, sizeof(response));
         break;
       case BOT_COMMAND_LIST:
-        result = botWriteText(response,sizeof(response),command.args_len && !listLow ? "Usage: list [low]" :
+        result = botWriteText(response,sizeof(response),scopedList ?
+          (command.args_len ? "Usage: list" : "Bot busy; try list again shortly") : command.args_len && !listLow ? "Usage: list [low]" :
           pending_voltage_list.active || pending_bot_dm_ack.active ? "Bot busy; try list again shortly" : listLow ? BotVoltageList::EMPTY_LOW : "No repeater readings available");
         break;
       case BOT_COMMAND_NEIGHBORS:
@@ -1731,11 +1881,19 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
   }
 }
 
-bool MyMesh::sendBotGroupMessage(uint8_t channel_idx, const char *text, size_t text_len) {
+bool MyMesh::sendBotGroupMessage(uint8_t channel_idx, const char *text, size_t text_len, bool unscoped) {
   ChannelDetails channel;
   if (!getChannel(channel_idx, channel)) return false;
 
   uint32_t timestamp = getRTCClock()->getCurrentTimeUnique();
+
+  if(unscoped) {
+    const bool saved_unscoped=send_unscoped;
+    send_unscoped=true;
+    const bool success=sendGroupMessage(timestamp,channel.channel,_prefs.node_name,text,text_len,300);
+    send_unscoped=saved_unscoped;
+    return success;
+  }
 
   size_t channel_name_len =
       botBoundedStrLen(channel.name, BOT_MAX_CHANNEL_NAME_LEN);
@@ -1745,15 +1903,18 @@ bool MyMesh::sendBotGroupMessage(uint8_t channel_idx, const char *text, size_t t
   if (channel_kind == BOT_CHANNEL_FAIRFIELD) {
     // #fairfield-county bot responses travel inside the #ct-ffc scope.
     TransportKey saved_scope = send_scope;
+    const bool saved_unscoped=send_unscoped;
 
     TransportKeyStore temp;
     TransportKey ct_ffc_scope;
     temp.getAutoKeyFor(0, "#ct-ffc", ct_ffc_scope);
 
     send_scope = ct_ffc_scope;
+    send_unscoped=false;
     bool success = sendGroupMessage(timestamp, channel.channel,
                                     _prefs.node_name, text, text_len, 300);
     send_scope = saved_scope;
+    send_unscoped=saved_unscoped;
     return success;
   }
 
@@ -1836,6 +1997,7 @@ void MyMesh::sendQueuedEmergencyForwards() {
 }
 
 bool MyMesh::sendBotSelfAdvert(bool flood, bool trackAdmin) {
+  if(!botNtpReady())return false;
   mesh::Packet* pkt;
   if (_prefs.advert_loc_policy == ADVERT_LOC_NONE) {
     pkt = createSelfAdvert(_prefs.node_name);
@@ -1872,6 +2034,7 @@ void MyMesh::logTx(mesh::Packet* packet, int len) {
   if (packet->getPayloadType() == PAYLOAD_TYPE_ADVERT && packet->payload_len >= PUB_KEY_SIZE &&
       !memcmp(packet->payload, self_id.pub_key, PUB_KEY_SIZE)) {
     last_bot_advert_time = getRTCClock()->getCurrentTime();
+    first_bot_advert_sent = true;
   }
   completeAdminAdvert(packet, true); // Dispatcher calls this after isSendComplete().
 }
@@ -1905,6 +2068,11 @@ void MyMesh::pollAdminAdvert() {
 
 void MyMesh::resolveLocalPathNames(BotPath::Route& route) {
   for(size_t hop=0;hop<route.count;++hop) {
+    if(const char* name=BotPath::fixedName(route.bytes+hop*route.width,route.width)) {
+      StrHelper::strzcpy(route.names[hop],name,sizeof(route.names[hop]));
+      route.ambiguous[hop]=false;
+      continue;
+    }
     ContactsIterator iter; ContactInfo contact; unsigned matches=0;
     char local[33]{};
     while(iter.hasNext(this,contact)) {
@@ -1923,7 +2091,8 @@ void MyMesh::pollBotPath() {
   auto& q=pending_bot_paths[bot_path_head];
   auto finish=[&](){q.active=false;bot_path_head=(bot_path_head+1)%4;--bot_path_count;};
   if(!q.started) {
-    if(BotInternetProbe::busy())return;
+    if(BotPathLookup::storagePending()) return;
+    if(BotInternetProbe::busy() || BotPathLookup::inProgress())return;
     resolveLocalPathNames(q.route);
     q.started=true;q.lookupRunning=BotPathLookup::start(q.route,q.message.sender_name,q.message.channel_kind==BOT_CHANNEL_DM ? "DM" : q.message.channel_name);
     q.ready=!q.lookupRunning;q.lookupDeadline=futureMillis(28000);
@@ -1932,21 +2101,38 @@ void MyMesh::pollBotPath() {
   if(q.sent) {if(!q.lookupRunning)finish();return;}
   if(!q.ready && millisHasNowPassed(q.lookupDeadline))q.ready=true;
   if(!q.ready)return;
+  // Finish resolution before numbering multipart replies; page boundaries
+  // must remain fixed once the first message has been sent.
+  if(q.route.all && q.lookupRunning)return;
   if(!bot_prefs.enabled || !BotPrefsCodec::commandEnabled(bot_prefs,BOT_COMMAND_PATH) || millisHasNowPassed(q.expires)) {
     q.sent=true;if(!q.lookupRunning)finish();return;
   }
   if(q.message.channel_kind==BOT_CHANNEL_DM && (pending_bot_dm_ack.active || pending_voltage_list.active))return;
-  resolveLocalPathNames(q.route); // Adverts received during the lookup take priority.
+  if(q.route.all && q.nextPart && !millisHasNowPassed(q.nextPart))return;
+  if(!q.route.all || !q.nextHop)
+    resolveLocalPathNames(q.route); // Freeze multipart names after the first part.
   char response[BOT_MAX_RESPONSE_LEN+1], formatted[BOT_MAX_RESPONSE_LEN+1];
   const size_t budget=FirmwareBot::maxResponseLenForChannel(q.message.channel_kind);
-  const auto result=BotPath::format(q.route,q.message.sender_name,response,budget+1);
+  size_t next=q.nextHop;
+  const auto result=q.route.all ? BotPath::formatAll(q.route,q.message.sender_name,q.nextHop,next,response,budget+1) :
+    BotPath::format(q.route,q.message.sender_name,response,budget+1);
   size_t written=0;
   auto* recipient=q.message.channel_kind==BOT_CHANNEL_DM ? lookupContactByPubKey(q.key,PUB_KEY_SIZE) : nullptr;
   q.sent=true;
   if(result.code!=BOT_COMMAND_RESULT_OK ||
      !botFormatResponseForChannel(q.message,response,result.text_len,formatted,sizeof(formatted),&written) ||
-     !sendBotResponse(q.message,recipient,q.channel,formatted,written)) ++bot_stats.send_failures;
-  if(!q.lookupRunning)finish();
+     !sendBotResponse(q.message,recipient,q.channel,formatted,written)) {
+    ++bot_stats.send_failures;
+    if(q.route.all && ++q.failures<3)q.sent=false;
+  } else if(q.route.all) {
+    q.failures=0;q.nextHop=next;q.sent=next>=q.route.count;
+  }
+  if(q.route.all) {
+    q.nextPart=futureMillis(5000);
+    FirmwareBot::recordCommandCooldown(bot_command_cooldowns,BOT_COMMAND_COOLDOWN_SLOTS,
+      BOT_COMMAND_PATH,_ms->getMillis(),BOT_COMMAND_COOLDOWN_MILLIS);
+  }
+  if(q.sent && !q.lookupRunning)finish();
 #endif
 }
 
@@ -1959,6 +2145,59 @@ void MyMesh::scheduleBotFloodAdvert(unsigned long interval_millis) {
 }
 
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+bool MyMesh::deferNameCacheSave(const uint8_t* key) {
+  static_assert(sizeof(deferred_name_cache_saves)/sizeof(deferred_name_cache_saves[0])>=BotAdminContacts::Capacity,
+    "Deferred saves must hold every authorized admin");
+  DeferredNameCacheSave* slot=nullptr;
+  for(auto& pending:deferred_name_cache_saves) {
+    if(pending.active && !memcmp(pending.key,key,PUB_KEY_SIZE)) {slot=&pending;break;}
+    if(!pending.active && !slot) slot=&pending;
+  }
+  if(!slot) return false;
+  slot->active=true;slot->ready=false;slot->error=nullptr;
+  memcpy(slot->key,key,PUB_KEY_SIZE);slot->due=_ms->getMillis();slot->expires=slot->due+600000;
+  return true;
+}
+
+void MyMesh::pollDeferredNameCacheSave() {
+  bool waiting=false;
+  for(auto& pending:deferred_name_cache_saves) {
+    if(!pending.active) continue;
+    if(!repeaterMonitor || !repeaterMonitor->botAdmins().allows(pending.key,BotAdminContacts::Commands)) {
+      pending.active=false;continue;
+    }
+    if(millisHasNowPassed(pending.expires)) {
+      if(pending.ready) {pending.active=false;continue;}
+      pending.ready=true;pending.error="deferred save timed out";
+      pending.expires=futureMillis(600000);
+    }
+    if(!pending.ready) waiting=true;
+  }
+  if(!bot_prefs.enabled || !botNtpReady()) return;
+  if(waiting && !BotPathLookup::inProgress()) {
+    // One write fulfills all admins waiting for the same idle cache.
+    const bool saved=BotPathLookup::saveNameCacheNow(getRTCClock()->getCurrentTime());
+    const char* error=saved ? nullptr : BotPathLookup::nameCacheSaveError();
+    for(auto& pending:deferred_name_cache_saves) if(pending.active && !pending.ready) {
+      pending.ready=true;pending.error=error;pending.due=_ms->getMillis();
+      pending.expires=futureMillis(600000);
+    }
+  }
+  if(pending_voltage_list.active || pending_bot_dm_ack.active) return;
+  for(auto& pending:deferred_name_cache_saves) {
+    if(!pending.active || !pending.ready || !millisHasNowPassed(pending.due)) continue;
+    auto* recipient=lookupContactByPubKey(pending.key,PUB_KEY_SIZE);
+    if(!recipient) {pending.active=false;++bot_stats.send_failures;continue;}
+    char text[96];
+    if(pending.error) snprintf(text,sizeof(text),"Name cache save failed: %s",pending.error);
+    else strcpy(text,"Name cache saved");
+    BotMessage message{};message.channel_kind=BOT_CHANNEL_DM;
+    if(sendBotResponse(message,recipient,0xFF,text,strlen(text))) pending.active=false;
+    else {++bot_stats.send_failures;pending.due=futureMillis(5000);}
+    return; // Existing DM ACK/retry slot handles delivery; pace failed enqueues.
+  }
+}
+
 bool MyMesh::sendAdminCheckResult(const uint8_t* key, const char* text) {
   if (!bot_prefs.enabled || pending_voltage_list.active || pending_bot_dm_ack.active) return false;
   if (!repeaterMonitor || !repeaterMonitor->botAdmins().allows(key,BotAdminContacts::Commands)) return true;
@@ -1968,6 +2207,17 @@ bool MyMesh::sendAdminCheckResult(const uint8_t* key, const char* text) {
   const bool sent=sendBotResponse(message,recipient,0xFF,text,strlen(text));
   if(!sent) ++bot_stats.send_failures;
   return true; // Existing DM ACK/retry machinery owns delivery once queued.
+}
+
+bool MyMesh::sendStartupNotification(const uint8_t* key, const char* text) {
+  if (!bot_prefs.enabled || pending_voltage_list.active || pending_bot_dm_ack.active) return false;
+  if (!repeaterMonitor || !repeaterMonitor->botAdmins().allows(key, BotAdminContacts::Notifications)) return true;
+  auto* recipient=lookupContactByPubKey(key,PUB_KEY_SIZE);
+  if (!recipient) return true;
+  BotMessage message{};message.channel_kind=BOT_CHANNEL_DM;
+  const bool sent=sendBotResponse(message,recipient,0xFF,text,strlen(text));
+  if (!sent) ++bot_stats.send_failures;
+  return sent; // The shared DM slot owns ACK/retry after successful enqueue.
 }
 
 bool MyMesh::queueStatusNotification(const uint8_t* key, const BotVoltageList::Snapshot& snapshot) {
@@ -1988,9 +2238,9 @@ bool MyMesh::queueSunriseNotification(const uint8_t* key, const BotVoltageList::
 
 void MyMesh::sendNextVoltageListPart() {
   auto& q=pending_voltage_list;
-  if (!q.active) return;
+  if (!q.active) {q.scopedNames.reset();return;}
   if (!bot_prefs.enabled || (!q.notification && !q.adminOnly && !BotPrefsCodec::commandEnabled(bot_prefs,q.command)) || millisHasNowPassed(q.expires)) {
-    q.active=false; return;
+    q.active=false;q.scopedNames.reset();return;
   }
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
   if (q.adminOnly && (!repeaterMonitor ||
@@ -2001,28 +2251,41 @@ void MyMesh::sendNextVoltageListPart() {
   if (pending_bot_dm_ack.active || !millisHasNowPassed(q.deadline)) return;
   ContactInfo* recipient=q.kind==BOT_CHANNEL_DM ? lookupContactByPubKey(q.key,PUB_KEY_SIZE) : nullptr;
   if(q.kind==BOT_CHANNEL_DM && !recipient) {q.active=false;bot_stats.send_failures++;return;}
-  char body[121],formatted[BOT_MAX_RESPONSE_LEN+1];size_t next=q.next,written=0;
-  const char* heading = (q.notification && !q.statusNotification) ? "Low Voltage Report:\n" : "";
+  char body[BOT_MAX_RESPONSE_LEN+1],formatted[BOT_MAX_RESPONSE_LEN+1];size_t next=q.next,written=0;
+  const bool scopedList=q.command==BOT_COMMAND_LIST && q.kind==BOT_CHANNEL_FAIRFIELD && !q.notification;
+  if(!scopedList)q.scopedNames.reset();
+  const bool scopedHashes=scopedList && !q.scopedNames;
+  // Users may use the full reply budget; keep other list/report budgets unchanged.
+  const size_t bodyCapacity = q.command == BOT_COMMAND_USER || scopedList ?
+      FirmwareBot::maxResponseLenForChannel(q.kind) + 1 : 121;
+  const char* heading = (q.notification && !q.statusNotification) ? "Morning Reoprt:\n" : "";
   const size_t headingLen = strlen(heading);
   memcpy(body, heading, headingLen);
   if (q.statusNotification && q.notification) {
-    if(!BotVoltageList::singleMessage(q.snapshot,body,sizeof(body))) {q.active=false;return;}
+    if(!BotVoltageList::singleMessage(q.snapshot,body,bodyCapacity)) {q.active=false;return;}
     next=q.snapshot.count;
   } else if (q.command == BOT_COMMAND_STATS || q.command == BOT_COMMAND_USER) {
-    if(!BotVoltageList::singleMessage(q.snapshot,body,sizeof(body))) {q.active=false;return;}
+    if(!BotVoltageList::singleMessage(q.snapshot,body,bodyCapacity)) {q.active=false;return;}
     next=q.snapshot.count;
   } else if (q.notification && q.snapshot.count == 1 && !strcmp(q.snapshot.lines[0], BotVoltageList::EMPTY_LOW)) {
     strcpy(body + headingLen, BotVoltageList::EMPTY_LOW); next=1;
-  } else if(!BotVoltageList::page(q.snapshot,next,q.part,body + headingLen,sizeof(body) - headingLen,q.command==BOT_COMMAND_NOTES)) {q.active=false;return;}
+  } else if(q.scopedNames) {
+    if(!BotVoltageList::page(*q.scopedNames,next,q.part,body,bodyCapacity)) {q.active=false;q.scopedNames.reset();return;}
+  } else if(!BotVoltageList::page(q.snapshot,next,q.part,body + headingLen,bodyCapacity - headingLen,
+      q.command==BOT_COMMAND_NOTES,scopedHashes ? ',' : '\n')) {q.active=false;return;}
   BotMessage message{};message.channel_kind=q.kind;
   if(!botFormatResponseForChannel(message,body,strlen(body),formatted,sizeof(formatted),&written) ||
      !sendBotResponse(message,recipient,q.channel,formatted,written)) {
     bot_stats.send_failures++;if(++q.failures>=3) q.active=false;
-  } else {q.next=next;++q.part;q.failures=0;if(q.next>=q.snapshot.count) q.active=false;}
+  } else {q.next=next;++q.part;q.failures=0;
+    if(q.next>=(q.scopedNames ? q.scopedNames->count : q.snapshot.count)) q.active=false;}
+  if(!q.active)q.scopedNames.reset();
   q.deadline=_ms->getMillis()+5000;
 }
 
 void MyMesh::recordBotCommandStats(BotCommandId id) {
+  // Reuse the existing admin bucket without changing persisted history layout.
+  if(id==BOT_COMMAND_SAVE)id=BOT_COMMAND_NOTES;
   bot_stats_window.accepted(id,_ms->getMillis());
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
   const uint32_t utc=getRTCClock()->getCurrentTime();
@@ -2068,23 +2331,126 @@ void MyMesh::exportBotStats(JsonObject out) {
     for(size_t i=0;i<count;++i)values.add(record ? record->counts[ids[i]] : 0);
   }
 }
+
+void MyMesh::localScopedRepeaterName(const uint8_t* hash,char* name,size_t capacity,bool& ambiguous) {
+  name[0]=0;ambiguous=false;
+  if(const char* fixed=BotPath::fixedName(hash,2)) {
+    StrHelper::strzcpy(name,fixed,capacity);
+    return;
+  }
+  ContactsIterator iter;ContactInfo contact;unsigned matches=0;
+  while(iter.hasNext(this,contact)) {
+    if(contact.type!=ADV_TYPE_REPEATER || memcmp(contact.id.pub_key,hash,2))continue;
+    if(++matches>1){name[0]=0;ambiguous=true;return;}
+    StrHelper::strzcpy(name,contact.name,capacity);
+  }
+}
+
+void MyMesh::requestScopedRepeaterNames(bool enabled) {
+  scoped_lookup_enabled=enabled;
+  scoped_lookup_requested_at=_ms->getMillis();
+  if(!enabled)scoped_lookup_count=0;
+}
+
+void MyMesh::pollScopedRepeaterLookup() {
+  if(scoped_lookup_running) {
+    if(BotPathLookup::discard()) {
+      scoped_lookup_running=false;scoped_lookup_due=futureMillis(60000);
+    }
+    return;
+  }
+  // No periodic list scan. Only dashboard refreshes with the card open
+  // can queue work, and stale requests expire if the browser disappears.
+  if(!scoped_lookup_count || BotPathLookup::storagePending())return;
+  if(!scoped_lookup_enabled || uint32_t(_ms->getMillis()-scoped_lookup_requested_at)>30000UL) {
+    scoped_lookup_count=0;return;
+  }
+  if(!bot_prefs.enabled || !botNtpReady() || bot_path_count || BotPathLookup::inProgress() || BotInternetProbe::busy() ||
+      (scoped_lookup_due && !millisHasNowPassed(scoped_lookup_due)))return;
+  scoped_lookup_due=futureMillis(60000);
+  std::unique_ptr<BotPath::Route> request(new(std::nothrow) BotPath::Route);
+  if(!request)return;
+  request->width=2;request->all=true;
+  request->count=scoped_lookup_count;
+  memcpy(request->bytes,scoped_lookup_hashes,scoped_lookup_count*2);
+  scoped_lookup_count=0;
+  if(request->count && BotPathLookup::start(*request,"ct-ffc list","Dashboard")) {
+    scoped_lookup_running=true;scoped_lookup_cursor=scoped_lookup_next_cursor;
+  }
+  // start() owns its worker copy; do not retain the staging route during lookup.
+}
+
+void MyMesh::exportScopedRepeaters(JsonObject out) {
+  bot_scoped_repeaters.begin();
+  const uint32_t utc=getRTCClock()->getCurrentTime();
+  const uint32_t today=repeaterMonitor && repeaterMonitor->clockReady() && utc>=MonitorCore::VALID_TIME ? MonitorCore::easternDay(utc) : 0;
+  out["today"]=today;out["storageReady"]=bot_scoped_repeaters.available();
+  out["capacity"]=BotScopedRepeaters::Capacity;
+  auto rows=out["entries"].to<JsonArray>();
+  const auto& saved=bot_scoped_repeaters.entries();
+  scoped_lookup_count=0;
+  size_t active_count=0;
+  for(size_t offset=0;offset<saved.count;++offset) {
+    const size_t i=(scoped_lookup_cursor+offset)%saved.count;
+    const auto& entry=saved.entries[i];
+    if(today && (entry.lastDay>today || today-entry.lastDay>=30))continue;
+    ++active_count;
+    // The closed card needs only its count, avoiding name scans and JSON rows.
+    if(!scoped_lookup_enabled)continue;
+    char name[97]{};bool ambiguous=false;
+    localScopedRepeaterName(entry.hash,name,sizeof(name),ambiguous);
+    char hash[5];snprintf(hash,sizeof(hash),"%02x%02x",entry.hash[0],entry.hash[1]);
+    if(!name[0] && !ambiguous) {
+      const bool cached=BotPathLookup::cachedName(hash,name,sizeof(name),ambiguous);
+      // Reuse this export pass to collect work; never allocate or scan the
+      // whole list again from the periodic main-loop lookup poll.
+      if(!cached && scoped_lookup_enabled && scoped_lookup_count<5) {
+        memcpy(scoped_lookup_hashes+scoped_lookup_count*2,entry.hash,2);++scoped_lookup_count;
+        scoped_lookup_next_cursor=(i+1)%saved.count;
+      }
+    }
+    auto row=rows.add<JsonObject>();row["hash"]=hash;row["name"]=name;
+    row["fixedName"]=BotPath::fixedName(entry.hash,2)!=nullptr;
+    row["ambiguous"]=ambiguous;row["lastDay"]=entry.lastDay;
+  }
+  out["count"]=active_count;
+}
 #endif
 
 void MyMesh::sampleBotStatsWindow() {
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
   const uint32_t utc=getRTCClock()->getCurrentTime(),ticks=_ms->getMillis();
   bot_stats_history.begin(ticks);
-  if(repeaterMonitor && repeaterMonitor->clockReady() && utc>=MonitorCore::VALID_TIME)bot_stats_history.observe(MonitorCore::easternDay(utc),ticks);
-  bot_stats_history.poll(ticks);
+  bot_scoped_repeaters.begin();
+  if(repeaterMonitor && repeaterMonitor->clockReady() && utc>=MonitorCore::VALID_TIME) {
+    const uint32_t day=MonitorCore::easternDay(utc);
+    const uint32_t local=uint32_t(int64_t(utc)+FirmwareBot::easternUtcOffsetSeconds(utc));
+    bot_stats_history.observe(day,ticks);
+    bot_stats_history.poll(ticks,day,local%86400UL);
+    const bool activitySaved=bot_stats_history.available() && bot_stats_history.savedDay()==day;
+    if(activitySaved)
+      bot_scoped_repeaters.saveAfterActivity(ticks,day);
+    BotPathLookup::pollNameCache(utc,day,activitySaved);
+  }
 #endif
   bot_stats_window.sample(_ms->getMillis(),bot_stats,radio_driver.getPacketsRecv(),
     radio_driver.getPacketsSent(),radio_driver.getPacketsRecvErrors());
 }
 
 void MyMesh::tickBot() {
+  // Remove stale entries permanently, including before the millis clock wraps.
+  const uint32_t neighborNow=_ms->getMillis();
+  for(auto& neighbor:bot_neighbors)
+    if(neighbor.active && !neighbor.heardWithin24Hours(neighborNow))neighbor=BotNeighbor{};
   sampleBotStatsWindow();
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+  pollDeferredNameCacheSave(); // Save in an idle gap before starting another lookup.
+#endif
   pollAdminAdvert();
   pollBotPath();
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+  pollScopedRepeaterLookup();
+#endif
   sendNextVoltageListPart();
   uint32_t now = _ms->getMillis();
 
@@ -2134,11 +2500,24 @@ void MyMesh::tickBot() {
 
   sendQueuedEmergencyForwards();
   if (!bot_prefs.enabled) return;
-  if (next_bot_local_advert && millisHasNowPassed(next_bot_local_advert)) {
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+  if(botNtpReady() && !bot_initial_ntp_advert_scheduled) {
+    bot_initial_ntp_advert_scheduled=true;
+    // Announce promptly after the first confirmed NTP sync. Prefer one
+    // flood advert; avoid a second, simultaneous local startup advert.
+    if(bot_prefs.flood_advert_interval_ms) {
+      scheduleBotFloodAdvert(1000);
+      scheduleBotLocalAdvert(bot_prefs.local_advert_interval_ms);
+    } else if(bot_prefs.local_advert_interval_ms) {
+      scheduleBotLocalAdvert(1000);
+    }
+  }
+#endif
+  if (botNtpReady() && next_bot_local_advert && millisHasNowPassed(next_bot_local_advert)) {
     sendBotSelfAdvert(false);
     scheduleBotLocalAdvert(bot_prefs.local_advert_interval_ms);
   }
-  if (next_bot_flood_advert && millisHasNowPassed(next_bot_flood_advert)) {
+  if (botNtpReady() && next_bot_flood_advert && millisHasNowPassed(next_bot_flood_advert)) {
     sendBotSelfAdvert(true);
     scheduleBotFloodAdvert(bot_prefs.flood_advert_interval_ms);
   }
@@ -2909,6 +3288,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       writeErrFrame(ERR_CODE_ILLEGAL_ARG);
     }
   } else if (cmd_frame[0] == CMD_SEND_SELF_ADVERT) {
+    if(!botNtpReady()) {writeErrFrame(ERR_CODE_ILLEGAL_ARG);return;}
     mesh::Packet* pkt;
     if (_prefs.advert_loc_policy == ADVERT_LOC_NONE) {
       pkt = createSelfAdvert(_prefs.node_name);
@@ -3918,7 +4298,16 @@ void MyMesh::loop() {
 #endif
 }
 
+bool MyMesh::botNtpReady() const {
+#if CMESH_BOT_ENABLED && defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+  return repeaterMonitor && repeaterMonitor->clockReady();
+#else
+  return true;
+#endif
+}
+
 bool MyMesh::advert() {
+  if(!botNtpReady())return false;
   mesh::Packet* pkt;
   if (_prefs.advert_loc_policy == ADVERT_LOC_NONE) {
     pkt = createSelfAdvert(_prefs.node_name);

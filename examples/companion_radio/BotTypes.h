@@ -90,6 +90,7 @@ enum BotCommandId : uint8_t {
   BOT_COMMAND_DISABLE = 34,
   BOT_COMMAND_NOTES = 35,
   BOT_COMMAND_PASSWORD = 36,
+  BOT_COMMAND_SAVE = 37,
   BOT_COMMAND_UNKNOWN = 26
 };
 
@@ -173,6 +174,7 @@ struct BotMessage {
   uint8_t sender_key_prefix_len;
   bool text_truncated;
   bool path_is_inbound;
+  bool fairfield_scope_valid;
   uint32_t sender_timestamp;
   uint32_t received_at_timestamp;
   uint8_t path_len;
@@ -263,6 +265,10 @@ struct BotNeighbor {
   uint8_t sample_next;
   int16_t rssi_samples[16];
   int8_t snr_samples[16];
+
+  bool heardWithin24Hours(uint32_t now) const {
+    return active && (uint32_t)(now-last_heard_millis)<=86400000UL;
+  }
 
   void addSignalSample(int16_t rssi, int8_t snr) {
     rssi_samples[sample_next] = rssi;

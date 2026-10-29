@@ -185,7 +185,7 @@ inline uint32_t crc32(const char* data, size_t len) {
   return ~crc;
 }
 inline bool validSnapshot(const uint32_t header[4], const char* payload, size_t len) {
-  return header[0] == 0x4D4F4E31 && header[2] == len && len <= 65000
+  return header[0] == 0x4D4F4E31 && header[2] == len && len <= 196592
       && header[3] == crc32(payload, len);
 }
 inline const char* resultName(uint8_t r) {

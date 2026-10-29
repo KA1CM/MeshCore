@@ -44,9 +44,12 @@ inline bool singleMessage(const Snapshot& s, char* out, size_t capacity) {
   }
   return used!=0;
 }
-// Reserve enough room for the largest possible heading: 32/32 plus newline.
-inline size_t pageEnd(const Snapshot& s, size_t next, size_t capacity, bool noteChunks=false) {
-  size_t used=6; const size_t start=next;
+// Preserve the existing two-digit reserve; larger snapshots need more digits.
+template<class Rows>
+inline size_t pageEnd(const Rows& s, size_t next, size_t capacity, bool noteChunks=false) {
+  size_t used=6;
+  for(size_t rows=s.count;rows>=100;rows/=10)used+=2;
+  const size_t start=next;
   while(next<s.count) {
     const size_t len=strlen(s.lines[next]);
     const size_t separator=next>start && (!noteChunks || next==1) ? 1 : 0;
@@ -55,16 +58,21 @@ inline size_t pageEnd(const Snapshot& s, size_t next, size_t capacity, bool note
   }
   return next;
 }
-inline bool page(const Snapshot& s, size_t& next, unsigned part, char* out, size_t capacity, bool noteChunks=false) {
+template<class Rows>
+inline bool page(const Rows& s, size_t& next, unsigned part, char* out, size_t capacity, bool noteChunks=false, char rowSeparator='\n') {
   if(capacity<80 || next>=s.count) return false;
   unsigned total=0;
-  for(size_t cursor=0;cursor<s.count;++total) cursor=pageEnd(s,cursor,capacity,noteChunks);
+  for(size_t cursor=0;cursor<s.count;++total) {
+    const size_t end=pageEnd(s,cursor,capacity,noteChunks);
+    if(end==cursor)return false;
+    cursor=end;
+  }
   const size_t end=pageEnd(s,next,capacity,noteChunks);
   size_t used=snprintf(out,capacity,"%u/%u\n",part,total);
   const size_t start=next;
   while(next<end) {
     const size_t len=strlen(s.lines[next]);
-    if(next>start && (!noteChunks || next==1)) out[used++]='\n';
+    if(next>start && (!noteChunks || next==1)) out[used++]=rowSeparator;
     memcpy(out+used,s.lines[next],len);used+=len;++next;
   }
   out[used]=0;return true;

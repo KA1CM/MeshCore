@@ -200,7 +200,27 @@ BotCommandId commandIdForName(const char* name, size_t len) {
 }
 
 static BotCommandId cooldownKeyFor(BotCommandId command_id) {
-  return command_id;
+  // Stage 1: local, basic replies neither observe nor consume cooldown slots.
+  // Keep contact lists, path lookups, statistics and admin operations throttled.
+  switch (command_id) {
+    case BOT_COMMAND_PING:
+    case BOT_COMMAND_TEST:
+    case BOT_COMMAND_SIG:
+    case BOT_COMMAND_HELP:
+    case BOT_COMMAND_CMD:
+    case BOT_COMMAND_HELLO:
+    case BOT_COMMAND_ABOUT:
+    case BOT_COMMAND_STATUS:
+    case BOT_COMMAND_CHANNELS:
+    case BOT_COMMAND_VERSION:
+    case BOT_COMMAND_TIME:
+    case BOT_COMMAND_LORA:
+    case BOT_COMMAND_ID:
+    case BOT_COMMAND_AIR:
+      return BOT_COMMAND_NONE;
+    default:
+      return command_id;
+  }
 }
 
 size_t maxResponseLenForChannel(BotChannelKind channel_kind) {
@@ -211,6 +231,7 @@ bool isCommandOnCooldown(const BotCommandCooldown* cooldowns, size_t cooldown_co
                          uint32_t now_millis) {
   if (!cooldowns || command_id == BOT_COMMAND_NONE) return false;
   BotCommandId cooldown_key = cooldownKeyFor(command_id);
+  if (cooldown_key == BOT_COMMAND_NONE) return false;
   for (size_t i = 0; i < cooldown_count; i++) {
     if (cooldowns[i].command_id == cooldown_key && (int32_t)(cooldowns[i].expires_at_millis - now_millis) > 0) return true;
   }
@@ -221,6 +242,7 @@ void recordCommandCooldown(BotCommandCooldown* cooldowns, size_t cooldown_count,
                            uint32_t now_millis, uint32_t cooldown_millis) {
   if (!cooldowns || cooldown_count == 0 || command_id == BOT_COMMAND_NONE || cooldown_millis == 0) return;
   BotCommandId cooldown_key = cooldownKeyFor(command_id);
+  if (cooldown_key == BOT_COMMAND_NONE) return;
 
   size_t slot = cooldown_count;
   for (size_t i = 0; i < cooldown_count; i++) {
@@ -274,7 +296,7 @@ bool parseCommand(const char* text, size_t text_len, BotCommand* command, bool a
   const BotCommandMetadata* metadata = name_len > BOT_MAX_COMMAND_NAME_LEN ? NULL : BotCommandRegistry::findByName(command->name, copy_name_len);
   command->id = metadata ? metadata->id : BOT_COMMAND_UNKNOWN;
   if (!has_prefix && (!metadata || (metadata->visibility != BOT_COMMAND_VISIBILITY_DISCOVERABLE &&
-                                   metadata->id != BOT_COMMAND_ADVERT && metadata->id != BOT_COMMAND_CHECK && metadata->id != BOT_COMMAND_SYNC && metadata->id != BOT_COMMAND_ADD && metadata->id != BOT_COMMAND_REMOVE && metadata->id != BOT_COMMAND_ENABLE && metadata->id != BOT_COMMAND_DISABLE && metadata->id != BOT_COMMAND_NOTES && metadata->id != BOT_COMMAND_PASSWORD))) return false;
+                                   metadata->id != BOT_COMMAND_ADVERT && metadata->id != BOT_COMMAND_CHECK && metadata->id != BOT_COMMAND_SYNC && metadata->id != BOT_COMMAND_ADD && metadata->id != BOT_COMMAND_REMOVE && metadata->id != BOT_COMMAND_ENABLE && metadata->id != BOT_COMMAND_DISABLE && metadata->id != BOT_COMMAND_NOTES && metadata->id != BOT_COMMAND_PASSWORD && metadata->id != BOT_COMMAND_SAVE))) return false;
 
   while (pos < normalized_len && isCommandDelimiter(normalized[pos])) pos++;
   // Notes and passwords are copied verbatim from the original DM.

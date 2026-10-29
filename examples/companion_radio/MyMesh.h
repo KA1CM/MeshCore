@@ -1,8 +1,11 @@
 #include "BotVoltageList.h"
+#include "BotScopeNotice.h"
+#include "BotScopedNameList.h"
 #include "BotStatsWindow.h"
 #include "BotTopUsers.h"
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
 #include "MonitorBotStatsHistory.h"
+#include "MonitorScopedRepeaters.h"
 #include <ArduinoJson.h>
 #endif
 #pragma once
@@ -106,17 +109,22 @@ class RepeaterMonitor;
 
 class MyMesh : public BaseChatMesh, public DataStoreHost {
 public:
+  bool botNtpReady() const;
   MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMeshTables &tables, DataStore& store, AbstractUITask* ui=NULL);
 
   void begin(bool has_display);
   void startInterface(BaseSerialInterface &serial);
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
   void exportBotStats(JsonObject out);
+  void exportScopedRepeaters(JsonObject out);
+  void requestScopedRepeaterNames(bool enabled);
   bool hasPendingPathReplies() const { return bot_path_count != 0; }
   bool sendAdminCheckResult(const uint8_t* key, const char* text);
+  bool sendStartupNotification(const uint8_t* key, const char* text);
   bool queueStatusNotification(const uint8_t* key, const BotVoltageList::Snapshot& snapshot);
   bool queueSunriseNotification(const uint8_t* key, const BotVoltageList::Snapshot& snapshot);
   uint32_t getLastBotAdvertTime() const { return last_bot_advert_time; }
+  bool hasSentBotAdvert() const { return first_bot_advert_sent; }
   void setRepeaterMonitor(RepeaterMonitor* monitor) { repeaterMonitor = monitor; }
   void saveMonitorContacts() { saveContacts(); }
   bool restoreMonitorContactName(const uint8_t* key);
@@ -255,7 +263,8 @@ private:
   void recordBotNeighbor(const uint8_t *pub_key, int16_t rssi_dbm, int8_t snr_quarters);
   bool enqueueEmergencyForward(const BotMessage &message);
   bool findBotChannel(BotChannelKind kind, uint8_t &channel_idx);
-  bool sendBotGroupMessage(uint8_t channel_idx, const char *text, size_t text_len);
+  bool sendBotGroupMessage(uint8_t channel_idx, const char *text, size_t text_len, bool unscoped = false);
+  BotScopeNotice fairfield_scope_notices;
   void sendQueuedEmergencyForwards();
   void tickBot();
   void scheduleBotLocalAdvert(unsigned long interval_millis);
@@ -268,16 +277,39 @@ private:
   void resolveLocalPathNames(BotPath::Route& route);
   void pollBotPath();
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+  void pollScopedRepeaterLookup();
+  bool deferNameCacheSave(const uint8_t* key);
+  void pollDeferredNameCacheSave();
+  struct DeferredNameCacheSave {
+    bool active=false,ready=false;
+    uint8_t key[PUB_KEY_SIZE]{};
+    uint32_t due=0,expires=0;
+    const char* error=nullptr;
+  } deferred_name_cache_saves[16]; // At most one pending confirmation per admin.
+  void localScopedRepeaterName(const uint8_t* hash,char* name,size_t capacity,bool& ambiguous);
+  bool scoped_lookup_running=false;
+  bool scoped_lookup_enabled=false;
+  uint32_t scoped_lookup_requested_at=0;
+  uint8_t scoped_lookup_hashes[10]{};
+  size_t scoped_lookup_count=0;
+  size_t scoped_lookup_cursor=0,scoped_lookup_next_cursor=0;
+  uint32_t scoped_lookup_due=0;
+#endif
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
   struct PendingBotPath {
     bool active=false, ready=false, started=false, lookupRunning=false, sent=false;
     BotPath::Route route;
     BotMessage message{};
     uint8_t key[PUB_KEY_SIZE]{}, channel=0xFF;
     uint32_t lookupDeadline=0, expires=0;
+    size_t nextHop=0;
+    uint32_t nextPart=0;
+    uint8_t failures=0;
   } pending_bot_paths[4];
   size_t bot_path_head=0, bot_path_count=0;
 #endif
   uint32_t last_bot_advert_time = 0;
+  bool first_bot_advert_sent = false;
   struct {
     bool active=false; uint8_t result=0;
     uint8_t key[PUB_KEY_SIZE]{}, hash[MAX_HASH_SIZE]{};
@@ -341,6 +373,7 @@ private:
 
   struct PendingVoltageList {
     BotVoltageList::Snapshot snapshot;
+    BotScopedNameList::Pointer scopedNames;
     BotCommandId command = BOT_COMMAND_LIST;
     bool notification = false;
     bool statusNotification = false;
@@ -360,6 +393,7 @@ private:
   void recordBotCommandStats(BotCommandId id);
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
   MonitorBotStatsHistory bot_stats_history;
+  MonitorScopedRepeaters bot_scoped_repeaters;
 #endif
   PendingBotDmAck pending_bot_dm_ack;
   PendingEmergencyForward pending_emergency_forwards[BOT_PENDING_EMERGENCY_SLOTS];
@@ -368,6 +402,7 @@ private:
   BotNeighbor bot_neighbors[BOT_NEIGHBOR_SLOTS];
   unsigned long next_bot_local_advert;
   unsigned long next_bot_flood_advert;
+  bool bot_initial_ntp_advert_scheduled=false;
 #endif
 
   uint8_t cmd_frame[MAX_FRAME_SIZE + 1];

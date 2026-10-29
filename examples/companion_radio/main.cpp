@@ -2,6 +2,7 @@
 #include <Mesh.h>
 #include "MyMesh.h"
 #include "RepeaterMonitor.h"
+#include "BotPathLookup.h"
 
 #if defined(ESP32) && defined(BOT_NTP_SYNC)
   #include <WiFi.h>
@@ -231,6 +232,10 @@ void setup() {
   Serial.begin(115200);
 
   board.begin();
+
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+  BotPathLookup::begin();
+#endif
 
 #ifdef DISPLAY_CLASS
   DisplayDriver* disp = NULL;

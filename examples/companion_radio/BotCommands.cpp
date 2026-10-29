@@ -192,6 +192,8 @@ BotCommandResult executeHelp(const BotCommand& command, char* output, size_t out
       "list low: list of repeaters with voltage below 3.6V or N/A");
   if (command.args_len == 8 && !strcmp(command.args,"list low"))
     return writeText(output,output_len,"list low: list of repeaters with voltage below 3.6V or N/A");
+  if (command.args_len == 8 && !strcmp(command.args,"path all"))
+    return writeText(output,output_len,"path all: response in multiple messages if needed.");
   const BotCommandMetadata* metadata = BotCommandRegistry::findByName(command.args, command.args_len);
   if (!metadata) return writeFormatted(output, output_len, "No help for %s", command.args);
   if (metadata->visibility != BOT_COMMAND_VISIBILITY_DISCOVERABLE) {
@@ -201,6 +203,11 @@ BotCommandResult executeHelp(const BotCommand& command, char* output, size_t out
     return writeText(output, output_len,
       "Neighbors: list of directly heard repeaters in one page\n"
       "Neighbors all: list of all directly heard repeaters");
+  }
+  if (metadata->id == BOT_COMMAND_PATH) {
+    return writeText(output,output_len,
+      "path: show path from requester to local bot in one message.\n"
+      "path all: response in multiple messages if needed.");
   }
   if (metadata->id == BOT_COMMAND_SIG) {
     return writeFormatted(output, output_len, "%s Usage: %s", metadata->details, metadata->usage);
@@ -283,12 +290,12 @@ BotCommandResult executeSig(const BotCommandContext& context, char* output, size
 BotCommandResult executeAir(const BotCommandContext& context, char* output, size_t output_len) {
   const char* target = context.response_target[0] ? context.response_target : NULL;
   if (target) {
-    return writeFormatted(output, output_len, "@[%s]: tx %lus rx %lus | rx flood %lu direct %lu | tx flood %lu direct %lu",
+    return writeFormatted(output, output_len, "@[%s]:\ntx %lus rx %lus\nrx flood %lu direct %lu\ntx flood %lu direct %lu",
                           target, (unsigned long)context.tx_airtime_seconds, (unsigned long)context.rx_airtime_seconds,
                           (unsigned long)context.flood_recv, (unsigned long)context.direct_recv,
                           (unsigned long)context.flood_sent, (unsigned long)context.direct_sent);
   }
-  return writeFormatted(output, output_len, "tx %lus rx %lus | rx flood %lu direct %lu | tx flood %lu direct %lu",
+  return writeFormatted(output, output_len, "tx %lus rx %lus\nrx flood %lu direct %lu\ntx flood %lu direct %lu",
                         (unsigned long)context.tx_airtime_seconds, (unsigned long)context.rx_airtime_seconds,
                         (unsigned long)context.flood_recv, (unsigned long)context.direct_recv,
                         (unsigned long)context.flood_sent, (unsigned long)context.direct_sent);
@@ -364,8 +371,17 @@ BotCommandResult executeTest(const BotCommand& command, const BotCommandContext&
 namespace BotCommands {
 
 bool pathRoute(const BotCommand& command, const BotCommandContext& context, BotPath::Route& route) {
-  route=BotPath::Route{};
-  if(command.args_len) {
+  // Reset in place: an aggregate temporary adds over 2 KB to the radio stack.
+  route.all=false;
+  route.width=route.count=0;
+  memset(route.bytes,0,sizeof(route.bytes));
+  memset(route.names,0,sizeof(route.names));
+  memset(route.ambiguous,0,sizeof(route.ambiguous));
+  route.all=command.args_len==3 &&
+    (command.args[0]=='a' || command.args[0]=='A') &&
+    (command.args[1]=='l' || command.args[1]=='L') &&
+    (command.args[2]=='l' || command.args[2]=='L');
+  if(command.args_len && !route.all) {
     ParsedPathArg parsed{};
     if(!parsePathArgument(command.args,command.args_len,context.path_hash_size,&parsed)) return false;
     route.width=parsed.hash_size; route.count=parsed.hash_count;

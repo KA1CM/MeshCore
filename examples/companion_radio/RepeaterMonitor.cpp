@@ -5,6 +5,7 @@
 #include "MyMesh.h"
 #include "BotPathLookup.h"
 #include "BotInternetProbe.h"
+#include "BotLookupMemory.h"
 #include "FirmwareBot.h"
 #include <WiFi.h>
 #include <new>
@@ -21,6 +22,19 @@
 #error Define Wi-Fi credentials in platformio.local.ini
 #endif
 using namespace MonitorCore;
+namespace {
+class HistoryJsonAllocator : public ArduinoJson::Allocator {
+public:
+  void* allocate(size_t size) override { return BotPathLookup::allocateBulk(size); }
+  void deallocate(void* memory) override { heap_caps_free(memory); }
+  void* reallocate(void* memory,size_t size) override {
+    if(!size) { heap_caps_free(memory);return nullptr; }
+    if(void* moved=heap_caps_realloc(memory,size,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT)) return moved;
+    return heap_caps_realloc(memory,size,MALLOC_CAP_8BIT);
+  }
+} historyJsonAllocator;
+using HistoryBuffer=std::unique_ptr<char[],BotPathLookup::FreeBulk>;
+}
 static const char* slots[] = {"/monitor0.json", "/monitor1.json"};
 static const struct { const char* ssid; const char* password; } wifiNetworks[] = {
   {BOT_NTP_SSID, BOT_NTP_PASSWORD},
@@ -169,36 +183,113 @@ bool RepeaterMonitor::importState(JsonDocument& doc, bool history) {
 
 bool RepeaterMonitor::readSlot(int slot, JsonDocument& doc, uint32_t& seq) {
   File f = SPIFFS.open(slots[slot], "r");
+  storageReadError="snapshot open/size invalid";
   if (!f || f.size() < 16 || f.size() > 196608) return false;
   uint32_t header[4];
+  storageReadError="snapshot header invalid";
   if (f.read((uint8_t*)header, sizeof(header)) != sizeof(header) || header[0] != 0x4D4F4E31 || header[2] != f.size() - 16) return false;
-  String payload = f.readString();
-  if (!validSnapshot(header, payload.c_str(), payload.length())) return false;
-  if (deserializeJson(doc, payload)) return false;
+  const size_t length=header[2];
+  HistoryBuffer payload(static_cast<char*>(BotPathLookup::allocateBulk(length+1)));
+  storageReadError="snapshot read-buffer allocation failed";
+  if(!payload) return false;
+  storageReadError="snapshot read incomplete";
+  if(f.read((uint8_t*)payload.get(),length)!=length) return false;
+  f.close();payload[length]=0;
+  storageReadError="snapshot checksum invalid";
+  if (!validSnapshot(header,payload.get(),length)) return false;
+  storageReadError="snapshot JSON invalid or allocation failed";
+  // Const input forces owned JSON strings; payload is released on return.
+  if (deserializeJson(doc,static_cast<const char*>(payload.get()),length) || doc.overflowed()) return false;
   seq = header[1];
   return true;
 }
 
-bool RepeaterMonitor::save() {
-  JsonDocument doc; exportState(doc, true, false);
-  String payload; serializeJson(doc, payload);
-  if (doc.overflowed() || payload.length() > 196592) { storageOK = false; return false; }
+bool RepeaterMonitor::save(bool retry) {
+  if(!retry && !storageOK) return false;
+  if(BotPathLookup::inProgress()) {
+    storageSaveDeferred=true;BotPathLookup::setStoragePending(true);return false;
+  }
+  storageSaveDeferred=false;
+  HistoryBuffer payload;
+  size_t length=0;
+  {
+    JsonDocument doc(&historyJsonAllocator);exportState(doc,true,false);
+    if(doc.overflowed()) return storageFailed("JSON allocation failed");
+    length=measureJson(doc);
+    if(!length || length>196592) return storageFailed("snapshot size invalid");
+    payload.reset(static_cast<char*>(BotPathLookup::allocateBulk(length+1)));
+    if(!payload) return storageFailed("serialization buffer allocation failed");
+    if(serializeJson(doc,payload.get(),length+1)!=length) return storageFailed("serialization incomplete");
+  } // Release the original JSON before writing and read-back verification.
   int dest = savedSlot == 0 ? 1 : 0;
-  uint32_t header[] = {0x4D4F4E31, sequence + 1, (uint32_t)payload.length(), crc32(payload.c_str(), payload.length())};
+  uint32_t header[] = {0x4D4F4E31, sequence + 1, (uint32_t)length, crc32(payload.get(),length)};
   File f = SPIFFS.open(slots[dest], "w");
-  bool ok = f && f.write((uint8_t*)header, sizeof(header)) == sizeof(header)
-      && f.write((const uint8_t*)payload.c_str(), payload.length()) == payload.length();
+  if(!f) return storageFailed("snapshot open for write failed");
+  const bool written=f.write((uint8_t*)header,sizeof(header))==sizeof(header) &&
+    f.write((const uint8_t*)payload.get(),length)==length;
   f.flush(); f.close();
-  JsonDocument check; uint32_t seq = 0;
-  ok = ok && readSlot(dest, check, seq) && seq == sequence + 1;
-  storageOK = ok;
-  if (ok) { savedSlot = dest; sequence = seq; }
-  else lastError = "Storage write failed. Polling is paused; export the list before restarting.";
-  return ok;
+  payload.reset(); // Never hold both serialized copies during verification.
+  if(!written) return storageFailed("snapshot write incomplete");
+  JsonDocument check(&historyJsonAllocator);uint32_t seq=0;
+  if(!readSlot(dest,check,seq)) return storageFailed(storageReadError);
+  if(seq!=sequence+1) return storageFailed("snapshot generation mismatch");
+  savedSlot=dest;sequence=seq;storageOK=true;return true;
+}
+
+void RepeaterMonitor::queueStorageNotice(const char* text) {
+  strlcpy(storageNotice,text,sizeof(storageNotice));storageNoticeRecipient=0;
+  storageNoticePending=true;storageNoticeDue=millis();storageNoticeExpires=millis()+600000;
+}
+
+bool RepeaterMonitor::storageFailed(const char* stage) {
+  storageOK=false;strlcpy(storageFailure,stage,sizeof(storageFailure));
+  lastError=String("History save failed: ")+storageFailure+". Polling paused.";
+  if(!storageRetryPending) {
+    storageRetryPending=true;storageRetryCount=0;storageRetryDue=millis()+30000;
+    char text[144];snprintf(text,sizeof(text),"History save failed: %s. Checks paused; retrying.",storageFailure);
+    queueStorageNotice(text);
+  }
+  BotPathLookup::setStoragePending(false); // Allow lookups during the retry backoff.
+  return false;
+}
+
+void RepeaterMonitor::pollStorageRecovery() {
+  if(storageSaveDeferred && storageOK && synced && !BotPathLookup::inProgress()) {
+    if(save()) {
+      storagePhaseSaved=phase==StoreStart || phase==StoreFinish || phase==StoreLogin;
+      BotPathLookup::setStoragePending(false);
+    }
+  }
+  if(storageRetryPending && synced && elapsed(millis(),storageRetryDue)) {
+    BotPathLookup::setStoragePending(true);
+    if(!BotPathLookup::inProgress()) {
+      if(save(true)) {
+        storageRetryPending=false;storageRetryCount=0;lastError="";
+        storagePhaseSaved=phase==StoreStart || phase==StoreFinish || phase==StoreLogin;
+        BotPathLookup::setStoragePending(false);
+        char text[144];snprintf(text,sizeof(text),"History storage recovered. Saved successfully after: %s",storageFailure);
+        queueStorageNotice(text);
+      } else if(++storageRetryCount>=3) {
+        storageRetryPending=false;BotPathLookup::setStoragePending(false);
+        char text[144];snprintf(text,sizeof(text),"History save failed after 3 retries: %s. Checks remain paused.",storageFailure);
+        queueStorageNotice(text);
+      } else storageRetryDue=millis()+(30000UL<<storageRetryCount);
+    }
+  }
+  if(!storageNoticePending) return;
+  if(elapsed(millis(),storageNoticeExpires)) {storageNoticePending=false;return;}
+  if(!synced || !elapsed(millis(),storageNoticeDue)) return;
+  while(storageNoticeRecipient<adminContacts.count()) {
+    const auto* admin=adminContacts.at(storageNoticeRecipient);
+    if(!(admin->permissions & BotAdminContacts::Notifications)) {++storageNoticeRecipient;continue;}
+    if(mesh.sendStartupNotification(admin->key,storageNotice)) ++storageNoticeRecipient;
+    storageNoticeDue=millis()+5000;return;
+  }
+  storageNoticePending=false;
 }
 
 void RepeaterMonitor::load() {
-  JsonDocument a, b; uint32_t sa = 0, sb = 0;
+  JsonDocument a(&historyJsonAllocator), b(&historyJsonAllocator); uint32_t sa = 0, sb = 0;
   bool va = readSlot(0, a, sa), vb = readSlot(1, b, sb);
   int first = vb && (!va || (int32_t)(sb - sa) > 0) ? 1 : 0;
   for (int attemptSlot = 0; attemptSlot < 2; ++attemptSlot) {
@@ -214,7 +305,7 @@ void RepeaterMonitor::load() {
 }
 
 void RepeaterMonitor::rememberNames() {
-  if (!storageOK) return;
+  if (!storageOK || BotPathLookup::inProgress()) return;
   bool changed = false;
   for (size_t i = 0; i < count; ++i) {
     auto* known = mesh.lookupContactByPubKey(entries[i].key, 32);
@@ -232,6 +323,7 @@ void RepeaterMonitor::rememberNames() {
 }
 
 void RepeaterMonitor::prune(uint32_t utc) {
+  if(!storageOK || BotPathLookup::inProgress()) return;
   bool changed = false;
   for (size_t i = 0; i < count; ++i) for (Reading& r : entries[i].readings) {
     if (r.day && !retained(r.day, easternDay(utc))) { r = Reading{}; changed = true; }
@@ -373,6 +465,7 @@ void RepeaterMonitor::routes() {
   });
   server.on("/api/state", HTTP_GET, [this]() {
     if (!authorized()) return;
+    mesh.requestScopedRepeaterNames(server.arg("ctffcNames")=="1");
     // Both this handler and start() run on the main loop, so no new worker can
     // start between this check and destruction of the JSON/serialized buffers.
     // Keep refresh paused between workers until every queued reply is finished.
@@ -384,6 +477,7 @@ void RepeaterMonitor::routes() {
     uint32_t utc = now();
     doc["canManage"] = requestIsAdmin;
     mesh.exportBotStats(doc["commandStats"].to<JsonObject>());
+    mesh.exportScopedRepeaters(doc["ctFfcRepeaters"].to<JsonObject>());
     doc["clockSyncRunning"] = syncPhase != SyncIdle;
     doc["clockSyncResult"] = syncResult;
     if (syncTarget >= 0 && syncTarget < (int)count) {
@@ -409,6 +503,9 @@ void RepeaterMonitor::routes() {
     }
     doc["now"] = utc; doc["timeReady"] = synced; doc["storageOK"] = storageOK;
     doc["running"] = running; doc["active"] = -1;
+    doc["storageRetryPending"]=storageRetryPending;
+    doc["storageRetryCount"]=storageRetryCount;
+    doc["storageFailureStage"]=storageFailure;
     if (active >= 0 && active < (int)count) {
       char activeKey[65];formatKey(entries[active].key,activeKey);
       for(size_t i=0;i<count;++i) if(!strcmp(doc["repeaters"][i]["key"] | "",activeKey)) doc["active"] = i;
@@ -420,6 +517,11 @@ void RepeaterMonitor::routes() {
     JsonObject lookupState=doc["pathLookup"].to<JsonObject>();
     lookupState["stage"]=lookup.stage; lookupState["detail"]=lookup.detail;
     lookupState["freeHeap"]=lookup.freeHeap; lookupState["largestBlock"]=lookup.largestBlock;
+    lookupState["psramFree"]=lookup.psramFree; lookupState["psramBlock"]=lookup.psramBlock;
+    lookupState["tlsPsramAllocations"]=lookup.tlsPsramAllocations;
+    lookupState["nameCacheSavedUtc"]=BotPathLookup::nameCacheLastSavedUtc();
+    lookupState["nameCacheStorageError"]=BotPathLookup::nameCacheSaveError();
+    lookupState["cachedNames"]=BotPathLookup::cachedNameCount();
     lookupState["lastFailure"]=lookup.lastFailure; lookupState["lastFailureDetail"]=lookup.lastFailureDetail;
     lookupState["failureHeap"]=lookup.failureHeap; lookupState["failureBlock"]=lookup.failureBlock;
     lookupState["failureUtc"]=lookup.failureUtc; lookupState["verifyFlags"]=lookup.verifyFlags;
@@ -435,6 +537,15 @@ void RepeaterMonitor::routes() {
       row["minHeap"]=lookupEntry.minHeap;row["minBlock"]=lookupEntry.minBlock;
     }
     auto wifiState=doc["wifiDiagnostics"].to<JsonObject>();
+    auto restartState=doc["restartHistory"].to<JsonObject>();
+    restartState["storageReady"]=restartHistory.available();restartState["error"]=restartHistory.lastError();
+    auto restarts=restartState["entries"].to<JsonArray>();
+    const auto& restartRecords=restartHistory.records();
+    for(size_t r=0;r<restartRecords.count;++r) {
+      const auto& entry=restartRecords.entries[r];auto row=restarts.add<JsonObject>();
+      row["reason"]=MonitorRestartHistory::reasonName(entry.reason);row["reasonCode"]=entry.reason;
+      row["bootUtc"]=entry.bootUtc;row["freeHeap"]=entry.freeHeap;row["largestBlock"]=entry.largestBlock;
+    }
     wifiState["connected"]=WiFi.status()==WL_CONNECTED;
     wifiState["status"]=(int)WiFi.status();wifiState["rssi"]=WiFi.RSSI();
     wifiState["attempts"]=wifiAttempts;wifiState["disconnects"]=wifiDisconnects;wifiState["reconnects"]=wifiReconnects;
@@ -622,7 +733,9 @@ void RepeaterMonitor::connectWifi(size_t index) {
 }
 
 void RepeaterMonitor::begin() {
+  startupBootMillis=millis();
   load(); mesh.setRepeaterMonitor(this);
+  restartHistory.begin();
   if (storageOK) {
 #ifdef BOT_REPEATER_INITIAL_PASSWORD
     const char* initial = BOT_REPEATER_INITIAL_PASSWORD;
@@ -709,28 +822,30 @@ const char* RepeaterMonitor::adminNotes(const uint8_t* sender, const char* args,
   auto& entry=entries[found];
   auto* c=mesh.lookupContactByPubKey(entry.key,32);
   char name[33];BotVoltageList::shortName(c && c->name[0] ? c->name : entry.learnedName[0] ? entry.learnedName : entry.name,entry.key,name);
+  std::string changed;
   if(set) {
     if(!storageOK || busy() || adminCheckPending) return "Bot busy or storage unavailable; try again shortly";
     const char* text=separator+1;
     if(*text==' ') ++text;
     if(!*text) return "Notes text is required; existing notes unchanged";
     std::string updated;
-    if(const char* error=BotNoteFields::edit(entry.notes,text,updated))return error;
+    if(const char* error=BotNoteFields::edit(entry.notes,text,updated,&changed))return error;
     if(!validNotes(updated.c_str(),updated.size())) return "Invalid notes; maximum 512 characters";
     std::string previous=entry.notes;entry.notes.swap(updated);
     if(!save()) {entry.notes.swap(previous);return "Could not save notes; change not applied";}
-    snprintf(adminEditReply,sizeof(adminEditReply),"%s notes saved",name);
-    return adminEditReply;
+    snprintf(out.lines[out.count++],BotVoltageList::LINE_SIZE,"%s notes saved",name);
+  } else {
+    snprintf(out.lines[out.count++],BotVoltageList::LINE_SIZE,"%s notes:",name);
   }
-  snprintf(out.lines[out.count++],BotVoltageList::LINE_SIZE,"%s notes:",name);
-  if(entry.notes.empty()) {strcpy(out.lines[out.count++],"No notes saved");return nullptr;}
+  const std::string& displayed=set ? changed : entry.notes;
+  if(displayed.empty()) {strcpy(out.lines[out.count++],"No notes saved");return nullptr;}
   // UTF-8-safe chunks: the notes pager joins them without adding newlines.
   // 2048 bytes need at most 36 bounded chunks.
-  for(size_t pos=0;pos<entry.notes.size();) {
-    size_t end=std::min(pos+60,entry.notes.size());
-    while(end<entry.notes.size() && ((unsigned char)entry.notes[end]&0xc0)==0x80) --end;
+  for(size_t pos=0;pos<displayed.size();) {
+    size_t end=std::min(pos+60,displayed.size());
+    while(end<displayed.size() && ((unsigned char)displayed[end]&0xc0)==0x80) --end;
     const size_t length=end-pos;
-    memcpy(out.lines[out.count],entry.notes.data()+pos,length);out.lines[out.count++][length]=0;pos=end;
+    memcpy(out.lines[out.count],displayed.data()+pos,length);out.lines[out.count++][length]=0;pos=end;
   }
   return nullptr;
 }
@@ -813,6 +928,85 @@ const char* RepeaterMonitor::adminEditRepeater(const uint8_t* sender, const char
   return adminEditReply;
 }
 
+
+const char* RepeaterMonitor::startAdminAdvert(const uint8_t* sender, const char* query) {
+  if(!adminContacts.allows(sender,BotAdminContacts::Commands))return "Not authorized";
+  if(!query || !*query)return "Usage: advert <repeater>";
+  if(!syncTimeReady() || !storageOK || busy() || adminCheckPending)return "Bot busy or not ready; try again shortly";
+  int target=-1;
+  for(size_t i=0;i<count;++i) {
+    const auto* c=mesh.lookupContactByPubKey(entries[i].key,32);
+    const char* name=c && c->name[0] ? c->name : entries[i].learnedName[0] ? entries[i].learnedName : entries[i].name;
+    bool match=false;
+    for(const char* p=name;*p;++p)if(!strncasecmp(p,query,strlen(query))){match=true;break;}
+    if(!match)continue;
+    if(target>=0)return "Multiple repeaters match; use a more specific name";
+    target=(int)i;BotVoltageList::shortName(name,entries[i].key,advertTargetName);
+  }
+  if(target<0)return "No matching managed repeater";
+  const auto* c=mesh.lookupContactByPubKey(entries[target].key,32);
+  if(!c)return "Repeater contact missing";
+  memcpy(advertTargetKey,entries[target].key,32);memcpy(advertAdminKey,sender,32);
+  advertBaseline=c->last_advert_timestamp;advertHeard=false;advertStamp=0;
+  advertPreFlood=advertLogins=advertPostAttempts=0;advertResult[0]=0;
+  sendRepeaterAdvert(false);
+  return nullptr;
+}
+
+void RepeaterMonitor::finishRepeaterAdvert(const char* result) {
+  snprintf(advertResult,sizeof(advertResult),"%s: %.60s",advertTargetName,result);
+  advertPhase=AdvertResult;advertDeadline=millis()+600000;
+}
+
+void RepeaterMonitor::sendRepeaterAdvert(bool flood) {
+  const auto* c=mesh.lookupContactByPubKey(advertTargetKey,32);
+  if(!c){finishRepeaterAdvert("Repeater contact missing");return;}
+  if(!syncTimeReady()){finishRepeaterAdvert("NTP no longer fresh");return;}
+  ContactInfo target=*c;
+  if(flood || advertLogins)target.out_path_len=OUT_PATH_UNKNOWN;
+  if(advertLogins)++advertPostAttempts;
+  else if(target.out_path_len==OUT_PATH_UNKNOWN)++advertPreFlood;
+  if(!advertStamp) {
+    advertStamp=mesh.getRTCClock()->getCurrentTimeUnique();const uint32_t utc=now();
+    if(advertStamp<utc || advertStamp-utc>5){finishRepeaterAdvert("Bot clock is not close to NTP");return;}
+    snprintf(advertPrefix,sizeof(advertPrefix),"%02X|",(unsigned)(uint8_t)esp_random());
+  }
+  char command[16];snprintf(command,sizeof(command),"%sadvert",advertPrefix);
+  uint32_t estimate=0;
+  const bool sent=mesh.sendCommandData(target,advertStamp,0,command,estimate)!=MSG_SEND_FAILED;
+  advertPhase=AdvertReply;advertDeadline=millis()+(sent ? timeout(estimate) : 3000);
+  // Same timestamp and text suppress duplicate execution on the repeater.
+}
+
+void RepeaterMonitor::retryRepeaterAdvert() {
+  if(advertHeard){finishRepeaterAdvert("Advert heard (command reply not received)");return;}
+  if((advertLogins && advertPostAttempts>0 && advertPostAttempts<4) || (!advertLogins && advertPreFlood<3)) {
+    advertPhase=AdvertReady;advertDeadline=millis()+15000;return;
+  }
+  if(advertPostAttempts>=4 || advertLogins>=2){finishRepeaterAdvert("No response or advert heard");return;}
+  const auto* c=mesh.lookupContactByPubKey(advertTargetKey,32);
+  const char* password=credentials.available() ? credentials.password(advertTargetKey) : "";
+  if(!c || !password[0]){finishRepeaterAdvert("No response; saved login password missing");return;}
+  if(!syncTimeReady()){finishRepeaterAdvert("NTP no longer fresh");return;}
+  ContactInfo target=*c;target.out_path_len=OUT_PATH_UNKNOWN;
+  uint32_t estimate=0;++advertLogins;advertPostAttempts=0;
+  const bool sent=mesh.sendLogin(target,password,estimate)!=MSG_SEND_FAILED;
+  advertPhase=AdvertLogin;advertDeadline=millis()+(sent ? timeout(estimate) : 3000);
+}
+
+void RepeaterMonitor::pollRepeaterAdvert() {
+  if(advertPhase==AdvertIdle)return;
+  if(!adminContacts.allows(advertAdminKey,BotAdminContacts::Commands)){advertPhase=AdvertIdle;return;}
+  if(advertPhase==AdvertResult) {
+    if(elapsed(millis(),advertDeadline) || mesh.sendAdminCheckResult(advertAdminKey,advertResult))advertPhase=AdvertIdle;
+    return;
+  }
+  if(advertHeard){finishRepeaterAdvert("Advert heard");return;}
+  if(!elapsed(millis(),advertDeadline))return;
+  if(advertPhase==AdvertObserve){finishRepeaterAdvert("Request confirmed; advert not heard");return;}
+  if(advertPhase==AdvertReady){sendRepeaterAdvert(true);return;}
+  retryRepeaterAdvert();
+}
 
 const char* RepeaterMonitor::startAdminCheck(const uint8_t* sender, const char* query, bool sync) {
   if (!adminContacts.allows(sender, BotAdminContacts::Commands)) return "Not authorized";
@@ -942,10 +1136,8 @@ void RepeaterMonitor::nextEntry() {
   Reading& r = entries[active].readings[runDay % 7];
   r = Reading{}; r.day = runDay; r.timestamp = now(); r.result = Checking;
   // Persist the start before transmitting: reboot cannot repeat an already-started daily check.
-  if (!save()) { running = false; phase = Idle; return; }
-  // Reuse the repeater's existing authorization for this node when possible.
-  // Try the saved route, then flood, before starting the flood login attempts.
-  sendStatus();
+  phase=StoreStart;deadline=millis();
+  BotPathLookup::setStoragePending(true);
 }
 
 void RepeaterMonitor::sendLogin() {
@@ -994,7 +1186,13 @@ void RepeaterMonitor::finish(uint8_t result, uint16_t mv) {
   measured.millivolts = result == Ok ? mv : 0;
   measured.clockKnown = result == Ok && clockKnown;
   measured.clockOffset = clockOffset; measured.clockUncertainty = clockUncertainty;
-  if (!save()) { running = false; phase = Idle; return; }
+  storageFinishResult=result;storageFinishMv=mv;
+  phase=StoreFinish;deadline=millis();BotPathLookup::setStoragePending(true);
+}
+
+void RepeaterMonitor::completeReading() {
+  const uint8_t result=storageFinishResult;
+  const uint16_t mv=storageFinishMv;
   if (singleTarget >= 0) {
     if(adminCheckPending && !adminCheckIsSync && !adminCheckReply[0]) {
       if(result==Ok) snprintf(adminCheckReply,sizeof(adminCheckReply),"%s %u.%02uV",adminCheckName,
@@ -1006,12 +1204,16 @@ void RepeaterMonitor::finish(uint8_t result, uint16_t mv) {
   }
   else {
     phase = Next; deadline = millis() + 10000;
-    // The persisted daily-check marker also bounds this to one automatic sync per day.
-    if (automatic && timeSyncDue(entries[active], now())) startClockSync(active);
   }
 }
 
 bool RepeaterMonitor::onResponse(const ContactInfo& from, const uint8_t* data, size_t len) {
+  if(advertPhase==AdvertLogin && !elapsed(millis(),advertDeadline) &&
+      !memcmp(from.id.pub_key,advertTargetKey,32) && modernLoginOK(data,len)) {
+    if(data[6]!=1)finishRepeaterAdvert("No admin permission");
+    else {advertStamp=0;advertPhase=AdvertReady;advertDeadline=millis()+3000;}
+    return true;
+  }
   if (syncPhase == SyncLogin && syncTarget >= 0 && syncTarget < (int)count &&
       !elapsed(millis(), syncDeadline) && !memcmp(from.id.pub_key, entries[syncTarget].key, 32) && modernLoginOK(data, len)) {
     adminConfirmed[syncTarget] = data[6] == 1;
@@ -1041,14 +1243,8 @@ bool RepeaterMonitor::onResponse(const ContactInfo& from, const uint8_t* data, s
     clockKnown = loginClock(data, len, clockSentUtc, (uint32_t)(millis() - clockSentMillis), clockOffset, clockUncertainty);
     if (clockKnown) {
       Entry& e = entries[active];
-      const uint32_t previousAt = e.clockCheckedAt, previousUncertainty = e.clockUncertainty;
-      const int64_t previousOffset = e.clockOffset;
       e.clockCheckedAt = now(); e.clockOffset = clockOffset; e.clockUncertainty = clockUncertainty;
-      // Persist the login measurement independently of the subsequent battery result.
-      if (!save()) {
-        e.clockCheckedAt = previousAt; e.clockOffset = previousOffset; e.clockUncertainty = previousUncertainty;
-        running = false; phase = Idle; return true;
-      }
+      phase=StoreLogin;deadline=millis();BotPathLookup::setStoragePending(true);return true;
     }
     phase = NeedStatus; deadline = millis() + 3000; return true;
   }
@@ -1060,11 +1256,20 @@ bool RepeaterMonitor::onResponse(const ContactInfo& from, const uint8_t* data, s
 }
 
 void RepeaterMonitor::poll() {
-  if (!synced || !storageOK || syncPhase != SyncIdle) return;
+  if (!synced || !storageOK || syncPhase != SyncIdle || advertPhase != AdvertIdle) return;
   if (!running) {
     for (size_t i = 0; i < count; ++i) if (due(entries[i], now())) { startRun(true); break; }
   }
   if (!running || !elapsed(millis(), deadline)) return;
+  if(phase==StoreStart || phase==StoreFinish || phase==StoreLogin) {
+    BotPathLookup::setStoragePending(true);
+    if(!storagePhaseSaved && !save()) return;
+    storagePhaseSaved=false;BotPathLookup::setStoragePending(false);
+    if(phase==StoreStart) sendStatus();
+    else if(phase==StoreLogin) {phase=NeedStatus;deadline=millis()+3000;}
+    else completeReading();
+    return;
+  }
   switch (phase) {
     case Next: nextEntry(); break;
     case NeedStatus: sendStatus(); break;
@@ -1077,8 +1282,15 @@ void RepeaterMonitor::poll() {
 }
 
 void RepeaterMonitor::onVerifiedAdvert(const uint8_t* key, uint32_t timestamp, uint8_t pathLen) {
+  // Accept only fresh, signature-verified adverts from the requested full key.
+  // The advert can arrive before the CLI reply, including over a multi-hop route.
+  if(advertStamp && timestamp>advertBaseline && !memcmp(key,advertTargetKey,32) &&
+      (advertPhase==AdvertReply || advertPhase==AdvertObserve || advertPhase==AdvertReady)) {
+    advertHeard=true;
+    if(advertPhase==AdvertObserve)finishRepeaterAdvert("Advert heard");
+  }
   // Only direct adverts: forwarding latency is not measurable passively.
-  if (pathLen != 0 || !syncTimeReady() || !storageOK || busy() || timestamp < VALID_TIME) return;
+  if (pathLen != 0 || !syncTimeReady() || !storageOK || busy() || BotPathLookup::inProgress() || timestamp < VALID_TIME) return;
   const uint32_t utc = now();
   if (utc < VALID_TIME) return;
   for (size_t i = 0; i < count; ++i) {
@@ -1111,7 +1323,28 @@ void RepeaterMonitor::onVerifiedAdvert(const uint8_t* key, uint32_t timestamp, u
   }
 }
 
+void RepeaterMonitor::pollAutomaticClockSync() {
+  if(BotPathLookup::inProgress()) return;
+  if(!syncTimeReady() || !storageOK || !credentials.available() || busy() || adminCheckPending)return;
+  const uint32_t utc=now(),day=easternDay(utc);
+  const uint32_t local=uint32_t(int64_t(utc)+FirmwareBot::easternUtcOffsetSeconds(utc));
+  if(local%86400UL<3UL*3600+30UL*60)return;
+  if(nextAutomaticSyncPoll && !elapsed(millis(),nextAutomaticSyncPoll))return;
+  nextAutomaticSyncPoll=millis()+10000;
+  for(size_t i=0;i<count;++i) {
+    const auto& entry=entries[i];
+    if(!timeSyncDue(entry,utc) ||
+        (entry.syncAttemptAt>=VALID_TIME && easternDay(entry.syncAttemptAt)>=day) ||
+        !credentials.password(entry.key)[0] || !mesh.lookupContactByPubKey(entry.key,32))continue;
+    // startClockSync persists syncAttemptAt before transmitting. This also
+    // prevents a same-day reboot from repeating an automatic attempt.
+    startClockSync((int)i);
+    return;
+  }
+}
+
 bool RepeaterMonitor::startClockSync(int target) {
+  if(BotPathLookup::inProgress()) return false;
   if (syncPhase != SyncIdle || target < 0 || target >= (int)count) return false;
   syncTarget = target;
   if (!storageOK || !credentials.available() || !syncTimeReady() ||
@@ -1181,6 +1414,7 @@ void RepeaterMonitor::chooseSyncAction(int64_t offset) {
 }
 
 void RepeaterMonitor::pollClockSync() {
+  if(!storageOK) return;
   if (syncPhase == SyncIdle || !elapsed(millis(), syncDeadline)) return;
   if (syncPhase == SyncLogin) {
     if (syncLoginAttempt < 3) startSyncLogin();
@@ -1234,6 +1468,13 @@ void RepeaterMonitor::recordClockSample(uint32_t remoteMinute) {
 }
 
 bool RepeaterMonitor::onCommandResponse(const ContactInfo& from, const char* text) {
+  if(advertPhase==AdvertReply && !elapsed(millis(),advertDeadline) &&
+      !memcmp(from.id.pub_key,advertTargetKey,32) && !strncmp(text,advertPrefix,3)) {
+    if(strcmp(text+3,"OK - Advert sent"))finishRepeaterAdvert("Repeater did not confirm advert request");
+    else if(advertHeard)finishRepeaterAdvert("Advert heard");
+    else {advertPhase=AdvertObserve;advertDeadline=millis()+60000;}
+    return true;
+  }
   if ((syncPhase != SyncReply && syncPhase != SyncRebootWait) ||
       syncTarget < 0 || syncTarget >= (int)count || elapsed(millis(), syncDeadline) ||
       memcmp(from.id.pub_key, entries[syncTarget].key, 32) || strncmp(text, syncPrefix, 3)) return false;
@@ -1322,7 +1563,7 @@ void RepeaterMonitor::pollConnectivity() {
     else connectivity.nextProbe=ms+5000;
   }
   BotPathLookup::setInternetAvailable(connectivity.internet.state!=BotConnectivity::Lost);
-  for(auto kind : {BotConnectivity::PowerReminder,BotConnectivity::WifiReminder,BotConnectivity::InternetReminder})
+  for(auto kind : {BotConnectivity::WifiReminder,BotConnectivity::InternetReminder})
     if(connectivity.reminder(ms,kind))queueConnectivityEvent(kind);
 }
 void RepeaterMonitor::pollConnectivityNotifications() {
@@ -1340,7 +1581,13 @@ void RepeaterMonitor::pollConnectivityNotifications() {
     using namespace BotConnectivity;
     switch(event.kind) {
       case PowerLost:add("USB power lost");timestamp(event.utc);break;
-      case PowerReminder:add("USB power lost since");timestamp(event.since);break;
+      case PowerReminder: {
+        snprintf(message.lines[message.count++],BotVoltageList::LINE_SIZE,"USB power lost for %luh",
+          (unsigned long)(event.durationMs/3600000UL));
+        char since[32];connectivityTime(event.since,since,sizeof(since));
+        snprintf(message.lines[message.count++],BotVoltageList::LINE_SIZE,"since %s",since);
+        break;
+      }
       case PowerRestored:add("USB power restored");duration();break;
       case WifiLost:add("Wi-Fi disconnected");timestamp(event.utc);break;
       case WifiReminder:add("Wi-Fi disconnected since");timestamp(event.since);break;
@@ -1378,6 +1625,44 @@ void RepeaterMonitor::scheduleSunriseNotification() {
   sunriseNotificationPending = true;
 }
 
+void RepeaterMonitor::pollStartupNotification() {
+  if(!synced) {
+    if(startupNtpFailureDone || (uint32_t)(millis()-startupBootMillis)<300000UL)return;
+    if(startupNtpFailureDue && !elapsed(millis(),startupNtpFailureDue))return;
+    while(startupNtpFailureRecipient<adminContacts.count()) {
+      const auto* admin=adminContacts.at(startupNtpFailureRecipient);
+      if(!(admin->permissions & BotAdminContacts::Notifications) ||
+          !mesh.lookupContactByPubKey(admin->key,32)) {++startupNtpFailureRecipient;continue;}
+      startupNtpFailureDue=millis()+5000;
+      if(!mesh.sendStartupNotification(admin->key,"I'm up\nNTP Failed..\nretrying"))return;
+      ++startupNtpFailureRecipient;return;
+    }
+    startupNtpFailureDone=true;
+    return;
+  }
+  if(startupNotificationDone || !synced || !mesh.hasSentBotAdvert() || busy())return;
+  if(!startupNotificationReady) {
+    const uint32_t utc=now();
+    const int32_t offset=FirmwareBot::easternUtcOffsetSeconds(utc);
+    time_t local=(time_t)utc+offset;tm calendar;gmtime_r(&local,&calendar);
+    char timestamp[32];strftime(timestamp,sizeof(timestamp),"%Y-%m-%d %H:%M:%S",&calendar);
+    snprintf(startupNotification,sizeof(startupNotification),
+      "I'm up\n%s %s\nNTP Synced\nAdvert Sent",timestamp,offset==-14400 ? "EDT" : "EST");
+    startupNotificationReady=true;
+  }
+  if(startupNotificationDue && !elapsed(millis(),startupNotificationDue))return;
+  while(startupRecipient<adminContacts.count()) {
+    const auto* admin=adminContacts.at(startupRecipient);
+    if(!(admin->permissions & BotAdminContacts::Notifications) ||
+        !mesh.lookupContactByPubKey(admin->key,32)) {++startupRecipient;continue;}
+    startupNotificationDue=millis()+5000;
+    if(!mesh.sendStartupNotification(admin->key,startupNotification))return;
+    ++startupRecipient;
+    return; // One recipient at a time; shared DM ACK/retry slot prevents overlap.
+  }
+  startupNotificationDone=true;
+}
+
 void RepeaterMonitor::pollSunriseNotification() {
   if (!sunriseNotificationPending) return;
   if (elapsed(millis(), sunriseNotificationExpires)) { sunriseNotificationPending = false; return; }
@@ -1394,15 +1679,13 @@ void RepeaterMonitor::pollSunriseNotification() {
 }
 
 void RepeaterMonitor::loop() {
-  if(usbPowerDetector.due(millis())) {
-    // One ADC measurement serves continuous detection and any active CSV test.
+  if(batterySignature && elapsed(millis(),nextBatterySample)) {
+    // Battery voltage cannot establish USB presence. Sample only for an
+    // explicitly started CSV test; never latch USB loss from voltage drift.
     const uint16_t mv=mesh.sampleBatteryMillivolts();
     const uint32_t sampledAt=millis();
-    const auto event=usbPowerDetector.add(sampledAt,mv);
-    if(event==UsbPowerDetector::Calibrated || event==UsbPowerDetector::PowerRestored)
-      onUSBPowerChanged(true);
-    else if(event==UsbPowerDetector::PowerLost)onUSBPowerChanged(false);
-    if(batterySignature)batterySignature->add(sampledAt,mv,BotPathLookup::inProgress());
+    nextBatterySample=sampledAt+1000;
+    batterySignature->add(sampledAt,mv,BotPathLookup::inProgress());
   }
   bool connected = WiFi.status() == WL_CONNECTED;
   if (connected && !wasConnected) {
@@ -1430,11 +1713,16 @@ void RepeaterMonitor::loop() {
     sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
   }
   server.handleClient();
+  pollStorageRecovery();
+  restartHistory.poll(now(),synced);
   if (elapsed(millis(), nextNameCheck)) { nextNameCheck = millis() + 10000; rememberNames(); }
   if (synced && elapsed(millis(), nextPrune)) { prune(now()); nextPrune = millis() + 60000; }
+  pollRepeaterAdvert();
   pollClockSync();
+  pollAutomaticClockSync();
   poll();
   pollAdminCheckReply();
+  pollStartupNotification();
   pollSunriseNotification();
   pollConnectivity();
   pollConnectivityNotifications();

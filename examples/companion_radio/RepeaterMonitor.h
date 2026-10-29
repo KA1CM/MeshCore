@@ -10,13 +10,14 @@
 #include "BotVoltageList.h"
 #include "RepeaterOrder.h"
 #include "BatterySignature.h"
-#include "UsbPowerDetector.h"
 #include "BotConnectivity.h"
+#include "MonitorRestartHistory.h"
 class MyMesh;
 struct ContactInfo;
 
 class RepeaterMonitor {
   MyMesh& mesh;
+  MonitorRestartHistory restartHistory;
   BotConnectivity::Monitor connectivity;
   BotConnectivity::Event connectivityEvents[16];
   uint8_t connectivityHead=0,connectivityCount=0;
@@ -29,7 +30,15 @@ class RepeaterMonitor {
   void pollConnectivity();
   void queueConnectivityEvent(BotConnectivity::Kind kind);
   void pollConnectivityNotifications();
-  UsbPowerDetector usbPowerDetector;
+  bool startupNotificationReady=false, startupNotificationDone=false;
+  size_t startupRecipient=0;
+  uint32_t startupNotificationDue=0;
+  char startupNotification[144]{};
+  void pollStartupNotification();
+  bool startupNtpFailureDone=false;
+  size_t startupNtpFailureRecipient=0;
+  uint32_t startupBootMillis=0,startupNtpFailureDue=0;
+  uint32_t nextBatterySample=0;
   std::unique_ptr<BatterySignature> batterySignature;
   MonitorCredentials credentials;
   BotAdminContacts adminContacts;
@@ -60,9 +69,21 @@ class RepeaterMonitor {
   void chooseSyncAction(int64_t offset);
   char syncPrefix[4]{};
   String syncResult;
-  bool busy() const { return running || syncPhase != SyncIdle; }
+  enum AdvertPhase { AdvertIdle, AdvertLogin, AdvertReady, AdvertReply, AdvertObserve, AdvertResult } advertPhase=AdvertIdle;
+  uint8_t advertTargetKey[32]{}, advertAdminKey[32]{};
+  char advertTargetName[33]{}, advertPrefix[4]{}, advertResult[96]{};
+  uint32_t advertDeadline=0,advertStamp=0,advertBaseline=0;
+  uint8_t advertPreFlood=0,advertLogins=0,advertPostAttempts=0;
+  bool advertHeard=false;
+  void finishRepeaterAdvert(const char* result);
+  void sendRepeaterAdvert(bool flood);
+  void retryRepeaterAdvert();
+  void pollRepeaterAdvert();
+  bool busy() const { return running || syncPhase != SyncIdle || advertPhase != AdvertIdle; }
   bool syncTimeReady() const { return synced && (uint32_t)(millis() - lastNtpSync) < 21600000UL; }
   void pollClockSync();
+  void pollAutomaticClockSync();
+  uint32_t nextAutomaticSyncPoll=0;
   void finishClockSync(const char* result);
 
   MonitorWebServer server{80};
@@ -74,7 +95,21 @@ class RepeaterMonitor {
   bool mdnsStarted = false, wasConnected = false;
   int active = -1;
   int singleTarget = -1;
-  enum Phase { Idle, Next, Login, Status, NeedStatus, Retry, RetryFloodStatus } phase = Idle;
+  enum Phase { Idle, Next, Login, Status, NeedStatus, Retry, RetryFloodStatus,
+               StoreStart, StoreFinish, StoreLogin } phase = Idle;
+  bool storageRetryPending=false,storagePhaseSaved=false,storageSaveDeferred=false;
+  uint8_t storageFinishResult=MonitorCore::Empty;
+  uint16_t storageFinishMv=0;
+  uint8_t storageRetryCount=0;
+  uint32_t storageRetryDue=0,storageNoticeDue=0,storageNoticeExpires=0;
+  size_t storageNoticeRecipient=0;
+  bool storageNoticePending=false;
+  char storageFailure[80]{},storageNotice[144]{};
+  const char* storageReadError="snapshot read failed";
+  bool storageFailed(const char* stage);
+  void pollStorageRecovery();
+  void queueStorageNotice(const char* text);
+  void completeReading();
   uint32_t clockSentUtc = 0, clockSentMillis = 0, clockUncertainty = 0;
   int64_t clockOffset = 0;
   bool clockKnown = false;
@@ -96,7 +131,7 @@ class RepeaterMonitor {
   void exportState(JsonDocument& doc, bool history, bool ordered = true);
   bool importState(JsonDocument& doc, bool history);
   bool readSlot(int slot, JsonDocument& doc, uint32_t& seq);
-  bool save();
+  bool save(bool retry=false);
   void load();
   void rememberNames();
   uint32_t nextNameCheck = 0;
@@ -118,6 +153,7 @@ public:
   const char* adminNotes(const uint8_t* sender, const char* args, BotVoltageList::Snapshot& out);
   const char* adminEditRepeater(const uint8_t* sender, const char* action, const char* query);
   const char* startAdminCheck(const uint8_t* sender, const char* query, bool sync = false);
+  const char* startAdminAdvert(const uint8_t* sender, const char* query);
   void onUSBPowerChanged(bool present);
   bool clockReady() const { return synced; }
   const BotAdminContacts& botAdmins() const { return adminContacts; }
