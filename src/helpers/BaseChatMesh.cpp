@@ -431,6 +431,7 @@ int  BaseChatMesh::sendMessage(const ContactInfo& recipient, uint32_t timestamp,
   mesh::Packet* pkt = composeMsgPacket(recipient, timestamp, attempt, text, expected_ack);
   if (pkt == NULL) return MSG_SEND_FAILED;
 
+  onMessageQueued(pkt,expected_ack);
   uint32_t t = _radio->getEstAirtimeFor(pkt->getRawLength());
 
   int rc;

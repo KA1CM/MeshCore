@@ -3,6 +3,14 @@
 #include <strings.h>
 
 namespace BotFairfieldHelp {
+constexpr char listReply[]=
+  "The complete list of repeaters forwarding ct-ffc packets can be found here http://tiny.cc/ffclist";
+constexpr char listHelp[]=
+  "list: complete list link.\n"
+  "list all: hashes heard in 30 days.\n"
+  "list <name>: matching repeater names.";
+static_assert(sizeof(listReply)-1<=BOT_MAX_GROUP_RESPONSE_LEN,"Fairfield list link must fit one message");
+static_assert(sizeof(listHelp)-1<=BOT_MAX_GROUP_RESPONSE_LEN,"Fairfield list help must fit one message");
 constexpr char commands[]=
   "ct-ffc commands:\n"
   "help cmd hello about version time status stats users air ping test path snr channels lora id neighbors list";
@@ -15,9 +23,9 @@ inline const char* reply(const BotCommand& command) {
   if(command.id!=BOT_COMMAND_HELP) return nullptr;
   if(!command.args_len) return commands;
   if(!strcasecmp(command.args,"list"))
-    return "list: all ct-ffc repeaters hashes heard in 30 days.\n"
-      "list <name>: matching repeater names.\n"
-      "use path<hash> to resolve name.";
+    return listHelp;
+  if(!strcasecmp(command.args,"list all"))
+    return "list all: all ct-ffc repeater hashes observed in the last 30 days, sent in paced messages.";
   if(!strcasecmp(command.args,"list low"))
     return "list <name>: matching known ct-ffc repeater names from the last 30 days. Example: list gbarc";
   if(!strcasecmp(command.args,"ping"))

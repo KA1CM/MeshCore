@@ -45,6 +45,7 @@ public:
     else {list.data.savedDay=previous;error=snapshots.lastError();}
   }
   bool available() const {return ready;}
+  uint32_t savedDay() const {return lastDailyDay;}
   const char* lastError() const {return error;}
   bool saveNow(uint32_t day) {
     begin();if(!ready)return false;
@@ -55,6 +56,26 @@ public:
     if(!success){list.data.savedDay=previous;error=snapshots.lastError();}
     else error="";
     return success;
+  }
+  bool removeNow(const uint8_t hash[2],uint32_t day) {
+    begin();if(!ready)return false;
+    if(!day){error="NTP not confirmed";return false;}
+    auto& saved=list.data;
+    size_t index=0;
+    while(index<saved.count && (saved.entries[index].hash[0]!=hash[0] || saved.entries[index].hash[1]!=hash[1]))++index;
+    if(index==saved.count){error="Hash not found";return false;}
+    const auto removed=saved.entries[index];
+    const uint32_t previousDay=saved.savedDay;
+    for(size_t i=index+1;i<saved.count;++i)saved.entries[i-1]=saved.entries[i];
+    --saved.count;saved.entries[saved.count]=BotScopedRepeaters::Entry{};
+    saved.savedDay=day;
+    if(!snapshots.save(&saved,sizeof(saved))) {
+      // Restore the in-memory list if the verified persistent save failed.
+      for(size_t i=saved.count;i>index;--i)saved.entries[i]=saved.entries[i-1];
+      saved.entries[index]=removed;++saved.count;saved.savedDay=previousDay;
+      error=snapshots.lastError();return false;
+    }
+    error="";return true;
   }
   const BotScopedRepeaters::Store& entries() const {return list.data;}
 };

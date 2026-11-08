@@ -12,6 +12,7 @@ inline const char* fixedName(const uint8_t* hash, size_t width) {
 }
 struct Route {
   bool all = false;
+  bool unavailable = false;
   uint8_t bytes[BOT_MAX_PATH_BYTES]{};
   uint8_t width = 0, count = 0;
   char names[BOT_MAX_PATH_BYTES][33]{};
@@ -31,6 +32,7 @@ inline BotCommandResult format(const Route& route, const char* target, char* out
 inline BotCommandResult formatAll(const Route& route, const char* target, size_t first,
                                   size_t& next, char* out, size_t capacity) {
   next=first;
+  if(route.unavailable){next=0;return format(route,target,out,capacity);}
   if (!out || !capacity || !route.width || route.width>4 ||
       route.count*route.width>BOT_MAX_PATH_BYTES || (route.count && first>=route.count))
     return {BOT_COMMAND_RESULT_NO_SPACE,0};
@@ -90,6 +92,12 @@ inline BotCommandResult formatAll(const Route& route, const char* target, size_t
 inline BotCommandResult format(const Route& route, const char* target, char* out, size_t capacity) {
   if (!out || !capacity) return {BOT_COMMAND_RESULT_NO_SPACE,0};
   out[0]=0;
+  if(route.unavailable) {
+    const int length=snprintf(out,capacity,"%s%s%sInbound route unavailable for a directly routed DM.",
+      target && *target ? "@[" : "",target && *target ? target : "",target && *target ? "]\n" : "");
+    if(length<0 || size_t(length)>=capacity){out[0]=0;return {BOT_COMMAND_RESULT_NO_SPACE,0};}
+    return {BOT_COMMAND_RESULT_OK,size_t(length)};
+  }
   if (!route.width || route.width>4 || route.count*route.width>BOT_MAX_PATH_BYTES)
     return {BOT_COMMAND_RESULT_NO_SPACE,0};
   if(route.width==1 && route.count) {

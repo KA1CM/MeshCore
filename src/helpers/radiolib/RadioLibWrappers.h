@@ -12,6 +12,9 @@ protected:
   uint16_t _num_floor_samples;
   int32_t _floor_sample_sum;
   uint8_t _preamble_sf;
+  uint32_t tx_unexpected_irqs=0, tx_last_unexpected_irq=0;
+  bool tx_unexpected_reported=false;
+  virtual bool hasTransmitDone() { return true; } // Legacy wrappers retain their IRQ handling.
 
   void idle();
   void startRecv();
@@ -56,6 +59,8 @@ public:
   uint32_t getPacketsRecv() const { return n_recv; }
   uint32_t getPacketsRecvErrors() const { return n_recv_errors; }
   uint32_t getPacketsSent() const { return n_sent; }
+  uint32_t getUnexpectedTxIrqs() const { return tx_unexpected_irqs; }
+  uint32_t getLastUnexpectedTxIrq() const { return tx_last_unexpected_irq; }
   void resetStats() { n_recv = n_sent = n_recv_errors = 0; }
 
   virtual float getLastRSSI() const override;

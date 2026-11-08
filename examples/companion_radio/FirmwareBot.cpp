@@ -296,7 +296,7 @@ bool parseCommand(const char* text, size_t text_len, BotCommand* command, bool a
   const BotCommandMetadata* metadata = name_len > BOT_MAX_COMMAND_NAME_LEN ? NULL : BotCommandRegistry::findByName(command->name, copy_name_len);
   command->id = metadata ? metadata->id : BOT_COMMAND_UNKNOWN;
   if (!has_prefix && (!metadata || (metadata->visibility != BOT_COMMAND_VISIBILITY_DISCOVERABLE &&
-                                   metadata->id != BOT_COMMAND_ADVERT && metadata->id != BOT_COMMAND_CHECK && metadata->id != BOT_COMMAND_SYNC && metadata->id != BOT_COMMAND_ADD && metadata->id != BOT_COMMAND_REMOVE && metadata->id != BOT_COMMAND_ENABLE && metadata->id != BOT_COMMAND_DISABLE && metadata->id != BOT_COMMAND_NOTES && metadata->id != BOT_COMMAND_PASSWORD && metadata->id != BOT_COMMAND_SAVE))) return false;
+                                   metadata->id != BOT_COMMAND_ADVERT && metadata->id != BOT_COMMAND_CHECK && metadata->id != BOT_COMMAND_SYNC && metadata->id != BOT_COMMAND_ADD && metadata->id != BOT_COMMAND_REMOVE && metadata->id != BOT_COMMAND_ENABLE && metadata->id != BOT_COMMAND_DISABLE && metadata->id != BOT_COMMAND_NOTES && metadata->id != BOT_COMMAND_PASSWORD && metadata->id != BOT_COMMAND_SAVE && metadata->id != BOT_COMMAND_MOON))) return false;
 
   while (pos < normalized_len && isCommandDelimiter(normalized[pos])) pos++;
   // Notes and passwords are copied verbatim from the original DM.
@@ -319,6 +319,50 @@ bool parseCommand(const char* text, size_t text_len, BotCommand* command, bool a
   command->args_len = args_len;
 
   return true;
+}
+
+bool hasBotMention(const char* text,size_t text_len,const char* bot_name) {
+  if(!text || !bot_name || !*bot_name)return false;
+  const size_t length=strlen(bot_name);
+  if(length+3>text_len)return false;
+  for(size_t i=0;i<=text_len-length-3;++i)
+    if(text[i]=='@' && text[i+1]=='[' && !memcmp(text+i+2,bot_name,length) && text[i+length+2]==']')return true;
+  return false;
+}
+
+bool parseAddressedCommand(const char* text,size_t text_len,const char* bot_name,
+                           BotCommand* command,bool allow_prefixless) {
+  if(!text || !bot_name || !*bot_name || text_len>BOT_MAX_TEXT_LEN)
+    return parseCommand(text,text_len,command,allow_prefixless);
+  const size_t name_len=strlen(bot_name),mention_len=name_len+3;
+  auto matches=[&](size_t pos) {
+    return pos+mention_len<=text_len && text[pos]=='@' && text[pos+1]=='[' &&
+      !memcmp(text+pos+2,bot_name,name_len) && text[pos+mention_len-1]==']';
+  };
+  char cleaned[BOT_MAX_TEXT_LEN+1];size_t used=0;bool mentioned=false;
+  for(size_t i=0;i<text_len;) {
+    if(matches(i)) {cleaned[used++]=' ';i+=mention_len;mentioned=true;}
+    else cleaned[used++]=text[i++];
+  }
+  cleaned[used]=0;
+  if(!mentioned)return parseCommand(text,text_len,command,allow_prefixless);
+  auto known=[&](const char* candidate,size_t length) {
+    return parseCommand(candidate,length,command,allow_prefixless) &&
+      command->id!=BOT_COMMAND_UNKNOWN && command->id!=BOT_COMMAND_NONE &&
+      command->id!=BOT_COMMAND_UNSUPPORTED;
+  };
+  // Covers commands before or after a mention: "path all @[name]" and
+  // "@[name] path all", without passing the mention as a command argument.
+  if(known(cleaned,used))return true;
+  // A mention may occur mid-sentence; the command must immediately follow it.
+  for(size_t i=0;i+mention_len<=text_len;++i) {
+    if(!matches(i))continue;
+    size_t after=i+mention_len;
+    while(after<text_len && (isSpaceByte(text[after]) || text[after]==':' || text[after]==','))++after;
+    if(known(text+after,text_len-after))return true;
+    i+=mention_len-1;
+  }
+  return false;
 }
 
 bool splitChannelText(const char* text, size_t text_len, char* sender, size_t sender_len, const char** body,

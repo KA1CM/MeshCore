@@ -373,6 +373,7 @@ namespace BotCommands {
 bool pathRoute(const BotCommand& command, const BotCommandContext& context, BotPath::Route& route) {
   // Reset in place: an aggregate temporary adds over 2 KB to the radio stack.
   route.all=false;
+  route.unavailable=false;
   route.width=route.count=0;
   memset(route.bytes,0,sizeof(route.bytes));
   memset(route.names,0,sizeof(route.names));
@@ -459,8 +460,9 @@ BotCommandResult executeCommand(const BotCommand& command, const BotCommandConte
     }
     case BOT_COMMAND_ABOUT:
       return writeText(output, output_len,
-                       "I'm a Heltec V4 running modified Colorado Mesh Bot firmware.\n"
-                       "Located near Trumbull Mall, CT [FN31jf] [06606]");
+                       "I'm a Heltec V4 running custom Colorado Mesh Bot firmware.\n"
+                       "Located near Trumbull Mall, CT [FN31jf] [06606]\n"
+                       "http://tiny.cc/ffbot");
     case BOT_COMMAND_STATUS: {
       char up_str[20];
       formatUptime(context.uptime_seconds, up_str, sizeof(up_str));

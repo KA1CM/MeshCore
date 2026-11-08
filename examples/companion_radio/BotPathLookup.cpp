@@ -1,7 +1,6 @@
 #include "BotInternetProbe.h"
 #include "BotPathLookup.h"
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
-#include "BotPathTrust.h"
 #include "BotPathLookupResult.h"
 #include "BotLookupBody.h"
 #include "BotSnapshotFile.h"
@@ -9,8 +8,7 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include <mbedtls/platform.h>
+#include <WiFiClient.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
@@ -26,19 +24,22 @@ Status lastStatus;
 HistoryEntry lookupHistory[30];
 size_t historyNext=0, historyCount=0;
 int historyActive=-1;
-uint32_t tlsPsramAllocations=0; // Worker-owned; copied into Status at lookup stages.
 uint32_t internalFree() { return heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT); }
 uint32_t internalBlock() { return heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT); }
-void beginHistory(const char* requester, const char* channel="") {
+uint32_t historySequence=0;
+uint32_t beginHistory(const char* requester, const char* channel="") {
   const uint32_t utc=(uint32_t)time(nullptr), ticks=millis(), heap=internalFree(), block=internalBlock();
   portENTER_CRITICAL(&statusMux);
   historyActive=(int)historyNext;
   auto& entry=lookupHistory[historyNext];entry=HistoryEntry{};
+  if(!++historySequence)++historySequence;
+  const uint32_t id=entry.id=historySequence;
   snprintf(entry.requester,sizeof(entry.requester),"%s",requester && *requester ? requester : "Unknown user");
   snprintf(entry.channel,sizeof(entry.channel),"%s",channel && *channel ? channel : "Unknown channel");
   entry.timestamp=utc;entry.startedMillis=ticks;entry.minHeap=heap;entry.minBlock=block;
   historyNext=(historyNext+1)%30;if(historyCount<30)++historyCount;
   portEXIT_CRITICAL(&statusMux);
+  return id;
 }
 void finishHistory() {
   const uint32_t ticks=millis();
@@ -46,25 +47,21 @@ void finishHistory() {
   if(historyActive>=0){auto& e=lookupHistory[historyActive];e.finished=true;e.elapsedMs=ticks-e.startedMillis;historyActive=-1;}
   portEXIT_CRITICAL(&statusMux);
 }
-void report(const char* stage,int detail=0,bool failure=false,uint32_t verifyFlags=0) {
+void report(const char* stage,int detail=0,bool failure=false) {
   Status next; next.stage=stage; next.detail=detail;
   if(failure) {
     next.failureUtc=(uint32_t)time(nullptr);
-    next.verifyFlags=verifyFlags;
-    if(verifyFlags) mbedtls_x509_crt_verify_info(next.verifyInfo,sizeof(next.verifyInfo),"",verifyFlags);
   }
   next.freeHeap=internalFree(); next.largestBlock=internalBlock();
   next.psramFree=heap_caps_get_free_size(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
   next.psramBlock=heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
-  next.tlsPsramAllocations=tlsPsramAllocations;
   portENTER_CRITICAL(&statusMux);
   next.lastFailure=failure ? stage : lastStatus.lastFailure;
   next.lastFailureDetail=failure ? detail : lastStatus.lastFailureDetail;
   next.failureHeap=failure ? next.freeHeap : lastStatus.failureHeap;
   next.failureBlock=failure ? next.largestBlock : lastStatus.failureBlock;
   if(!failure) {
-    next.failureUtc=lastStatus.failureUtc; next.verifyFlags=lastStatus.verifyFlags;
-    memcpy(next.verifyInfo,lastStatus.verifyInfo,sizeof(next.verifyInfo));
+    next.failureUtc=lastStatus.failureUtc;
   }
   if(historyActive>=0) {
     auto& e=lookupHistory[historyActive];e.stage=stage;e.detail=detail;e.elapsedMs=millis()-e.startedMillis;
@@ -76,10 +73,10 @@ void report(const char* stage,int detail=0,bool failure=false,uint32_t verifyFla
   portEXIT_CRITICAL(&statusMux);
 }
 // Resolve in the worker with the socket API, avoiding WiFi.hostByName's shared
-// event-bit/callback state. Preserve the original host for SNI and certificate
-// verification when connecting to the resolved address. No DNS settings change.
-class LookupClient : public WiFiClientSecure {
+// event-bit/callback state. No DNS settings change.
+class LookupClient : public WiFiClient {
 public:
+  using WiFiClient::connect;
   bool connectionFailed=false;
   int connect(const char* host,uint16_t port,int32_t timeout) override {
     connectionFailed=false;
@@ -95,34 +92,12 @@ public:
     const auto* address=reinterpret_cast<const struct sockaddr_in*>(addresses->ai_addr);
     const IPAddress ip(address->sin_addr.s_addr);
     freeaddrinfo(addresses);
-    _timeout=timeout;
-    report("Connecting with verified TLS");
+    report("Connecting with HTTP");
     errno=0;
-    // Mirror the pinned Arduino secure-client connect, but record verification
-    // flags before stop() frees the TLS context. Verification remains required.
-    const uint32_t connectStarted=millis();
-    const int result=start_ssl_client(sslclient,ip,port,host,_timeout,_CA_cert,
-      _use_ca_bundle,_cert,_private_key,nullptr,nullptr,_use_insecure,_alpn_protos);
-    _lastError=result;
-    const int connected=result>=0;
+    const int connected=WiFiClient::connect(ip,port,timeout);
     if(!connected) {
-      const int socketError=errno;
-      const uint32_t flags=result==MBEDTLS_ERR_X509_CERT_VERIFY_FAILED ?
-        mbedtls_ssl_get_verify_result(&sslclient->ssl_ctx) : 0;
-      // The pinned SDK frees/closes the socket on TCP connect failure. A -1
-      // with a live TLS context after the configured deadline is its handshake timeout.
-      const uint32_t elapsed=millis()-connectStarted;
-      const bool handshakeTimeout=result==-1 && sslclient->socket>=0 &&
-        sslclient->ssl_ctx.state!=MBEDTLS_SSL_HELLO_REQUEST &&
-        elapsed>=sslclient->handshake_timeout;
-      report(handshakeTimeout ? "TLS handshake timed out (milliseconds)" :
-             result==MBEDTLS_ERR_SSL_ALLOC_FAILED ? "TLS allocation failed" :
-             result==MBEDTLS_ERR_X509_CERT_VERIFY_FAILED ? "TLS certificate verification failed" :
-             result < -1 ? "TLS handshake failed" : "TCP connection failed",
-             handshakeTimeout ? (int)elapsed : result < -1 ? result : socketError,true,flags);
-      stop();
-      connectionFailed=true;
-    } else _connected=true;
+      report("TCP connection failed",errno,true); connectionFailed=true;
+    }
     return connected;
   }
 };
@@ -147,8 +122,8 @@ struct Cached {
   bool ambiguous=false;
 };
 constexpr size_t CacheCapacity=128;
-constexpr uint32_t PositiveCacheSeconds=100UL*60*60;
-Cached* cache=nullptr; // Allocated once, preferably outside TLS's internal heap.
+constexpr uint32_t CacheSeconds=100UL*60*60;
+Cached* cache=nullptr; // Allocated once, preferably in PSRAM.
 static_assert(sizeof(Cached)*CacheCapacity<=16384,"Bound lookup name cache memory");
 bool ensureCache() {
   if(cache) return true;
@@ -179,32 +154,7 @@ bool throttled=false, busy=false;
 bool historyStoragePending=false; // Main loop only; existing worker may finish.
 QueueHandle_t requests=nullptr, completed=nullptr;
 TaskHandle_t workerTask=nullptr;
-#if defined(CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC) && defined(MBEDTLS_PLATFORM_MEMORY) && \
-    !defined(MBEDTLS_PLATFORM_CALLOC_MACRO) && !defined(MBEDTLS_PLATFORM_FREE_MACRO)
-// Install once before TLS starts; never swap global allocators around a request.
-// Only this worker's large TLS allocations prefer PSRAM. Everything else keeps
-// the pinned SDK's internal-RAM allocation policy and compatible heap free.
-void* tlsCalloc(size_t count,size_t size) {
-  if(size && count>SIZE_MAX/size) return nullptr;
-  if(workerTask && xTaskGetCurrentTaskHandle()==workerTask && count*size>=16384) {
-    if(void* memory=heap_caps_calloc(count,size,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT)) {
-      ++tlsPsramAllocations;
-      return memory;
-    }
-  }
-  return heap_caps_calloc(count,size,MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
-}
-void tlsFree(void* memory) { heap_caps_free(memory); }
-bool installTlsAllocator() {
-  static bool installed=false;
-  if(!installed) installed=mbedtls_platform_set_calloc_free(tlsCalloc,tlsFree)==0;
-  return installed;
-}
-#else
-bool installTlsAllocator() { return true; } // Preserve other SDK configurations.
-#endif
-// Reserve the worker's internal stack at startup instead of carving a new
-// 12 KB block out of the heap for every TLS request.
+// Keep the existing bounded worker stack; no per-request stack allocation.
 constexpr size_t WorkerStackBytes=12288;
 alignas(16) StackType_t workerStack[WorkerStackBytes/sizeof(StackType_t)];
 static_assert(sizeof(workerStack)==WorkerStackBytes,"Lookup stack must remain 12 KB");
@@ -216,7 +166,7 @@ void resolve(BotPath::Route* route) {
   bool missing[BOT_MAX_PATH_BYTES]{};
   String hops;
   // Cached identities are cheap and apply to the entire route. Only new
-  // internet requests retain the ordinary PATH first-five-hop restriction.
+  // Internet requests retain the ordinary PATH first-ten-hop restriction.
   for(size_t i=0;i<route->count;++i) {
     if(route->names[i][0] || route->ambiguous[i]) continue;
     char prefix[9]; BotPath::hash(*route,i,prefix);
@@ -254,25 +204,22 @@ void resolve(BotPath::Route* route) {
   }
   if(!internetPolicySnapshot().available){report("Internet unavailable; using local/cached names");return;}
   if(WiFi.status()!=WL_CONNECTED) { report("Wi-Fi disconnected",0,true); return; }
-  if(time(nullptr)<=1700000000) { report("System clock not ready for HTTPS",0,true); return; }
+  if(time(nullptr)<=1700000000) { report("System clock not ready for lookup",0,true); return; }
   // No radio, contact, or dashboard state is touched from this task.
   if(hops.length() && (!throttled || !future(nextFetch)) &&
      WiFi.status()==WL_CONNECTED && time(nullptr)>1700000000) {
     throttled=true; nextFetch=millis()+60000; // Failure backoff.
     LookupClient client;
-    client.setCACert(BOT_PATH_ROOT_CA);
-    client.setHandshakeTimeout(15);
     HTTPClient http;
     http.setConnectTimeout(4000); http.setTimeout(4000);
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
     http.useHTTP10(true); // The analyzer may close-delimit the body (no length header).
-    const String url=String("https://analyzer.ctmesh.org/api/resolve-hops?hops=")+hops;
+    const String url=String("http://analyzer.ctmesh.org/api/resolve-hops?hops=")+hops;
     report("Connecting to analyzer");
     if(http.begin(client,url)) {
       const int status=http.GET();
       if(status<0 && !client.connectionFailed) {
-        char tlsMessage[160]{};
-        const int tlsError=client.lastError(tlsMessage,sizeof(tlsMessage));
-        report(tlsError ? "TLS connection failed" : "HTTP connection failed",tlsError ? tlsError : status,true);
+        report("HTTP connection failed",status,true);
       } else if(status>=0) report("Analyzer HTTP response",status,status!=200);
       const int length=http.getSize();
       if(Body::accepts(status,length)) {
@@ -300,11 +247,11 @@ void resolve(BotPath::Route* route) {
               // background requests for a prefix absent from the analyzer.
               readEntry(entry,prefix,result.name,result.ambiguous,true,sizeof(result.name));
               // Refuse the analyzer's heuristic best pick for colliding prefixes.
-              // Keep resolved names for 100 hours; retry missing/ambiguous
-              // identities after 15 minutes so new analyzer data can be found.
+              // Keep resolved, missing and ambiguous results for 100 hours.
+              // Only resolved names are saved across restarts.
               const bool positive=result.name[0] && !result.ambiguous;
-              result.expires=millis()+(positive ? PositiveCacheSeconds*1000 : 900000UL);
-              result.expiresUtc=positive ? (uint32_t)time(nullptr)+PositiveCacheSeconds : 0;
+              result.expires=millis()+CacheSeconds*1000UL;
+              result.expiresUtc=positive ? (uint32_t)time(nullptr)+CacheSeconds : 0;
               cache[nextCache++%CacheCapacity]=result;
               BotPath::shortName(result.name,route->names[i]); route->ambiguous[i]=result.ambiguous;
               if(result.name[0]) ++matched;
@@ -315,7 +262,7 @@ void resolve(BotPath::Route* route) {
       }
       if(status==200 && !Body::accepts(status,length)) report("Response size rejected",length,true);
       http.end();
-    } else report("Could not initialize HTTPS",0,true);
+    } else report("Could not initialize HTTP",0,true);
   }
 }
 void worker(void*) {
@@ -349,7 +296,7 @@ bool restoreNameCache(uint32_t utc) {
     if(!valid) break;
     const size_t length=strlen(entry.prefix);
     valid=(length==4 || length==6) && entry.expiresUtc>saved->savedUtc &&
-      entry.expiresUtc-saved->savedUtc<=PositiveCacheSeconds;
+      entry.expiresUtc-saved->savedUtc<=CacheSeconds;
     for(size_t k=0;valid && k<length;++k)
       valid=(entry.prefix[k]>='0' && entry.prefix[k]<='9') || (entry.prefix[k]>='a' && entry.prefix[k]<='f');
     for(size_t k=0;valid && entry.name[k];++k) valid=(uint8_t)entry.name[k]>=32 && entry.name[k]!=127;
@@ -379,7 +326,7 @@ bool writeNameCache(uint32_t utc,uint32_t dailyDay) {
   for(size_t i=0;i<CacheCapacity;++i) {
     const auto& item=cache[i];
     if(!item.name[0] || item.ambiguous || !future(item.expires) || item.expiresUtc<=utc ||
-       item.expiresUtc-utc>PositiveCacheSeconds) continue;
+       item.expiresUtc-utc>CacheSeconds) continue;
     // A route may contain the same prefix more than once. Persist one copy,
     // retaining the freshest expiry rather than rejecting it after restart.
     size_t slot=0;
@@ -413,18 +360,13 @@ bool saveNameCacheNow(uint32_t utc) {
 }
 const char* nameCacheSaveError() { return cacheSaveError; }
 uint32_t nameCacheLastSavedUtc() { return cacheLastSaveUtc; }
+uint32_t nameCacheSavedDay() { return cacheDailyDay; }
 bool begin() {
   if(workerTask) return true;
-  if(!installTlsAllocator()) { report("Cannot initialize TLS allocator",0,true); return false; }
   if(!requests) requests=xQueueCreateStatic(1,sizeof(BotPath::Route*),requestsStorage,&requestsControl);
   if(!completed) completed=xQueueCreateStatic(1,sizeof(BotPath::Route*),completedStorage,&completedControl);
   if(!requests || !completed) { report("Cannot initialize lookup queues",0,true); return false; }
-  // ESP-IDF's task API specifies stack depth in bytes, unlike vanilla FreeRTOS.
-  // A TLS key-exchange step can spend seconds in crypto without blocking.
-  // Keep it off the Wi-Fi core (whose idle task is watchdog-monitored).
-  // Use normal priority: idle priority can starve behind loopTask long enough
-  // for the peer to close the TLS handshake. Equal priority shares CPU time
-  // with loopTask through the pinned SDK's preemptive scheduler.
+  // ESP-IDF specifies stack depth in bytes. Keep network work off the radio loop.
   workerTask=xTaskCreateStaticPinnedToCore(worker,"pathLookup",WorkerStackBytes,nullptr,
     tskIDLE_PRIORITY+1,workerStack,&workerControl,ARDUINO_RUNNING_CORE);
   if(!workerTask) { report("Cannot initialize lookup task",0,true); return false; }
@@ -443,16 +385,47 @@ Status status() {
   portENTER_CRITICAL(&statusMux); Status result=lastStatus; portEXIT_CRITICAL(&statusMux);
   return result;
 }
-void recordEvent(const char* requester, const char* outcome, const char* channel) {
+uint32_t recordEvent(const char* requester, const char* outcome, const char* channel, const char* reply) {
   const uint32_t utc=(uint32_t)time(nullptr), heap=internalFree(), block=internalBlock();
   portENTER_CRITICAL(&statusMux);
   // An active entry can age out after 30 newer events; never update its reused slot.
   if(historyActive==(int)historyNext)historyActive=-1;
   auto& e=lookupHistory[historyNext];e=HistoryEntry{};
+  if(!++historySequence)++historySequence;
+  const uint32_t id=e.id=historySequence;
   snprintf(e.requester,sizeof(e.requester),"%s",requester && *requester ? requester : "Unknown user");
   snprintf(e.channel,sizeof(e.channel),"%s",channel && *channel ? channel : "Unknown channel");
-  e.timestamp=utc;e.stage=outcome;e.finished=true;e.minHeap=heap;e.minBlock=block;
+  e.timestamp=utc;e.stage=outcome;e.reply=reply;e.finished=true;e.minHeap=heap;e.minBlock=block;
   historyNext=(historyNext+1)%30;if(historyCount<30)++historyCount;
+  portEXIT_CRITICAL(&statusMux);
+  return id;
+}
+void recordCommand(uint32_t id,BotCommandId command) {
+  portENTER_CRITICAL(&statusMux);
+  for(auto& e:lookupHistory)if(id && e.id==id){e.command=command;break;}
+  portEXIT_CRITICAL(&statusMux);
+}
+void recordCommandStage(uint32_t id,const char* stage) {
+  portENTER_CRITICAL(&statusMux);
+  for(auto& e:lookupHistory)if(id && e.id==id){e.stage=stage;break;}
+  portEXIT_CRITICAL(&statusMux);
+}
+void recordDelivery(uint32_t historyId,unsigned event,bool notice) {
+  if(!historyId)return;
+  portENTER_CRITICAL(&statusMux);
+  for(auto& e:lookupHistory)if(e.id==historyId) {
+    if(event==0)++e.queued;
+    else if(event==1)++e.transmitted;
+    else if(event==2)++e.repeated;
+    else if(event==3)++e.txFailed;
+    const bool path=e.command==BOT_COMMAND_PATH;
+    if(e.txFailed)e.reply=notice ? "Unscoped notice TX failed" : (path ? "Path reply TX failed" : "Reply TX failed");
+    else if(e.repeated && e.repeated==e.queued)e.reply=notice ? "Unscoped notice repeated" : (path ? "Path reply repeated" : "Reply repeated");
+    else if(e.repeated)e.reply=(path ? "Path reply partially repeated" : "Reply partially repeated");
+    else if(e.transmitted && e.transmitted==e.queued)e.reply=notice ? "Unscoped notice transmitted" : (path ? "Path reply transmitted" : "Reply transmitted");
+    else e.reply=notice ? "Unscoped notice queued" : (path ? "Path reply queued" : "Reply queued");
+    break;
+  }
   portEXIT_CRITICAL(&statusMux);
 }
 bool history(size_t index, HistoryEntry& entry) {
@@ -461,10 +434,39 @@ bool history(size_t index, HistoryEntry& entry) {
   if(found)entry=lookupHistory[(historyNext+29-index)%30];
   portEXIT_CRITICAL(&statusMux);return found;
 }
-bool start(const BotPath::Route& route, const char* requester, const char* channel) {
+void recordDmRequest(uint32_t id,const uint8_t* key,uint32_t timestamp,bool retry,bool inbound) {
+  portENTER_CRITICAL(&statusMux);
+  for(auto& e:lookupHistory)if(id && e.id==id) {
+    for(size_t i=0;i<8;++i)snprintf(e.dmSenderKey+i*2,3,"%02x",key[i]);
+    e.dmTimestamp=timestamp;e.dmRetry=retry;e.dmInbound=inbound;break;
+  }
+  portEXIT_CRITICAL(&statusMux);
+}
+void recordReply(uint32_t historyId,const char* outcome) {
+  if(!historyId)return;
+  portENTER_CRITICAL(&statusMux);
+  for(auto& entry:lookupHistory)if(entry.id==historyId){
+    if(entry.command!=BOT_COMMAND_PATH && !strncmp(outcome,"Path reply",10)) {
+      struct Label{const char* path;const char* generic;};
+      static const Label labels[]={
+        {"Path reply queued","Reply queued"},{"Path reply transmitted","Reply transmitted"},
+        {"Path reply acknowledged","Reply acknowledged"},{"Path reply TX failed","Reply TX failed"},
+        {"Path reply ACK timed out","Reply ACK timed out"},{"Path reply queued; tracking full","Reply queued; tracking full"},
+        {"Path reply retry failed: DM contact missing","Reply retry failed: DM contact missing"},
+        {"Path reply retry rejected by send queue","Reply retry rejected by send queue"}};
+      for(const auto& label:labels)if(!strcmp(outcome,label.path)){outcome=label.generic;break;}
+    }
+    entry.reply=outcome;break;
+  }
+  portEXIT_CRITICAL(&statusMux);
+}
+bool start(const BotPath::Route& route, const char* requester, const char* channel,uint32_t* historyId) {
+  if(historyId)*historyId=0;
   if(busy || historyStoragePending || BotInternetProbe::busy()) return false;
-  if(!route.count) return false;
-  beginHistory(requester,channel);
+  const uint32_t id=beginHistory(requester,channel);
+  if(historyId)*historyId=id;
+  if(route.unavailable){report("Inbound route unavailable for direct DM");finishHistory();return false;}
+  if(!route.count) {report("Direct route");finishHistory();return false;}
   if(route.width!=2 && route.width!=3) { report("Unsupported hash width",route.width); finishHistory(); return false; }
   if(size_t(route.count)*route.width>BOT_MAX_PATH_BYTES) { report("Invalid route length",route.count); finishHistory(); return false; }
   bool missing=false;

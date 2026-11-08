@@ -6,6 +6,8 @@
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
 #include "MonitorBotStatsHistory.h"
 #include "MonitorScopedRepeaters.h"
+#include "BotReplyTracker.h"
+#include "BotDmRequestLog.h"
 #include <ArduinoJson.h>
 #endif
 #pragma once
@@ -97,6 +99,7 @@
 
 struct AdvertPath {
   uint8_t pubkey_prefix[7];
+  uint8_t full_pubkey[32]; // Verify identity before reusing an advert name for DM.
   uint8_t path_len;
   char    name[32];
   uint32_t recv_timestamp;
@@ -117,8 +120,12 @@ public:
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
   void exportBotStats(JsonObject out);
   void exportScopedRepeaters(JsonObject out);
+  bool exportScopedSnapshot(JsonObject out);
+  void refreshScopedSnapshotNames(JsonArray rows);
   void requestScopedRepeaterNames(bool enabled);
+  const char* removeObservedScopedHash(const uint8_t hash[2]);
   bool hasPendingPathReplies() const { return bot_path_count != 0; }
+  bool dailySavesComplete(uint32_t day) const;
   bool sendAdminCheckResult(const uint8_t* key, const char* text);
   bool sendStartupNotification(const uint8_t* key, const char* text);
   bool queueStatusNotification(const uint8_t* key, const BotVoltageList::Snapshot& snapshot);
@@ -290,7 +297,7 @@ private:
   bool scoped_lookup_running=false;
   bool scoped_lookup_enabled=false;
   uint32_t scoped_lookup_requested_at=0;
-  uint8_t scoped_lookup_hashes[10]{};
+  uint8_t scoped_lookup_hashes[20]{}; // Ten two-byte hashes per background request.
   size_t scoped_lookup_count=0;
   size_t scoped_lookup_cursor=0,scoped_lookup_next_cursor=0;
   uint32_t scoped_lookup_due=0;
@@ -304,9 +311,22 @@ private:
     uint32_t lookupDeadline=0, expires=0;
     size_t nextHop=0;
     uint32_t nextPart=0;
+    uint32_t historyId=0;
     uint8_t failures=0;
+    bool repeatedDm=false;
   } pending_bot_paths[4];
   size_t bot_path_head=0, bot_path_count=0;
+  BotReplyTracker<MAX_HASH_SIZE> bot_reply_tracker;
+  uint32_t bot_reply_history_id=0;
+  bool bot_reply_notice=false;
+  BotDmRequestLog bot_dm_request_log;
+  bool bot_dm_request_repeated=false;
+  uint32_t bot_reply_dm_tag=0;
+  uint32_t bot_dm_history_id=0;
+  void onMessageQueued(mesh::Packet* packet,uint32_t expected_ack) override;
+  void recordBotReplyEvent(const BotReplyTracker<MAX_HASH_SIZE>::Entry& entry,unsigned event);
+  void trackBotReplyPacket(mesh::Packet* packet);
+  void observeBotReplyPacket(mesh::Packet* packet,unsigned event);
 #endif
   uint32_t last_bot_advert_time = 0;
   bool first_bot_advert_sent = false;
@@ -314,7 +334,7 @@ private:
     bool active=false; uint8_t result=0;
     uint8_t key[PUB_KEY_SIZE]{}, hash[MAX_HASH_SIZE]{};
     mesh::Packet* packet=nullptr;
-    uint32_t deadline=0;
+    uint32_t deadline=0,historyId=0;
   } pending_admin_advert;
   bool handleBotAdminCommand(const BotMessage &message, const ContactInfo *direct_recipient,
                             const BotCommand &command);
@@ -383,6 +403,7 @@ private:
     uint8_t channel=0xFF, key[PUB_KEY_SIZE]{};
     size_t next=0; unsigned part=1, failures=0;
     uint32_t deadline=0, expires=0;
+    uint32_t historyId=0;
   } pending_voltage_list;
   void sendNextVoltageListPart();
   BotPrefs bot_prefs;

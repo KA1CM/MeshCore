@@ -3,7 +3,8 @@
 
 namespace BotAdminHelp {
 inline const char* reply(const char* command) {
-  if (!command || !*command) return "Admin help:\nadvert check sync add remove enable disable notes password save";
+  if (!command || !*command) return "Admin help:\nadvert check sync add remove enable disable notes password save moon";
+  if (!strcasecmp(command,"moon")) return "moon: list of repeaters in moon-mode\nmoon on <repeater>\nmoon off <repeater>\nManual off leaves repeat status unchanged.";
   if (!strcasecmp(command,"save")) return "Save command activity, ct-ffc list and name cache now.\nUsage: save";
   if (!strcasecmp(command,"advert")) return "advert: flood advert from this bot\nadvert <repeater>: request a repeater flood advert";
   if (!strcasecmp(command,"check")) return "Check repeater voltage.\nUsage: check <repeater>";

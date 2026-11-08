@@ -7,7 +7,7 @@
 #include <cctype>
 
 namespace BotScopedNameList {
-// Allocate only for a radio search; bulk storage prefers PSRAM over TLS RAM.
+// Allocate only for a radio search; bulk storage prefers PSRAM over internal RAM.
 struct Snapshot { char lines[BotScopedRepeaters::Capacity][97]; size_t count=0; };
 struct Free { void operator()(Snapshot* value) const {
   if(value) { value->~Snapshot(); std::free(value); }

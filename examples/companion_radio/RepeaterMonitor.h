@@ -19,6 +19,19 @@ class RepeaterMonitor {
   MyMesh& mesh;
   MonitorRestartHistory restartHistory;
   BotConnectivity::Monitor connectivity;
+  BotConnectivity::WifiRecovery wifiRecovery;
+  enum MoonPhase {MoonIdle,MoonLogin,MoonReady,MoonReply} moonPhase=MoonIdle;
+  int moonTarget=-1;
+  bool moonOn=false;
+  uint8_t moonLogins=0,moonCommands=0,moonToken=0;
+  uint32_t moonDeadline=0,moonExpires=0,nextMoonPoll=0;
+  char moonPrefix[4]{};
+  void pollMoon();
+  const char* setMoonMode(size_t index,bool mode);
+  void sendMoonLogin();
+  void finishMoon(uint8_t result);
+  bool internetNoticePending=false,internetNoticeReleased=false;
+  uint32_t internetNoticeDeadline=0;
   BotConnectivity::Event connectivityEvents[16];
   uint8_t connectivityHead=0,connectivityCount=0;
   size_t connectivityRecipient=0;
@@ -79,10 +92,17 @@ class RepeaterMonitor {
   void sendRepeaterAdvert(bool flood);
   void retryRepeaterAdvert();
   void pollRepeaterAdvert();
-  bool busy() const { return running || syncPhase != SyncIdle || advertPhase != AdvertIdle; }
+  bool busy() const { return running || syncPhase != SyncIdle || advertPhase != AdvertIdle || moonPhase!=MoonIdle; }
   bool syncTimeReady() const { return synced && (uint32_t)(millis() - lastNtpSync) < 21600000UL; }
   void pollClockSync();
   void pollAutomaticClockSync();
+  void pollAnalyzerClocks();
+  void pollPiPublisher();
+  std::unique_ptr<JsonDocument> piSnapshot;
+  bool piLookupRunning=false;
+  uint32_t piLookupSequence=0,piLookupDue=0,piPreparationStarted=0;
+  uint32_t analyzerClockDue=0;
+  bool analyzerClockDirty=false;
   uint32_t nextAutomaticSyncPoll=0;
   void finishClockSync(const char* result);
 
@@ -122,6 +142,9 @@ class RepeaterMonitor {
   bool wifiEverConnected = false;
   uint32_t wifiDisconnects=0, wifiReconnects=0, wifiAttempts=0;
   uint32_t wifiLastDisconnect=0, wifiLastConnect=0;
+  portMUX_TYPE wifiEventMux=portMUX_INITIALIZER_UNLOCKED;
+  uint32_t wifiDisconnectEvents=0,wifiDisconnectEventMillis=0;
+  uint16_t wifiDisconnectReason=0;
   size_t wifiIndex = 0;
   void connectWifi(size_t index);
   String lastError;
@@ -149,6 +172,7 @@ class RepeaterMonitor {
   ContactInfo* contact();
   void poll();
 public:
+  const char* adminMoon(const uint8_t* sender,const char* args);
   const char* adminPassword(const uint8_t* sender, const char* args);
   const char* adminNotes(const uint8_t* sender, const char* args, BotVoltageList::Snapshot& out);
   const char* adminEditRepeater(const uint8_t* sender, const char* action, const char* query);
@@ -159,8 +183,10 @@ public:
   const BotAdminContacts& botAdmins() const { return adminContacts; }
   explicit RepeaterMonitor(MyMesh& m) : mesh(m) {}
   void onVerifiedAdvert(const uint8_t* key, uint32_t timestamp, uint8_t pathLen);
-  void voltageList(BotVoltageList::Snapshot& out, bool lowOnly = false);
+  void voltageList(BotVoltageList::Snapshot& out, bool lowOnly = false, bool includeMoon = false, bool moonOnly = false);
   void begin();
+  // Versioned, read-only companion stats extension; no network requests.
+  size_t writeWifiDiagnostics(uint8_t* out,size_t capacity);
   void loop();
   bool onCommandResponse(const ContactInfo& from, const char* text);
   bool onResponse(const ContactInfo& from, const uint8_t* data, size_t len);

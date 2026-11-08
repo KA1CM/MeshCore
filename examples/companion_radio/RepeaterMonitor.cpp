@@ -4,10 +4,14 @@
 #include "RepeaterMonitorPage.h"
 #include "MyMesh.h"
 #include "BotPathLookup.h"
+#include "BotCommandRegistry.h"
 #include "BotInternetProbe.h"
+#include "BotAnalyzerClock.h"
+#include "BotPiPublisher.h"
 #include "BotLookupMemory.h"
 #include "FirmwareBot.h"
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <new>
 #include <ESPmDNS.h>
 #include <SPIFFS.h>
@@ -34,6 +38,7 @@ public:
   }
 } historyJsonAllocator;
 using HistoryBuffer=std::unique_ptr<char[],BotPathLookup::FreeBulk>;
+
 }
 static const char* slots[] = {"/monitor0.json", "/monitor1.json"};
 static const struct { const char* ssid; const char* password; } wifiNetworks[] = {
@@ -60,6 +65,7 @@ void RepeaterMonitor::exportState(JsonDocument& doc, bool history, bool ordered)
     JsonObject item = list.add<JsonObject>();
     item["notes"] = e.notes.c_str();
     item["key"] = key; item["name"] = e.name; item["enabled"] = e.enabled;
+    item["moonMode"]=e.moonMode;
     auto* known = mesh.lookupContactByPubKey(e.key, 32);
     const char* displayName = known && known->name[0] ? known->name : e.learnedName[0] ? e.learnedName : e.name;
     if (!history) {
@@ -74,6 +80,16 @@ void RepeaterMonitor::exportState(JsonDocument& doc, bool history, bool ordered)
       item["learnedLongitude"] = e.learnedLongitude;
     }
     item["scheduledDay"] = e.scheduledDay;
+    item["moonOffPending"]=e.moonOffPending;item["moonRestorePending"]=e.moonRestorePending;item["moonAttemptOn"]=e.moonAttemptOn;
+    item["moonConfirmedOn"]=e.moonConfirmedOn;item["moonAttemptAt"]=e.moonAttemptAt;
+    item["moonConfirmedAt"]=e.moonConfirmedAt;item["moonResult"]=e.moonResult;
+    if(e.analyzerClock.checkedAt || e.analyzerClock.fetchedAt) {
+      const auto& a=e.analyzerClock;auto clock=item["analyzerClock"].to<JsonObject>();
+      clock["checkedAt"]=a.checkedAt;clock["attemptDay"]=a.attemptDay;clock["fetchedAt"]=a.fetchedAt;
+      clock["advertAt"]=a.advertAt;clock["observedAt"]=a.observedAt;clock["samples"]=a.samples;
+      clock["skew"]=a.skew;clock["drift"]=a.drift;clock["severity"]=a.severity;clock["result"]=a.result;
+      clock["calibrated"]=a.calibrated;
+    }
     item["lastSynced"] = e.lastSynced;
     item["syncAttemptAt"] = e.syncAttemptAt;
     item["syncAttemptResult"] = e.syncAttemptResult;
@@ -121,7 +137,40 @@ bool RepeaterMonitor::importState(JsonDocument& doc, bool history) {
     }
     strlcpy(e.name, name, sizeof(e.name));
     e.enabled = item["enabled"];
+    if(!item["moonMode"].isNull()) {
+      if(!item["moonMode"].is<bool>())return false;
+      const bool mode=item["moonMode"];
+      if(!history && mode!=e.moonMode) {e.moonRestorePending=false;e.moonOffPending=false;e.moonAttemptAt=0;}
+      e.moonMode=mode;
+    }
     if (history) {
+      if(!item["analyzerClock"].isNull()) {
+        if(!item["analyzerClock"].is<JsonObject>())return false;
+        const auto clock=item["analyzerClock"].as<JsonObjectConst>();auto& a=e.analyzerClock;
+        for(const char* field:{"checkedAt","attemptDay","fetchedAt","advertAt","observedAt","samples"})
+          if(!clock[field].is<uint32_t>())return false;
+        if(!clock["skew"].is<double>() || !clock["drift"].is<double>() ||
+            !clock["severity"].is<uint8_t>() || clock["severity"].as<uint8_t>()>6 ||
+            !clock["result"].is<uint8_t>() || clock["result"].as<uint8_t>()>5 || !clock["calibrated"].is<bool>())return false;
+        a.checkedAt=clock["checkedAt"];a.attemptDay=clock["attemptDay"];a.fetchedAt=clock["fetchedAt"];
+        a.advertAt=clock["advertAt"];a.observedAt=clock["observedAt"];a.samples=clock["samples"];
+        a.skew=clock["skew"];a.drift=clock["drift"];a.severity=clock["severity"];a.result=clock["result"];
+        a.calibrated=clock["calibrated"];
+        if(!std::isfinite(a.skew) || !std::isfinite(a.drift) ||
+            (a.checkedAt && a.checkedAt<VALID_TIME) || (a.fetchedAt && a.fetchedAt<VALID_TIME))return false;
+      }
+      for(const char* field:{"moonRestorePending","moonOffPending","moonAttemptOn","moonConfirmedOn"})
+        if(!item[field].isNull() && !item[field].is<bool>())return false;
+      for(const char* field:{"moonAttemptAt","moonConfirmedAt"})
+        if(!item[field].isNull() && !item[field].is<uint32_t>())return false;
+      if(!item["moonResult"].isNull() && (!item["moonResult"].is<uint8_t>() || item["moonResult"].as<uint8_t>()>5))return false;
+      e.moonOffPending=item["moonOffPending"] | false;e.moonRestorePending=item["moonRestorePending"] | false;
+      if(e.moonOffPending && e.moonRestorePending)return false;
+      e.moonAttemptOn=item["moonAttemptOn"] | false;
+      e.moonConfirmedOn=item["moonConfirmedOn"] | false;e.moonAttemptAt=item["moonAttemptAt"] | 0UL;
+      e.moonConfirmedAt=item["moonConfirmedAt"] | 0UL;e.moonResult=item["moonResult"] | 0;
+      if(e.moonResult==1)e.moonResult=5; // An interrupted operation is unconfirmed.
+      if((e.moonAttemptAt && e.moonAttemptAt<VALID_TIME) || (e.moonConfirmedAt && e.moonConfirmedAt<VALID_TIME))return false;
       // Migrate older snapshots which saved displayName but never restored it.
       const char* learned = item["learnedName"] | "";
       if (item["learnedName"].isNull()) {
@@ -174,6 +223,7 @@ bool RepeaterMonitor::importState(JsonDocument& doc, bool history) {
         e.readings[r.day % 7] = r;
       }
     }
+    if(!e.enabled){e.moonMode=false;e.moonRestorePending=false;e.moonOffPending=false;}
     ++n;
   }
   std::copy_n(candidate.get(), sizeof(entries)/sizeof(entries[0]), entries);
@@ -331,7 +381,7 @@ void RepeaterMonitor::prune(uint32_t utc) {
   if (changed) save();
 }
 
-void RepeaterMonitor::voltageList(BotVoltageList::Snapshot& out, bool lowOnly) {
+void RepeaterMonitor::voltageList(BotVoltageList::Snapshot& out, bool lowOnly, bool includeMoon, bool moonOnly) {
   char names[MAX_REPEATERS][33]{};
   for(size_t i=0;i<count;++i) {
     auto* contact=mesh.lookupContactByPubKey(entries[i].key,32);
@@ -341,7 +391,7 @@ void RepeaterMonitor::voltageList(BotVoltageList::Snapshot& out, bool lowOnly) {
   }
   size_t order[MAX_REPEATERS];
   RepeaterOrder::westToEast(entries,count,mesh,order);
-  BotVoltageList::build(entries,names,count,out,order,lowOnly);
+  BotVoltageList::build(entries,names,count,out,order,lowOnly,includeMoon,moonOnly);
 }
 
 bool RepeaterMonitor::authorized(bool mutation) {
@@ -473,12 +523,16 @@ void RepeaterMonitor::routes() {
       server.sendHeader("Retry-After","5");
       server.send(503,"text/plain","Path lookup in progress");return;
     }
-    JsonDocument doc; exportState(doc, true);
+    // The open ct-ffc card expands this snapshot substantially. Keep its JSON
+    // nodes and serialized body out of the Wi-Fi stack's internal RAM.
+    JsonDocument doc(&historyJsonAllocator); exportState(doc, true);
     uint32_t utc = now();
     doc["canManage"] = requestIsAdmin;
+    if(requestIsAdmin)BotPiPublisher::exportState(doc["piPublisher"].to<JsonObject>());
     mesh.exportBotStats(doc["commandStats"].to<JsonObject>());
     mesh.exportScopedRepeaters(doc["ctFfcRepeaters"].to<JsonObject>());
     doc["clockSyncRunning"] = syncPhase != SyncIdle;
+    doc["moonRunning"]=moonPhase!=MoonIdle;
     doc["clockSyncResult"] = syncResult;
     if (syncTarget >= 0 && syncTarget < (int)count) {
       char key[65]; formatKey(entries[syncTarget].key, key); doc["clockSyncKey"] = key;
@@ -518,20 +572,27 @@ void RepeaterMonitor::routes() {
     lookupState["stage"]=lookup.stage; lookupState["detail"]=lookup.detail;
     lookupState["freeHeap"]=lookup.freeHeap; lookupState["largestBlock"]=lookup.largestBlock;
     lookupState["psramFree"]=lookup.psramFree; lookupState["psramBlock"]=lookup.psramBlock;
-    lookupState["tlsPsramAllocations"]=lookup.tlsPsramAllocations;
     lookupState["nameCacheSavedUtc"]=BotPathLookup::nameCacheLastSavedUtc();
     lookupState["nameCacheStorageError"]=BotPathLookup::nameCacheSaveError();
     lookupState["cachedNames"]=BotPathLookup::cachedNameCount();
     lookupState["lastFailure"]=lookup.lastFailure; lookupState["lastFailureDetail"]=lookup.lastFailureDetail;
     lookupState["failureHeap"]=lookup.failureHeap; lookupState["failureBlock"]=lookup.failureBlock;
-    lookupState["failureUtc"]=lookup.failureUtc; lookupState["verifyFlags"]=lookup.verifyFlags;
-    lookupState["verifyInfo"]=lookup.verifyInfo;
+    lookupState["failureUtc"]=lookup.failureUtc;
     JsonArray lookupLog=lookupState["history"].to<JsonArray>();
     BotPathLookup::HistoryEntry lookupEntry;
     for(size_t i=0;BotPathLookup::history(i,lookupEntry);++i) {
       auto row=lookupLog.add<JsonObject>();
       row["channel"]=lookupEntry.channel;row["requester"]=lookupEntry.requester;row["timestamp"]=lookupEntry.timestamp;
       row["stage"]=lookupEntry.stage;row["detail"]=lookupEntry.detail;
+      row["reply"]=lookupEntry.reply;
+      const auto* command=BotCommandRegistry::findById(lookupEntry.command);
+      row["command"]=command ? command->name : "";
+      if(lookupEntry.dmSenderKey[0]) {
+        row["dmSenderKey"]=lookupEntry.dmSenderKey;row["dmTimestamp"]=lookupEntry.dmTimestamp;
+        row["dmRetry"]=lookupEntry.dmRetry;row["dmInbound"]=lookupEntry.dmInbound;
+      }
+      row["queued"]=lookupEntry.queued;row["transmitted"]=lookupEntry.transmitted;
+      row["repeated"]=lookupEntry.repeated;row["txFailed"]=lookupEntry.txFailed;
       row["failure"]=lookupEntry.failure;row["failureDetail"]=lookupEntry.failureDetail;
       row["elapsedMs"]=lookupEntry.elapsedMs;row["finished"]=lookupEntry.finished;
       row["minHeap"]=lookupEntry.minHeap;row["minBlock"]=lookupEntry.minBlock;
@@ -549,6 +610,7 @@ void RepeaterMonitor::routes() {
     wifiState["connected"]=WiFi.status()==WL_CONNECTED;
     wifiState["status"]=(int)WiFi.status();wifiState["rssi"]=WiFi.RSSI();
     wifiState["attempts"]=wifiAttempts;wifiState["disconnects"]=wifiDisconnects;wifiState["reconnects"]=wifiReconnects;
+    wifiState["staleConnectionRecoveries"]=wifiRecovery.count;
     wifiState["uptimeSeconds"]=millis()/1000;
     if(wifiEverConnected)wifiState["connectedAgoSeconds"]=(uint32_t)(millis()-wifiLastConnect)/1000;
     if(wifiDisconnects)wifiState["disconnectedAgoSeconds"]=(uint32_t)(millis()-wifiLastDisconnect)/1000;
@@ -596,7 +658,41 @@ void RepeaterMonitor::routes() {
       for (size_t i = 0; i < count; ++i) if (entries[i].enabled && entries[i].scheduledDay < day) unfinished = true;
       doc["nextSunrise"] = sunrise(day + ((utc >= sunrise(day) && !unfinished) ? 1 : 0));
     }
-    String json; serializeJson(doc, json); server.send(200, "application/json", json);
+    if(doc.overflowed()) {server.send(503,"text/plain","Not enough memory for dashboard state.");return;}
+    const size_t length=measureJson(doc);
+    HistoryBuffer payload(static_cast<char*>(BotPathLookup::allocateBulk(length+1)));
+    if(!payload || serializeJson(doc,payload.get(),length+1)!=length) {
+      server.send(503,"text/plain","Could not prepare dashboard state.");return;
+    }
+    doc.clear(); // Release JSON nodes before the network send.
+    server.setContentLength(length);
+    server.send(200,"application/json","");
+    server.sendContent(payload.get(),length);
+  });
+  server.on("/api/ctffc-remove", HTTP_POST, [this]() {
+    if(!authorized(true))return;
+    if(!requestIsAdmin){server.send(403,"text/plain","Admin only");return;}
+    if(busy() || BotPathLookup::inProgress() || mesh.hasPendingPathReplies()) {
+      server.send(409,"text/plain","Wait for current work to finish.");return;
+    }
+    JsonDocument doc;
+    const String body=server.arg("plain");
+    if(body.length()>64 || deserializeJson(doc,body) || !doc["hash"].is<const char*>()) {
+      server.send(400,"text/plain","Use a four-digit hex hash.");return;
+    }
+    const char* text=doc["hash"];
+    uint8_t hash[2]{};
+    if(strlen(text)!=4){server.send(400,"text/plain","Use a four-digit hex hash.");return;}
+    for(size_t i=0;i<4;++i) {
+      const char c=text[i];
+      const int digit=c>='0' && c<='9' ? c-'0' : c>='a' && c<='f' ? c-'a'+10 : c>='A' && c<='F' ? c-'A'+10 : -1;
+      if(digit<0){server.send(400,"text/plain","Use a four-digit hex hash.");return;}
+      hash[i/2]=uint8_t((hash[i/2]<<4)|digit);
+    }
+    if(const char* error=mesh.removeObservedScopedHash(hash)) {
+      server.send(!strcmp(error,"Hash not found") ? 404 : 507,"text/plain",error);return;
+    }
+    server.send(200,"application/json","{\"removed\":true,\"saved\":true}");
   });
   server.on("/api/list", HTTP_GET, [this]() {
     if (!authorized()) return;
@@ -649,6 +745,24 @@ void RepeaterMonitor::routes() {
     }
     server.send(404,"text/plain","Repeater is no longer in the list.");
   });
+  server.on("/api/moon",HTTP_POST,[this]() {
+    if(!authorized(true))return;
+    if(!synced || !storageOK || busy() || BotPathLookup::inProgress()) {
+      server.send(409,"text/plain","Wait for time sync and active checks or lookups to finish.");return;
+    }
+    JsonDocument doc;uint8_t key[32];
+    if(server.arg("plain").length()>256 || deserializeJson(doc,server.arg("plain")) ||
+        !parseKey(doc["key"] | "",key) || !doc["enabled"].is<bool>()) {
+      server.send(400,"text/plain","Provide a repeater key and enabled flag.");return;
+    }
+    for(size_t i=0;i<count;++i)if(!memcmp(entries[i].key,key,32)) {
+      if(const char* error=setMoonMode(i,doc["enabled"].as<bool>())) {
+        server.send(storageOK ? 409 : 507,"text/plain",error);return;
+      }
+      nextMoonPoll=millis();server.send(200,"application/json","{\"ok\":true}");return;
+    }
+    server.send(404,"text/plain","Repeater not found.");
+  });
   server.on("/api/check", HTTP_POST, [this]() {
     if (!authorized(true)) return;
     if (!synced || !storageOK || busy() || (lastManual && millis() - lastManual < 600000)) {
@@ -670,10 +784,36 @@ void RepeaterMonitor::routes() {
     int target = -1;
     for (size_t i = 0; i < count; ++i) if (memcmp(entries[i].key, key, 32) == 0) { target = (int)i; break; }
     if (target < 0) { server.send(404, "text/plain", "Repeater is not in the saved list."); return; }
+    if(!entries[target].enabled){server.send(409,"text/plain","Repeater is disabled.");return;}
     singleTarget = target; running = true; automatic = false;
     runDay = easternDay(now()); active = -1; phase = Next; deadline = millis();
     // Individual checks neither observe nor restart the full-list cooldown.
     server.send(200, "application/json", "{\"ok\":true}");
+  });
+  server.on("/api/pi-publish", HTTP_POST, [this]() {
+    if(!authorized(true))return;
+    if(!synced || now()<VALID_TIME || !storageOK) {
+      server.send(409,"text/plain","Wait for NTP confirmation and working storage.");return;
+    }
+    if(const char* error=BotPiPublisher::requestManual(easternDay(now()),millis())) {
+      server.send(409,"text/plain",error);return;
+    }
+    server.send(202,"application/json","{\"queued\":true}");
+  });
+  server.on("/api/pi-settings", HTTP_POST, [this]() {
+    if(!authorized(true))return;
+    String body=server.arg("plain");JsonDocument doc;
+    if(body.length()>384 || deserializeJson(doc,body) || !doc["enabled"].is<bool>() ||
+        !doc["host"].is<const char*>() || !doc["token"].is<const char*>() || !doc["port"].is<unsigned>()) {
+      server.send(400,"text/plain","Provide enabled, Pi hostname/IP, port and shared token.");return;
+    }
+    JsonString host=doc["host"].as<JsonString>(),token=doc["token"].as<JsonString>();
+    const unsigned port=doc["port"];
+    if(port<1 || port>65535 || strlen(host.c_str())!=host.size() || strlen(token.c_str())!=token.size() ||
+        !BotPiPublisher::configure(doc["enabled"],host.c_str(),uint16_t(port),token.c_str())) {
+      server.send(409,"text/plain","Could not save Pi settings. Check values or wait for the update to finish.");return;
+    }
+    server.send(200,"application/json","{\"ok\":true}");
   });
   server.on("/api/password", HTTP_POST, [this]() {
     if (!authorized(true)) return;
@@ -736,6 +876,7 @@ void RepeaterMonitor::begin() {
   startupBootMillis=millis();
   load(); mesh.setRepeaterMonitor(this);
   restartHistory.begin();
+  BotPiPublisher::begin();
   if (storageOK) {
 #ifdef BOT_REPEATER_INITIAL_PASSWORD
     const char* initial = BOT_REPEATER_INITIAL_PASSWORD;
@@ -750,9 +891,54 @@ void RepeaterMonitor::begin() {
   for (size_t i = 0; i < count; ++i) restoredNames |= mesh.restoreMonitorContactName(entries[i].key);
   if (restoredNames) mesh.saveMonitorContacts();
   rememberNames();
+  WiFi.onEvent([this](arduino_event_id_t,arduino_event_info_t info) {
+    const uint32_t stamp=millis();
+    portENTER_CRITICAL(&wifiEventMux);
+    wifiDisconnectReason=info.wifi_sta_disconnected.reason;
+    wifiDisconnectEventMillis=stamp;++wifiDisconnectEvents;
+    portEXIT_CRITICAL(&wifiEventMux);
+  },ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   WiFi.persistent(false); WiFi.mode(WIFI_STA); WiFi.setAutoReconnect(false); connectWifi(0);
   wifiAttempt = wifiWindowStart = millis(); board.setInhibitSleep(true);
   routes(); server.begin();
+}
+
+size_t RepeaterMonitor::writeWifiDiagnostics(uint8_t* out,size_t capacity) {
+  // v2 appends channel and six raw BSSID bytes to the v1 fields.
+  constexpr size_t length=8+15*4+4*4+7;
+  if(!out || capacity<length)return 0;
+  const uint32_t ms=millis();
+  uint32_t eventCount,eventMillis;uint16_t reason;
+  portENTER_CRITICAL(&wifiEventMux);
+  eventCount=wifiDisconnectEvents;eventMillis=wifiDisconnectEventMillis;reason=wifiDisconnectReason;
+  portEXIT_CRITICAL(&wifiEventMux);
+  size_t pos=0;
+  out[pos++]=2;out[pos++]=uint8_t(WiFi.status());out[pos++]=uint8_t(WiFi.getMode());
+  out[pos++]=uint8_t(int8_t(WiFi.RSSI()));out[pos++]=uint8_t(connectivity.internet.state);
+  out[pos++]=(synced ? 1 : 0) | (BotInternetProbe::busy() ? 2 : 0) |
+    (BotPathLookup::inProgress() ? 4 : 0) | (wasConnected ? 8 : 0);
+  out[pos++]=uint8_t(reason);out[pos++]=uint8_t(reason>>8);
+  const uint32_t absent=UINT32_MAX;
+  const uint32_t values[]={ms/1000,wifiAttempts,wifiDisconnects,wifiReconnects,
+    wifiAttempts ? (ms-wifiAttempt)/1000 : absent,
+    wifiEverConnected ? (ms-wifiLastConnect)/1000 : absent,
+    wifiDisconnects ? (ms-wifiLastDisconnect)/1000 : absent,eventCount,
+    eventCount ? (ms-eventMillis)/1000 : absent,
+    heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT),
+    heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT),
+    heap_caps_get_free_size(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT),
+    heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT),
+    int32_t(connectivity.nextProbe-ms)>0 ? connectivity.nextProbe-ms : 0,
+    connectivity.internet.since};
+  static_assert(sizeof(values)/sizeof(values[0])==15,"Wi-Fi stats v1 layout");
+  for(uint32_t value:values)for(unsigned shift=0;shift<32;shift+=8)out[pos++]=uint8_t(value>>shift);
+  const IPAddress addresses[]={WiFi.localIP(),WiFi.gatewayIP(),WiFi.dnsIP(0),WiFi.subnetMask()};
+  for(const auto& address:addresses)for(unsigned octet=0;octet<4;++octet)out[pos++]=address[octet];
+  wifi_ap_record_t accessPoint{};
+  const bool associated=esp_wifi_sta_get_ap_info(&accessPoint)==ESP_OK;
+  out[pos++]=associated ? accessPoint.primary : 0;
+  for(unsigned i=0;i<6;++i)out[pos++]=associated ? accessPoint.bssid[i] : 0;
+  return pos;
 }
 
 const char* RepeaterMonitor::adminPassword(const uint8_t* sender, const char* args) {
@@ -906,7 +1092,10 @@ const char* RepeaterMonitor::adminEditRepeater(const uint8_t* sender, const char
   } else if(remove) {
     for(size_t i=target;i+1<count;++i) entries[i]=entries[i+1];
     entries[--count]=Entry{};
-  } else entries[target].enabled=enable;
+  } else {
+    entries[target].enabled=enable;
+    if(!enable){entries[target].moonMode=false;entries[target].moonRestorePending=false;entries[target].moonOffPending=false;}
+  }
   if(!save()) {
     std::copy_n(backup.get(),MAX_REPEATERS,entries);count=oldCount;
     return "Could not save repeater list; change not applied";
@@ -1024,6 +1213,7 @@ const char* RepeaterMonitor::startAdminCheck(const uint8_t* sender, const char* 
     BotVoltageList::shortName(name,entries[i].key,adminCheckName);
   }
   if(target<0) return "No matching repeater";
+  if(!sync && !entries[target].enabled)return "Repeater is disabled";
   memcpy(adminCheckRecipient,sender,32);adminCheckReply[0]=0;adminCheckPending=true;
   adminCheckIsSync=sync;
   adminCheckExpires=millis()+7200000;
@@ -1119,6 +1309,126 @@ ContactInfo* RepeaterMonitor::contact() {
   return c;
 }
 
+const char* RepeaterMonitor::setMoonMode(size_t index,bool mode) {
+  if(index>=count)return "Repeater not found";
+  if(!synced || !storageOK || busy() || BotPathLookup::inProgress())return "Bot busy or not ready; try again shortly";
+  auto& e=entries[index];
+  if(!e.enabled)return "Enable the repeater before changing moon mode";
+  if(mode && (!credentials.password(e.key)[0] || !mesh.lookupContactByPubKey(e.key,32)))
+    return "A saved password and repeater contact are required";
+  if(e.moonMode!=mode || (!mode && (e.moonRestorePending || e.moonOffPending))) {
+    const Entry previous=e;
+    e.moonMode=mode;e.moonRestorePending=false;e.moonOffPending=false;e.moonAttemptAt=0;e.moonResult=0;
+    if(!save()){e=previous;return "Could not save moon setting";}
+  }
+  nextMoonPoll=millis();return nullptr;
+}
+
+const char* RepeaterMonitor::adminMoon(const uint8_t* sender,const char* args) {
+  if(!adminContacts.allows(sender,BotAdminContacts::Commands))return "Not authorized";
+  if(!args)return "Usage: moon on <repeater> or moon off <repeater>";
+  bool mode;
+  const char* query;
+  if(!strncasecmp(args,"on ",3)){mode=true;query=args+3;}
+  else if(!strncasecmp(args,"off ",4)){mode=false;query=args+4;}
+  else return "Usage: moon on <repeater> or moon off <repeater>";
+  while(*query==' ')++query;
+  if(!*query)return "Provide a repeater name or key prefix";
+  int target=-1;const size_t length=strlen(query);
+  for(size_t i=0;i<count;++i) {
+    auto* contact=mesh.lookupContactByPubKey(entries[i].key,32);
+    const char* name=contact && contact->name[0] ? contact->name :
+      entries[i].learnedName[0] ? entries[i].learnedName : entries[i].name;
+    char key[65];formatKey(entries[i].key,key);
+    bool match=length>=4 && length<=64 && !strncasecmp(key,query,length);
+    for(const char* part=name;!match && *part;++part)if(!strncasecmp(part,query,length))match=true;
+    if(!match)continue;
+    if(target>=0)return "Multiple repeaters match; use a more specific name or key";
+    target=i;
+  }
+  if(target<0)return "No matching repeater";
+  if(const char* error=setMoonMode(target,mode))return error;
+  char name[33];auto* contact=mesh.lookupContactByPubKey(entries[target].key,32);
+  BotVoltageList::shortName(contact && contact->name[0] ? contact->name :
+    entries[target].learnedName[0] ? entries[target].learnedName : entries[target].name,entries[target].key,name);
+  snprintf(adminEditReply,sizeof(adminEditReply),"%s moon mode %s%s",name,mode ? "ON" : "OFF",
+    mode ? "" : "\nRepeat setting unchanged");
+  return adminEditReply;
+}
+
+void RepeaterMonitor::sendMoonLogin() {
+  if(moonTarget<0 || moonTarget>=(int)count){finishMoon(3);return;}
+  if(!entries[moonTarget].enabled){finishMoon(5);return;}
+  auto* contact=mesh.lookupContactByPubKey(entries[moonTarget].key,32);
+  const char* password=credentials.password(entries[moonTarget].key);
+  if(!contact || !password[0]){finishMoon(3);return;}
+  ContactInfo target=*contact;target.out_path_len=OUT_PATH_UNKNOWN;
+  uint32_t estimate=0;++moonLogins;
+  const bool sent=mesh.sendLogin(target,password,estimate)!=MSG_SEND_FAILED;
+  moonPhase=MoonLogin;moonDeadline=millis()+(sent ? timeout(estimate) : 15000);
+}
+
+void RepeaterMonitor::finishMoon(uint8_t result) {
+  if(moonTarget>=0 && moonTarget<(int)count) {
+    auto& entry=entries[moonTarget];entry.moonResult=result;
+    if(result==2) {
+      entry.moonConfirmedAt=now();entry.moonConfirmedOn=moonOn;
+      if(moonOn)entry.moonRestorePending=false;else entry.moonOffPending=false;
+    }
+    if(storageOK)save();
+  }
+  moonPhase=MoonIdle;moonTarget=-1;nextMoonPoll=millis()+5000;
+}
+
+void RepeaterMonitor::pollMoon() {
+  if(!synced || !storageOK)return;
+  const uint32_t ms=millis(),utc=now();
+  if(moonPhase!=MoonIdle) {
+    if(moonTarget<0 || moonTarget>=(int)count || !entries[moonTarget].enabled){finishMoon(5);return;}
+    if(elapsed(ms,moonExpires)){finishMoon(4);return;}
+    if(!elapsed(ms,moonDeadline))return;
+    if(moonPhase==MoonLogin) {
+      if(moonLogins<2)sendMoonLogin();else finishMoon(3);
+      return;
+    }
+    if(moonPhase==MoonReply) {
+      if(moonCommands>=2) {
+        // Like voltage checks, try the operation first. Refresh access only
+        // after bounded direct attempts fail, never before every command.
+        if(!moonLogins)sendMoonLogin();else finishMoon(4);
+        return;
+      }
+      moonPhase=MoonReady;moonDeadline=ms+5000;return;
+    }
+    auto* contact=mesh.lookupContactByPubKey(entries[moonTarget].key,32);
+    if(!contact){finishMoon(5);return;}
+    ContactInfo target=*contact;target.out_path_len=OUT_PATH_UNKNOWN;
+    snprintf(moonPrefix,sizeof(moonPrefix),"%02X|",(unsigned)++moonToken);
+    char command[24];snprintf(command,sizeof(command),"%sset repeat %s",moonPrefix,moonOn ? "on" : "off");
+    uint32_t estimate=0;++moonCommands;
+    const uint32_t stamp=mesh.getRTCClock()->getCurrentTimeUnique();
+    if(stamp<utc || stamp-utc>5){finishMoon(5);return;}
+    const bool sent=mesh.sendCommandData(target,stamp,0,command,estimate)!=MSG_SEND_FAILED;
+    moonPhase=MoonReply;moonDeadline=ms+(sent ? timeout(estimate) : 15000);
+    return;
+  }
+  if(!elapsed(ms,nextMoonPoll))return;
+  nextMoonPoll=ms+1000;
+  if(busy() || BotPathLookup::inProgress() || BotPathLookup::storagePending() || BotInternetProbe::busy())return;
+  for(size_t i=0;i<count;++i)if(moonDue(entries[i],utc)) {
+    auto& entry=entries[i];const uint32_t previousAt=entry.moonAttemptAt;
+    const bool previousOn=entry.moonAttemptOn;const uint8_t previousResult=entry.moonResult;
+    moonOn=entry.moonRestorePending || (!entry.moonOffPending && moonDaytime(utc));
+    entry.moonAttemptAt=utc;entry.moonAttemptOn=moonOn;entry.moonResult=1;
+    if(!save()) {
+      entry.moonAttemptAt=previousAt;entry.moonAttemptOn=previousOn;entry.moonResult=previousResult;
+      return; // Persist the attempt before any radio request; fail closed.
+    }
+    moonTarget=i;moonLogins=moonCommands=0;moonToken=uint8_t(esp_random());
+    moonExpires=ms+300000;moonPhase=MoonReady;moonDeadline=ms;return;
+  }
+}
+
 void RepeaterMonitor::nextEntry() {
   if (easternDay(now()) != runDay) { running = false; phase = Idle; active = -1; return; }
   if (singleTarget >= 0) active = singleTarget;
@@ -1128,6 +1438,7 @@ void RepeaterMonitor::nextEntry() {
     if (automatic) scheduleSunriseNotification();
     return;
   }
+  if(!entries[active].enabled){running=false;phase=Idle;active=-1;singleTarget=-1;return;}
   clockKnown = false; clockOffset = 0; clockUncertainty = 0;
   attempt = 0;
   preLoginFloodAttempts = 0;
@@ -1186,6 +1497,11 @@ void RepeaterMonitor::finish(uint8_t result, uint16_t mv) {
   measured.millivolts = result == Ok ? mv : 0;
   measured.clockKnown = result == Ok && clockKnown;
   measured.clockOffset = clockOffset; measured.clockUncertainty = clockUncertainty;
+  if(result==Ok && (mv>3800 || mv<3500) && entries[active].moonMode) {
+    entries[active].moonMode=false;entries[active].moonRestorePending=mv>3800;
+    entries[active].moonOffPending=mv<3500;
+    entries[active].moonAttemptAt=0;entries[active].moonResult=0;
+  }
   storageFinishResult=result;storageFinishMv=mv;
   phase=StoreFinish;deadline=millis();BotPathLookup::setStoragePending(true);
 }
@@ -1208,6 +1524,12 @@ void RepeaterMonitor::completeReading() {
 }
 
 bool RepeaterMonitor::onResponse(const ContactInfo& from, const uint8_t* data, size_t len) {
+  if(moonPhase==MoonLogin && moonTarget>=0 && !elapsed(millis(),moonDeadline) &&
+      !memcmp(from.id.pub_key,entries[moonTarget].key,32) && modernLoginOK(data,len)) {
+    if(data[6]!=1)finishMoon(3);
+    else {moonCommands=0;moonPhase=MoonReady;moonDeadline=millis()+3000;}
+    return true;
+  }
   if(advertPhase==AdvertLogin && !elapsed(millis(),advertDeadline) &&
       !memcmp(from.id.pub_key,advertTargetKey,32) && modernLoginOK(data,len)) {
     if(data[6]!=1)finishRepeaterAdvert("No admin permission");
@@ -1256,7 +1578,7 @@ bool RepeaterMonitor::onResponse(const ContactInfo& from, const uint8_t* data, s
 }
 
 void RepeaterMonitor::poll() {
-  if (!synced || !storageOK || syncPhase != SyncIdle || advertPhase != AdvertIdle) return;
+  if (!synced || !storageOK || syncPhase != SyncIdle || advertPhase != AdvertIdle || moonPhase!=MoonIdle) return;
   if (!running) {
     for (size_t i = 0; i < count; ++i) if (due(entries[i], now())) { startRun(true); break; }
   }
@@ -1309,8 +1631,8 @@ void RepeaterMonitor::onVerifiedAdvert(const uint8_t* key, uint32_t timestamp, u
     if (!advances) return;
     const int64_t offset = (int64_t)timestamp - utc;
     // At most one routine snapshot per hour; save threshold crossings immediately.
-    const bool large = offset >= 600 || offset <= -600;
-    const bool wasLarge = e.clockOffset >= 600 || e.clockOffset <= -600;
+    const bool large = offset >= 300 || offset <= -300;
+    const bool wasLarge = e.clockOffset >= 300 || e.clockOffset <= -300;
     if (e.clockCheckedAt && utc >= e.clockCheckedAt && utc - e.clockCheckedAt < 3600 && large == wasLarge) return;
     const uint32_t oldAt = e.clockCheckedAt, oldUncertainty = e.clockUncertainty;
     const int64_t oldOffset = e.clockOffset;
@@ -1323,8 +1645,99 @@ void RepeaterMonitor::onVerifiedAdvert(const uint8_t* key, uint32_t timestamp, u
   }
 }
 
+void RepeaterMonitor::pollPiPublisher() {
+  const uint32_t utc=now(),ms=millis(),day=easternDay(utc);
+  auto fail=[&](const char* reason){piSnapshot.reset();BotPiPublisher::preparationFailed(reason,ms);};
+  const bool networkIdle=synced && utc>=VALID_TIME && storageOK && !busy() &&
+    !BotInternetProbe::busy() && !BotPathLookup::inProgress() && !BotPathLookup::storagePending() &&
+    !storageSaveDeferred && !mesh.hasPendingPathReplies() && WiFi.status()==WL_CONNECTED;
+  BotPiPublisher::poll(utc,ms,networkIdle);
+  // Own and consume our lookup result before any idle/queue gates.
+  if(piLookupRunning) {
+    if(!BotPathLookup::discard())return;
+    piLookupRunning=false;piLookupDue=ms+5000UL;
+    if(BotPathLookup::successSequence()==piLookupSequence){fail("Name lookup failed; nothing sent to Pi");return;}
+    if(piSnapshot)mesh.refreshScopedSnapshotNames((*piSnapshot)["entries"].as<JsonArray>());
+  }
+  if(!BotPiPublisher::due(day,ms)){piSnapshot.reset();return;}
+  if(!networkIdle || BotPiPublisher::busy())return;
+  const uint32_t local=uint32_t(int64_t(utc)+FirmwareBot::easternUtcOffsetSeconds(utc));
+  // Independent of all 03:00 saves. A missed 02:30 run catches up when idle.
+  if(!BotPiPublisher::manualPending() && local%86400UL<2UL*3600UL+30UL*60UL)return;
+  if(!piSnapshot) {
+    if(!BotPiPublisher::beginPreparation(day)){fail("Could not save Pi update attempt");return;}
+    piSnapshot.reset(new(std::nothrow) JsonDocument(BotPiPublisher::jsonAllocator()));
+    if(!piSnapshot || !mesh.exportScopedSnapshot(piSnapshot->to<JsonObject>()) || piSnapshot->overflowed()) {
+      fail("Could not prepare ct-ffc snapshot");return;
+    }
+    piPreparationStarted=ms;piLookupDue=0;
+  }
+  if(ms-piPreparationStarted>600000UL){fail("Name preparation timed out; nothing sent to Pi");return;}
+  if(piLookupDue && int32_t(ms-piLookupDue)<0)return;
+  auto rows=(*piSnapshot)["entries"].as<JsonArray>();mesh.refreshScopedSnapshotNames(rows);
+  if(piSnapshot->overflowed()){fail("Pi snapshot allocation failed");return;}
+  std::unique_ptr<BotPath::Route> request;
+  for(JsonObject row:rows) {
+    if(row["checked"].as<bool>())continue;
+    if(!request) {
+      request.reset(new(std::nothrow) BotPath::Route);
+      if(!request){fail("Name request allocation failed");return;}
+      request->width=2;request->all=true;
+    }
+    unsigned a,b;
+    if(sscanf(row["hash"] | "","%2x%2x",&a,&b)!=2){fail("Invalid ct-ffc hash");return;}
+    request->bytes[request->count*2]=uint8_t(a);request->bytes[request->count*2+1]=uint8_t(b);
+    if(++request->count==BotPathLookup::RequestHopLimit)break;
+  }
+  if(request) {
+    BotPiPublisher::resolvingNames();piLookupSequence=BotPathLookup::successSequence();
+    if(BotPathLookup::start(*request,"ct-ffc Pi update","Pi"))piLookupRunning=true;
+    else fail("Could not start name lookup; nothing sent to Pi");
+    return;
+  }
+  const size_t length=measureJson(*piSnapshot);
+  if(length>BotPiPublisher::SnapshotLimit){fail("Pi snapshot too large");return;}
+  HistoryBuffer body(static_cast<char*>(heap_caps_malloc(length+1,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT)));
+  if(!body || serializeJson(*piSnapshot,body.get(),length+1)!=length){fail("Pi upload allocation failed");return;}
+  piSnapshot.reset();
+  if(BotPiPublisher::start(body.get(),length,day,ms))body.release();
+}
+
+void RepeaterMonitor::pollAnalyzerClocks() {
+  using namespace BotAnalyzerClock;
+  const uint32_t utc=now(),ms=millis();
+  uint8_t key[32];Summary fetched;
+  if(take(key,fetched)) {
+    for(size_t i=0;i<count;++i)if(!memcmp(entries[i].key,key,32)) {
+      auto& stored=entries[i].analyzerClock;
+      if(fetched.result==Good){fetched.fetchedAt=utc;stored=fetched;}
+      stored.checkedAt=utc;stored.attemptDay=easternDay(utc);stored.result=fetched.result;
+      analyzerClockDirty=true;break;
+    }
+    analyzerClockDue=ms+15000UL;
+  }
+  if(!synced || utc<VALID_TIME || !storageOK || WiFi.status()!=WL_CONNECTED ||
+      connectivity.internet.state==BotConnectivity::Lost || busy() || BotInternetProbe::busy() ||
+      BotPathLookup::inProgress() || BotPathLookup::storagePending() || storageSaveDeferred ||
+      mesh.hasPendingPathReplies() || (analyzerClockDue && int32_t(ms-analyzerClockDue)<0))return;
+  const uint32_t local=uint32_t(int64_t(utc)+FirmwareBot::easternUtcOffsetSeconds(utc));
+  if(local%86400UL<3UL*3600UL)return;
+  const uint32_t day=easternDay(utc);
+  if(!mesh.dailySavesComplete(day))return;
+  for(size_t i=0;i<count;++i) {
+    if(!analyzerFetchDue(entries[i],day))continue;
+    if(!start(entries[i].key))analyzerClockDue=ms+60000UL;
+    return; // One Internet request at a time; the main/radio loop never waits.
+  }
+  if(analyzerClockDirty) {
+    // One verified settings save after the week's enabled-repeaters batch.
+    if(save())analyzerClockDirty=false;
+    analyzerClockDue=ms+60000UL;
+  }
+}
+
 void RepeaterMonitor::pollAutomaticClockSync() {
-  if(BotPathLookup::inProgress()) return;
+  if(BotPathLookup::inProgress() || BotInternetProbe::busy()) return;
   if(!syncTimeReady() || !storageOK || !credentials.available() || busy() || adminCheckPending)return;
   const uint32_t utc=now(),day=easternDay(utc);
   const uint32_t local=uint32_t(int64_t(utc)+FirmwareBot::easternUtcOffsetSeconds(utc));
@@ -1333,7 +1746,7 @@ void RepeaterMonitor::pollAutomaticClockSync() {
   nextAutomaticSyncPoll=millis()+10000;
   for(size_t i=0;i<count;++i) {
     const auto& entry=entries[i];
-    if(!timeSyncDue(entry,utc) ||
+    if((!timeSyncDue(entry,utc) && !analyzerTimeSyncDue(entry,utc)) ||
         (entry.syncAttemptAt>=VALID_TIME && easternDay(entry.syncAttemptAt)>=day) ||
         !credentials.password(entry.key)[0] || !mesh.lookupContactByPubKey(entry.key,32))continue;
     // startClockSync persists syncAttemptAt before transmitting. This also
@@ -1468,6 +1881,13 @@ void RepeaterMonitor::recordClockSample(uint32_t remoteMinute) {
 }
 
 bool RepeaterMonitor::onCommandResponse(const ContactInfo& from, const char* text) {
+  if(moonPhase==MoonReply && moonTarget>=0 && !elapsed(millis(),moonDeadline) &&
+      !memcmp(from.id.pub_key,entries[moonTarget].key,32) && !strncmp(text,moonPrefix,3)) {
+    if(!strcmp(text+3,moonOn ? "OK - repeat is now ON" : "OK - repeat is now OFF"))finishMoon(2);
+    else if(!moonLogins)sendMoonLogin();
+    else finishMoon(5);
+    return true;
+  }
   if(advertPhase==AdvertReply && !elapsed(millis(),advertDeadline) &&
       !memcmp(from.id.pub_key,advertTargetKey,32) && !strncmp(text,advertPrefix,3)) {
     if(strcmp(text+3,"OK - Advert sent"))finishRepeaterAdvert("Repeater did not confirm advert request");
@@ -1516,6 +1936,21 @@ void RepeaterMonitor::onUSBPowerChanged(bool present) {
     queueConnectivityEvent(present ? BotConnectivity::PowerRestored : BotConnectivity::PowerLost);
 }
 void RepeaterMonitor::queueConnectivityEvent(BotConnectivity::Kind kind) {
+  using namespace BotConnectivity;
+  if(kind==InternetLost && !internetNoticeReleased) {
+    if(!internetNoticePending) {
+      internetNoticePending=true;internetNoticeDeadline=millis()+120000UL;
+    }
+    return; // Try recovery before telling admins about an internet outage.
+  }
+  if(internetNoticePending) {
+    if(kind==InternetRestored || kind==WifiRestoredOnline) {
+      internetNoticePending=false;internetNoticeReleased=false;
+      return; // Neither loss nor restoration is announced for a silent repair.
+    }
+    if(kind==WifiLost || kind==WifiReminder || kind==WifiRestoredOffline || kind==InternetReminder)return;
+  }
+  if(kind==InternetRestored || kind==WifiRestoredOnline)internetNoticeReleased=false;
   auto event=connectivity.event(millis(),now(),kind);
   event.battery=mesh.sampleBatteryMillivolts();
   // Preserve the event already being delivered; bound RAM during long radio congestion.
@@ -1556,11 +1991,33 @@ void RepeaterMonitor::pollConnectivity() {
     const bool checkingRestore=connectivity.wifiRestorePending;
     if(connectivity.result(ok,ms,now()))queueConnectivityEvent(checkingRestore ? (ok ? BotConnectivity::WifiRestoredOnline : BotConnectivity::WifiRestoredOffline) : (ok ? BotConnectivity::InternetRestored : BotConnectivity::InternetLost));
   }
-  if(connectivity.due(ms) && wifi && !BotInternetProbe::busy() &&
+  // Confirm recovery promptly instead of waiting five minutes between the two
+  // successful checks required by the existing connectivity state machine.
+  if(internetNoticePending && connectivity.internet.state==BotConnectivity::Lost &&
+      int32_t(connectivity.nextProbe-ms)>int32_t(BotConnectivity::FAILURE_RETRY))
+    connectivity.nextProbe=ms+BotConnectivity::FAILURE_RETRY;
+  if(wifi && wifiRecovery.due(connectivity,ms) && !busy() &&
+      !BotInternetProbe::busy() && !BotPathLookup::inProgress() &&
+      !BotPathLookup::storagePending() && !storageSaveDeferred &&
+      !mesh.hasPendingPathReplies()) {
+    wifiRecovery.started(ms);
+    if(internetNoticePending)internetNoticeDeadline=ms+120000UL;
+    // The normal disconnected-station loop owns subsequent retries. Clear
+    // wasConnected now so it does not start a second reconnect next iteration.
+    wasConnected=false;wifiWindowStart=ms;
+    if(mdnsStarted){MDNS.end();mdnsStarted=false;}
+    connectWifi(wifiIndex);
+    connectivity.nextProbe=ms+BotConnectivity::FAILURE_RETRY;
+    // Do not start an HTTP probe against the connection being replaced.
+  } else if(connectivity.due(ms) && wifi && !BotInternetProbe::busy() &&
      !BotPathLookup::inProgress() && !mesh.hasPendingPathReplies()) {
     // Resource failure/deferred checks are not evidence of a network outage.
     if(BotInternetProbe::start()) {connectivity.attempted(ms);connectivityProbeWifiChanged=connectivityWifiChanged;}
     else connectivity.nextProbe=ms+5000;
+  }
+  if(internetNoticePending && int32_t(ms-internetNoticeDeadline)>=0) {
+    internetNoticePending=false;internetNoticeReleased=true;
+    queueConnectivityEvent(BotConnectivity::InternetLost);
   }
   BotPathLookup::setInternetAvailable(connectivity.internet.state!=BotConnectivity::Lost);
   for(auto kind : {BotConnectivity::WifiReminder,BotConnectivity::InternetReminder})
@@ -1614,7 +2071,7 @@ void RepeaterMonitor::pollConnectivityNotifications() {
 }
 
 void RepeaterMonitor::scheduleSunriseNotification() {
-  voltageList(sunriseNotification, true);
+  voltageList(sunriseNotification, true, true);
   if (!sunriseNotification.count) {
     sunriseNotification.count = 1;
     strlcpy(sunriseNotification.lines[0], BotVoltageList::EMPTY_LOW, BotVoltageList::LINE_SIZE);
@@ -1718,6 +2175,7 @@ void RepeaterMonitor::loop() {
   if (elapsed(millis(), nextNameCheck)) { nextNameCheck = millis() + 10000; rememberNames(); }
   if (synced && elapsed(millis(), nextPrune)) { prune(now()); nextPrune = millis() + 60000; }
   pollRepeaterAdvert();
+  pollMoon(); // Daytime repeat-on waits for the completed morning voltage check.
   pollClockSync();
   pollAutomaticClockSync();
   poll();
@@ -1725,6 +2183,8 @@ void RepeaterMonitor::loop() {
   pollStartupNotification();
   pollSunriseNotification();
   pollConnectivity();
+  pollPiPublisher();
+  pollAnalyzerClocks();
   pollConnectivityNotifications();
 }
 #endif

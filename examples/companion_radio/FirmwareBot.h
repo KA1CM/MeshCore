@@ -9,6 +9,11 @@ BotWriteResult normalizeChannelText(const char* text, char* sender, size_t sende
                                     size_t* written);
 bool parseCommand(const char* text, size_t text_len, BotCommand* command);
 bool parseCommand(const char* text, size_t text_len, BotCommand* command, bool allow_prefixless);
+// Recognize the local bot's exact @[name] mention without making a mention
+// alone a command. Unmentioned input retains ordinary parser behavior.
+bool parseAddressedCommand(const char* text,size_t text_len,const char* bot_name,
+                           BotCommand* command,bool allow_prefixless);
+bool hasBotMention(const char* text,size_t text_len,const char* bot_name);
 bool splitChannelText(const char* text, size_t text_len, char* sender, size_t sender_len, const char** body,
                       size_t* body_len);
 BotWriteResult writeResponse(char* output, size_t output_len, const char* text, size_t text_len, size_t* written);

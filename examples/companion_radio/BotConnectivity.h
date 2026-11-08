@@ -79,4 +79,17 @@ struct Monitor {
     return e;
   }
 };
+// Recover stale station connections without rebooting or cycling Wi-Fi on
+// individual failed probes. A real upstream outage must not cause a tight loop.
+struct WifiRecovery {
+  static constexpr uint32_t SPACING=900000UL;
+  bool attempted=false;
+  uint32_t lastAttempt=0,count=0;
+  bool due(const Monitor& monitor,uint32_t ms) const {
+    return monitor.wifi.state==Good && monitor.internet.state==Lost &&
+      monitor.failures>=3 && !monitor.successes && !monitor.wifiRestorePending &&
+      (!attempted || uint32_t(ms-lastAttempt)>=SPACING);
+  }
+  void started(uint32_t ms) {attempted=true;lastAttempt=ms;++count;}
+};
 }

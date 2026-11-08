@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string>
 #include <algorithm>
+#include "BotAnalyzerClock.h"
 
 // Hardware-independent scheduling and wire-format helpers.
 namespace MonitorCore {
@@ -34,12 +35,16 @@ inline bool validNotes(const char* text, size_t length) {
 }
 
 struct Entry {
+  BotAnalyzerClock::Summary analyzerClock;
   uint8_t key[32] = {};
   char name[33] = {};
   std::string notes; // Allocate only actual UTF-8 text; validNotes enforces the limit.
   char learnedName[33] = {};
   int32_t learnedLatitude = 0, learnedLongitude = 0;
   bool enabled = true;
+  bool moonMode=false,moonRestorePending=false,moonOffPending=false,moonAttemptOn=false,moonConfirmedOn=false;
+  uint32_t moonAttemptAt=0,moonConfirmedAt=0;
+  uint8_t moonResult=0; // 0 none, 1 pending, 2 confirmed, 3 login failed, 4 timeout, 5 send failed
   uint32_t scheduledDay = 0;
   uint32_t lastSynced = 0;
   uint32_t syncAttemptAt = 0;
@@ -50,6 +55,31 @@ struct Entry {
 };
 inline bool validLocation(int32_t lat, int32_t lon) {
   return (lat || lon) && lat >= -90000000 && lat <= 90000000 && lon >= -180000000 && lon <= 180000000;
+}
+inline uint32_t analyzerClockWeek(uint32_t easternDay) {
+  if(easternDay<4)return 0;
+  return easternDay-(easternDay+3)%7; // Monday of this local calendar week; epoch day 0 was Thursday.
+}
+inline bool analyzerFetchDue(const Entry& e,uint32_t day) {
+  return day && e.enabled && e.analyzerClock.attemptDay<analyzerClockWeek(day);
+}
+inline uint32_t latestDirectClockVerification(const Entry& e,uint32_t utc) {
+  uint32_t latest=e.lastSynced>=VALID_TIME && e.lastSynced<=utc ? e.lastSynced : 0;
+  if(e.clockCheckedAt>=VALID_TIME && e.clockCheckedAt<=utc && e.clockCheckedAt>latest)latest=e.clockCheckedAt;
+  for(const auto& r:e.readings)
+    if(r.clockKnown && r.timestamp>=VALID_TIME && r.timestamp<=utc && r.timestamp>latest)latest=r.timestamp;
+  return latest;
+}
+inline bool analyzerTimeSyncDue(const Entry& e,uint32_t utc) {
+  const auto& a=e.analyzerClock;
+  if(!e.enabled || utc<VALID_TIME || a.result!=BotAnalyzerClock::Good ||
+      a.severity<2 || a.severity>6)return false;
+  // Freshly fetching an old advert is not fresh clock evidence. Use observer
+  // reception time, not the node's possibly incorrect advert timestamp.
+  constexpr uint32_t MaxAge=100UL*3600UL;
+  if(a.fetchedAt<VALID_TIME || a.fetchedAt>utc || utc-a.fetchedAt>=MaxAge ||
+      a.observedAt<VALID_TIME || a.observedAt>utc || utc-a.observedAt>=MaxAge)return false;
+  return a.observedAt>latestDirectClockVerification(e,utc);
 }
 inline bool timeSyncDue(const Entry& e, uint32_t utc) {
   if (!e.enabled || utc < VALID_TIME) return false;
@@ -63,7 +93,7 @@ inline bool timeSyncDue(const Entry& e, uint32_t utc) {
       sampleTime = r.timestamp; offset = r.clockOffset;
     }
   }
-  if (sampleTime && (offset >= 600 || offset <= -600)) return true;
+  if (sampleTime && (offset >= 300 || offset <= -300)) return true;
   // A recent acceptable offset is also evidence that clock maintenance is current.
   const uint32_t verifiedAt = sampleTime ? sampleTime : e.lastSynced;
   return verifiedAt < VALID_TIME || verifiedAt > utc || utc - verifiedAt >= 30UL * 86400;
@@ -121,7 +151,7 @@ inline uint32_t easternDay(uint32_t utc) {
   uint32_t end = civilDay(y, 11, novSunday) * 86400UL + 6 * 3600;
   return (utc - ((utc >= start && utc < end) ? 4 : 5) * 3600UL) / 86400UL;
 }
-inline uint32_t sunrise(uint32_t day) {
+inline uint32_t solarEvent(uint32_t day,bool setting) {
   // NOAA fractional-year equations, Bridgeport city centre, east-positive longitude.
   // https://gml.noaa.gov/grad/solcalc/solareqns.PDF
   time_t t = day * 86400UL + 12 * 3600;
@@ -137,8 +167,32 @@ inline uint32_t sunrise(uint32_t day) {
       - 0.002697*cos(3*gamma) + 0.00148*sin(3*gamma);
   double lat = 41.18 * pi / 180;
   double ha = acos(cos(90.833*pi/180)/(cos(lat)*cos(dec)) - tan(lat)*tan(dec)) * 180/pi;
-  double minutes = 720 - 4 * (-73.19 + ha) - eq;
+  double minutes = 720 - 4 * (-73.19 + (setting ? -ha : ha)) - eq;
   return day * 86400UL + (uint32_t)lround(minutes * 60);
+}
+inline uint32_t sunrise(uint32_t day) {return solarEvent(day,false);}
+inline uint32_t sunset(uint32_t day) {return solarEvent(day,true);}
+inline bool moonDaytime(uint32_t utc) {
+  const uint32_t day=easternDay(utc);
+  return utc>=sunrise(day) && utc<sunset(day);
+}
+inline uint32_t moonPeriod(uint32_t utc) {
+  const uint32_t day=easternDay(utc);
+  // Before sunrise belongs to the previous sunset, not a new OFF operation
+  // at midnight. Periods change only at sunrise and sunset.
+  if(utc<sunrise(day))return (day-1)*2+1;
+  return day*2+(utc>=sunset(day) ? 1 : 0);
+}
+inline bool moonDue(const Entry& entry,uint32_t utc) {
+  if(utc<VALID_TIME || !entry.enabled || (!entry.moonMode && !entry.moonRestorePending && !entry.moonOffPending))return false;
+  const bool on=entry.moonRestorePending || (!entry.moonOffPending && moonDaytime(utc));
+  if(on && entry.moonMode && !entry.moonRestorePending) {
+    const uint32_t day=easternDay(utc);
+    const auto& reading=entry.readings[day%7];
+    // Apply voltage safeguards before the daytime repeat-ON operation.
+    if(entry.scheduledDay!=day || reading.day!=day || reading.result==Empty || reading.result==Checking)return false;
+  }
+  return !entry.moonAttemptAt || moonPeriod(entry.moonAttemptAt)!=moonPeriod(utc) || entry.moonAttemptOn!=on;
 }
 inline bool retained(uint32_t day, uint32_t today) { return day && day <= today && today - day < 7; }
 inline bool due(const Entry& e, uint32_t utc) {

@@ -9,6 +9,16 @@
 #endif
 
 class CustomSX1262Wrapper : public RadioLibWrapper {
+protected:
+  bool hasTransmitDone() override {
+    const uint32_t irq=((CustomSX1262*)_radio)->getIrqFlags();
+    const bool done=(irq & RADIOLIB_SX126X_IRQ_TX_DONE) &&
+      !(irq & RADIOLIB_SX126X_IRQ_TIMEOUT) && irq!=0xffff;
+    if(!done && !tx_unexpected_reported) {
+      ++tx_unexpected_irqs;tx_last_unexpected_irq=irq;tx_unexpected_reported=true;
+    }
+    return done;
+  }
 public:
   CustomSX1262Wrapper(CustomSX1262& radio, mesh::MainBoard& board) : RadioLibWrapper(radio, board) { }
 

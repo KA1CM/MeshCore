@@ -11,12 +11,13 @@ inline void shortName(const char* name, const uint8_t* key, char* out) {
   BotShortName::write(name,out);
   if (!out[0]) snprintf(out, 33, "[%02x%02x%02x%02x]", key[0],key[1],key[2],key[3]);
 }
-inline void build(const MonitorCore::Entry* entries, const char names[][33], size_t count, Snapshot& out, const size_t* order = nullptr, bool lowOnly = false) {
+inline void build(const MonitorCore::Entry* entries, const char names[][33], size_t count, Snapshot& out, const size_t* order = nullptr, bool lowOnly = false, bool includeMoon = false, bool moonOnly = false) {
   const size_t total = count > MonitorCore::MAX_REPEATERS ? MonitorCore::MAX_REPEATERS : count;
   out.count = 0;
   for(size_t row=0;row<total;++row) {
     const size_t i=order ? order[row] : row;
     if (!entries[i].enabled) continue;
+    if(moonOnly && !entries[i].moonMode)continue;
     bool duplicate=false;
     for(size_t j=0;j<total;++j) if(i!=j && entries[j].enabled && !strcmp(names[i],names[j])) duplicate=true;
     char label[48];
@@ -25,11 +26,12 @@ inline void build(const MonitorCore::Entry* entries, const char names[][33], siz
     const MonitorCore::Reading* latest=nullptr;
     for(const auto& reading:entries[i].readings)
       if(reading.timestamp && (!latest || reading.timestamp>latest->timestamp)) latest=&reading;
-    if(lowOnly && latest && latest->result==MonitorCore::Ok && latest->millivolts>=3600) continue;
+    const bool moon=includeMoon && entries[i].moonMode;
+    if(lowOnly && !moon && latest && latest->result==MonitorCore::Ok && latest->millivolts>=3600) continue;
     const size_t outputRow=out.count++;
     if(latest && latest->result==MonitorCore::Ok)
-      snprintf(out.lines[outputRow],LINE_SIZE,"%s %u.%02uV",label,((latest->millivolts+5)/10)/100,((latest->millivolts+5)/10)%100);
-    else snprintf(out.lines[outputRow],LINE_SIZE,"%s N/A",label);
+      snprintf(out.lines[outputRow],LINE_SIZE,"%s%s %u.%02uV",label,moon ? " 🌙" : "",((latest->millivolts+5)/10)/100,((latest->millivolts+5)/10)%100);
+    else snprintf(out.lines[outputRow],LINE_SIZE,"%s%s N/A",label,moon ? " 🌙" : "");
   }
 }
 // One message, keeping complete rows in their existing priority order.

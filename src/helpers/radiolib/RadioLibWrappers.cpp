@@ -151,6 +151,7 @@ uint32_t RadioLibWrapper::getEstAirtimeFor(int len_bytes) {
 }
 
 bool RadioLibWrapper::startSendRaw(const uint8_t* bytes, int len) {
+  tx_unexpected_reported=false;
   _board->onBeforeTransmit();
   int err = _radio->startTransmit((uint8_t *) bytes, len);
   if (err == RADIOLIB_ERR_NONE) {
@@ -164,7 +165,8 @@ bool RadioLibWrapper::startSendRaw(const uint8_t* bytes, int len) {
 }
 
 bool RadioLibWrapper::isSendComplete() {
-  if (state & STATE_INT_READY) {
+  if ((state & ~STATE_INT_READY)==STATE_TX_WAIT && (state & STATE_INT_READY)) {
+    if(!hasTransmitDone())return false; // Dispatcher retains its existing TX timeout.
     state = STATE_IDLE;
     n_sent++;
     return true;

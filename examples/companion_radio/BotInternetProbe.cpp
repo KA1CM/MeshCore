@@ -1,4 +1,6 @@
 #include "BotInternetProbe.h"
+#include "BotAnalyzerClock.h"
+#include "BotPiPublisher.h"
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -40,9 +42,9 @@ void worker(void*) {
  xQueueSend(results,&ok,portMAX_DELAY);vTaskDelete(nullptr);
 }
 }
-bool busy(){return active;}
+bool busy(){return active || BotAnalyzerClock::busy() || BotPiPublisher::busy();}
 bool start(){
- if(active)return false;
+ if(busy())return false;
  if(!results)results=xQueueCreate(1,sizeof(bool));
  if(!results)return false;
  active=true;
