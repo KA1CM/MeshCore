@@ -28,6 +28,8 @@ void setInternetAvailable(bool available);
 // Main-loop-only API. The worker owns its cache and never accesses mesh state.
 struct HistoryEntry {
   BotCommandId command=BOT_COMMAND_PATH;
+  BotReplyScope requestScope=BOT_REPLY_UNSCOPED;
+  bool mentioned=false;
   uint32_t id=0;
   const char* reply="";
   char requester[33]{};
@@ -49,6 +51,7 @@ void recordDelivery(uint32_t historyId,unsigned event,bool notice);
 void recordDmRequest(uint32_t historyId,const uint8_t* key,uint32_t timestamp,bool retry,bool inbound);
 void recordCommand(uint32_t historyId,BotCommandId command);
 void recordCommandStage(uint32_t historyId,const char* stage);
+void recordRequestContext(uint32_t historyId,BotReplyScope scope,bool mentioned);
 // Update only the matching request row; never attach an outcome by name alone.
 void recordReply(uint32_t historyId,const char* outcome);
 // Internet lookup limit only; cached names are checked for every route hop.

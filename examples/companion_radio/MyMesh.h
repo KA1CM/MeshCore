@@ -128,6 +128,8 @@ public:
   bool dailySavesComplete(uint32_t day) const;
   bool sendAdminCheckResult(const uint8_t* key, const char* text);
   bool sendStartupNotification(const uint8_t* key, const char* text);
+  bool sendAdminCommandResult(const uint8_t* key,const char* text);
+  bool sendMentionAnnouncement(BotChannelKind kind);
   bool queueStatusNotification(const uint8_t* key, const BotVoltageList::Snapshot& snapshot);
   bool queueSunriseNotification(const uint8_t* key, const BotVoltageList::Snapshot& snapshot);
   uint32_t getLastBotAdvertTime() const { return last_bot_advert_time; }
@@ -262,7 +264,7 @@ private:
   void buildBotCommandContext(BotCommandContext &context, BotCommandId command_id);
   bool sendBotResponse(const BotMessage &message, const ContactInfo *direct_recipient, uint8_t channel_idx,
                        const char *text, size_t text_len);
-  BotCommandResult executeBotHelloCommand(const BotMessage &message, char *output, size_t output_len);
+  BotCommandResult executeBotHelloCommand(const BotMessage &message, char *output, size_t output_len, bool includeScopeInfo=false);
   BotCommandResult executeBotTimeCommand(const BotMessage &message, char *output, size_t output_len);
   BotCommandResult executeBotLoraCommand(const BotMessage &message, char *output, size_t output_len);
   BotCommandResult executeBotIdCommand(const BotMessage &message, char *output, size_t output_len);
@@ -270,6 +272,7 @@ private:
   void recordBotNeighbor(const uint8_t *pub_key, int16_t rssi_dbm, int8_t snr_quarters);
   bool enqueueEmergencyForward(const BotMessage &message);
   bool findBotChannel(BotChannelKind kind, uint8_t &channel_idx);
+  void resolveBotReplyScope(BotMessage& message,const mesh::Packet* packet);
   bool sendBotGroupMessage(uint8_t channel_idx, const char *text, size_t text_len, bool unscoped = false);
   BotScopeNotice fairfield_scope_notices;
   void sendQueuedEmergencyForwards();
@@ -317,6 +320,16 @@ private:
   } pending_bot_paths[4];
   size_t bot_path_head=0, bot_path_count=0;
   BotReplyTracker<MAX_HASH_SIZE> bot_reply_tracker;
+  struct FreeRetryPacket {void operator()(mesh::Packet* packet) const;};
+  struct ChannelReplyRetry {
+    std::unique_ptr<mesh::Packet,FreeRetryPacket> packet;
+    uint8_t hash[MAX_HASH_SIZE]{};
+    uint32_t historyId=0,due=0,expires=0;
+    bool queued=false,notice=false;
+  } channel_reply_retries[8];
+  uint32_t channel_reply_retry_due=0;
+  void rememberChannelReplyRetry(const mesh::Packet* packet,uint32_t historyId,bool notice);
+  void pollChannelReplyRetries();
   uint32_t bot_reply_history_id=0;
   bool bot_reply_notice=false;
   BotDmRequestLog bot_dm_request_log;
@@ -400,6 +413,7 @@ private:
     bool adminOnly = false;
     bool active=false;
     BotChannelKind kind=BOT_CHANNEL_DM;
+    BotReplyScope reply_scope=BOT_REPLY_UNSCOPED;
     uint8_t channel=0xFF, key[PUB_KEY_SIZE]{};
     size_t next=0; unsigned part=1, failures=0;
     uint32_t deadline=0, expires=0;

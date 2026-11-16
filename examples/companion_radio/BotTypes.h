@@ -92,6 +92,8 @@ enum BotCommandId : uint8_t {
   BOT_COMMAND_PASSWORD = 36,
   BOT_COMMAND_SAVE = 37,
   BOT_COMMAND_MOON = 38,
+  BOT_COMMAND_WIKI = 39,
+  BOT_COMMAND_BATTERY = 40,
   BOT_COMMAND_UNKNOWN = 26
 };
 
@@ -167,6 +169,14 @@ enum BotWriteResult : uint8_t {
   BOT_WRITE_NO_SPACE
 };
 
+enum BotReplyScope : uint8_t {
+  BOT_REPLY_UNSCOPED=0,
+  BOT_REPLY_CT_FFC=1,
+  BOT_REPLY_CT=2,
+  BOT_REPLY_LI=3,
+  BOT_REPLY_UNKNOWN=255
+};
+
 struct BotMessage {
   BotChannelKind channel_kind;
   char channel_name[BOT_MAX_CHANNEL_NAME_LEN + 1];
@@ -176,6 +186,7 @@ struct BotMessage {
   bool text_truncated;
   bool path_is_inbound;
   bool fairfield_scope_valid;
+  BotReplyScope reply_scope;
   uint32_t sender_timestamp;
   uint32_t received_at_timestamp;
   uint8_t path_len;
@@ -323,6 +334,7 @@ struct BotStats {
 };
 
 static_assert(BOT_COMMAND_UNKNOWN < 32, "BotCommandId must fit uint32_t command masks");
+static_assert(sizeof(BotReplyScope)==1, "Reply scope must remain a compact ID");
 static_assert(sizeof(BotMessage) <= 264, "BotMessage RAM budget exceeded");
 // Notes replacements retain a full DM payload rather than the normal 79-byte arguments.
 static_assert(sizeof(BotCommand) <= 200, "BotCommand RAM budget exceeded");

@@ -6,6 +6,8 @@ constexpr size_t SnapshotLimit=49152;
 bool begin();
 bool busy();
 bool manualPending();
+enum class Completion {None,Published,Unchanged,Failed};
+Completion takeCompletion(const char*& reason);
 bool due(uint32_t day,uint32_t ms);
 bool beginPreparation(uint32_t day);
 void preparationFailed(const char* reason,uint32_t ms);

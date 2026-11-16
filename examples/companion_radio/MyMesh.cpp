@@ -5,6 +5,8 @@
 #include "MyMesh.h"
 #if CMESH_BOT_ENABLED && defined(ESP32) && defined(BOT_REPEATER_MONITOR)
 #include "BotCommandTrace.h"
+#include "BotLookupMemory.h"
+#include <new>
 #endif
 
 #include <Arduino.h> // needed for PlatformIO
@@ -1174,6 +1176,39 @@ void MyMesh::observeBotDirectMessage(const ContactInfo &from, uint32_t sender_ti
 #endif
 }
 
+static const char* botReplyScopeName(BotReplyScope scope) {
+  switch(scope) {
+    case BOT_REPLY_CT_FFC:return "#ct-ffc";
+    case BOT_REPLY_CT:return "#ct";
+    case BOT_REPLY_LI:return "#li";
+    default:return nullptr;
+  }
+}
+
+static bool botReplyScopeKey(BotReplyScope scope,TransportKey& key) {
+  const char* name=botReplyScopeName(scope);
+  if(!name)return false;
+  // Same public-region derivation as TransportKeyStore, without storing a key
+  // in every queued message or carrying its 16-entry cache on the send stack.
+  mesh::Utils::sha256(key.key,sizeof(key.key),reinterpret_cast<const uint8_t*>(name),strlen(name));
+  return true;
+}
+
+void MyMesh::resolveBotReplyScope(BotMessage& message,const mesh::Packet* packet) {
+  message.reply_scope=BOT_REPLY_UNSCOPED;
+  if(!packet || !packet->hasTransportCodes())return;
+  message.reply_scope=BOT_REPLY_UNKNOWN;
+  unsigned matches=0;
+  for(unsigned i=BOT_REPLY_CT_FFC;i<=BOT_REPLY_LI;++i) {
+    TransportKey key;botReplyScopeKey(static_cast<BotReplyScope>(i),key);
+    // Transport codes are packet-specific HMACs; code 1 is a return hint.
+    if(packet->transport_codes[0]==key.calcTransportCode(packet)) {
+      message.reply_scope=static_cast<BotReplyScope>(i);++matches;
+    }
+  }
+  if(matches!=1)message.reply_scope=BOT_REPLY_UNKNOWN;
+}
+
 static bool botPacketUsesFairfieldScope(const mesh::Packet* packet) {
   if(!packet || !packet->hasTransportCodes())return false;
   TransportKeyStore store;TransportKey scope;
@@ -1188,6 +1223,8 @@ void MyMesh::observeBotChannelMessage(uint8_t channel_idx, const char *channel_n
   memset(&message, 0, sizeof(message));
   size_t channel_len = botBoundedStrLen(channel_name, BOT_MAX_CHANNEL_NAME_LEN);
   message.channel_kind = BotPolicy::classifyChannel(channel_name, channel_len, false, bot_prefs);
+  if(message.channel_kind==BOT_CHANNEL_BOT || message.channel_kind==BOT_CHANNEL_TESTING)
+    resolveBotReplyScope(message,packet);
   if(message.channel_kind==BOT_CHANNEL_FAIRFIELD)
     message.fairfield_scope_valid=botPacketUsesFairfieldScope(packet);
   if (channel_name && channel_len > 0) {
@@ -1273,7 +1310,7 @@ bool MyMesh::findBotChannel(BotChannelKind kind, uint8_t &channel_idx) {
   return false;
 }
 
-BotCommandResult MyMesh::executeBotHelloCommand(const BotMessage &message, char *output, size_t output_len) {
+BotCommandResult MyMesh::executeBotHelloCommand(const BotMessage &message, char *output, size_t output_len, bool includeScopeInfo) {
   uint32_t now = getRTCClock()->getCurrentTime();
   const char *target = message.sender_name[0] ? message.sender_name : NULL;
 
@@ -1296,6 +1333,10 @@ BotCommandResult MyMesh::executeBotHelloCommand(const BotMessage &message, char 
   }
 
   if(message.channel_kind==BOT_CHANNEL_FAIRFIELD) {
+    if(!includeScopeInfo) {
+      if(target)return botWriteFormatted(output,output_len,"%s @[%s]\nWelcome to #fairfield-county.",greeting,target);
+      return botWriteFormatted(output,output_len,"%s\nWelcome to #fairfield-county.",greeting);
+    }
     static const char welcome[]="\nWelcome to #fairfield-county. We are testing scoped messages to reduce the burden of the mesh.\nmore info on http://tiny.cc/ct-ffc";
     static const char explanation[]="\nWe are testing scoped messages to reduce the burden of the mesh.\nmore info on http://tiny.cc/ct-ffc";
     static const char compact[]="\nScoped messages reduce mesh traffic.\nmore info on http://tiny.cc/ct-ffc";
@@ -1309,6 +1350,12 @@ BotCommandResult MyMesh::executeBotHelloCommand(const BotMessage &message, char 
       return botWriteFormatted(output,output_len,"%s @[%s]%s",greeting,target,suffix);
     }
     return botWriteFormatted(output,output_len,"%s%s",greeting,suffix);
+  }
+
+  if(message.channel_kind==BOT_CHANNEL_BOT || message.channel_kind==BOT_CHANNEL_TESTING) {
+    static const char policy[]="I'll respond if mentioned or scoped with ct-ffc, ct, or li.";
+    if(target)return botWriteFormatted(output,output_len,"%s @[%s]\n%s",greeting,target,policy);
+    return botWriteFormatted(output,output_len,"%s\n%s",greeting,policy);
   }
 
   if (target) {
@@ -1527,28 +1574,27 @@ bool MyMesh::handleBotAdminCommand(const BotMessage &message, const ContactInfo 
   const bool adminHelp = adminHelpReply &&
       message.channel_kind == BOT_CHANNEL_DM && direct_recipient && repeaterMonitor &&
       repeaterMonitor->botAdmins().allows(direct_recipient->id.pub_key, BotAdminContacts::Commands);
-  if (command.id != BOT_COMMAND_ADVERT && command.id != BOT_COMMAND_CHECK && command.id != BOT_COMMAND_SYNC && command.id != BOT_COMMAND_ADD && command.id != BOT_COMMAND_REMOVE && command.id != BOT_COMMAND_ENABLE && command.id != BOT_COMMAND_DISABLE && command.id != BOT_COMMAND_NOTES && command.id != BOT_COMMAND_PASSWORD && command.id != BOT_COMMAND_SAVE && command.id != BOT_COMMAND_MOON && !adminHelp) return false;
+  if (command.id != BOT_COMMAND_ADVERT && command.id != BOT_COMMAND_CHECK && command.id != BOT_COMMAND_SYNC && command.id != BOT_COMMAND_ADD && command.id != BOT_COMMAND_REMOVE && command.id != BOT_COMMAND_ENABLE && command.id != BOT_COMMAND_DISABLE && command.id != BOT_COMMAND_NOTES && command.id != BOT_COMMAND_PASSWORD && command.id != BOT_COMMAND_SAVE && command.id != BOT_COMMAND_MOON && command.id != BOT_COMMAND_WIKI && !adminHelp) return false;
   // Use the authenticated DM contact's full key, never a channel name or key prefix.
   if (message.channel_kind != BOT_CHANNEL_DM || !direct_recipient || !repeaterMonitor ||
       !repeaterMonitor->botAdmins().allows(direct_recipient->id.pub_key, BotAdminContacts::Commands) ||
       message.text_truncated || pending_admin_advert.active || pending_voltage_list.active || pending_bot_dm_ack.active ||
       FirmwareBot::isCommandOnCooldown(bot_command_cooldowns, BOT_COMMAND_COOLDOWN_SLOTS,
                                       command.id, _ms->getMillis())) {
-    const char* reason=message.channel_kind!=BOT_CHANNEL_DM || !direct_recipient || !repeaterMonitor ||
-      !repeaterMonitor->botAdmins().allows(direct_recipient->id.pub_key,BotAdminContacts::Commands) ?
-      "Ignored: admin permission required" : message.text_truncated ? "Ignored: truncated admin command" :
-      pending_admin_advert.active || pending_voltage_list.active || pending_bot_dm_ack.active ?
-      "Ignored: admin response queue busy" : "Ignored: admin command cooldown";
-    BotPathLookup::recordCommandStage(bot_reply_history_id,reason);
     bot_stats.ignored_messages++;
     return true;
   }
+  BotCommandTrace adminTrace(bot_reply_history_id,message,direct_recipient->id.pub_key,command.id,bot_dm_request_repeated,FirmwareBot::hasBotMention(message.text,message.text_len,_prefs.node_name));
+  adminTrace.stage("Command received");
   const char *response = nullptr;
   char save_response[BOT_MAX_RESPONSE_LEN+1]{};
   if (adminHelp) {
     response=adminHelpReply;
   } else if (command.id == BOT_COMMAND_SAVE) {
     response=command.args_len ? "Usage: save" : nullptr;
+  } else if (command.id == BOT_COMMAND_WIKI) {
+    response=command.args_len ? "Usage: wiki" : repeaterMonitor->requestWikiUpdate(direct_recipient->id.pub_key);
+    if(!response)response="ct-ffc wiki update queued.";
   } else if (command.id == BOT_COMMAND_MOON) {
     if(!command.args_len) {
       repeaterMonitor->voltageList(pending_voltage_list.snapshot,false,true,true);
@@ -1625,7 +1671,7 @@ bool MyMesh::handleBotAdminCommand(const BotMessage &message, const ContactInfo 
     bot_stats.send_failures++;
   }
 #else
-  if (command.id != BOT_COMMAND_ADVERT && command.id != BOT_COMMAND_CHECK && command.id != BOT_COMMAND_SYNC && command.id != BOT_COMMAND_ADD && command.id != BOT_COMMAND_REMOVE && command.id != BOT_COMMAND_ENABLE && command.id != BOT_COMMAND_DISABLE && command.id != BOT_COMMAND_NOTES && command.id != BOT_COMMAND_PASSWORD && command.id != BOT_COMMAND_SAVE && command.id != BOT_COMMAND_MOON) return false;
+  if (command.id != BOT_COMMAND_ADVERT && command.id != BOT_COMMAND_CHECK && command.id != BOT_COMMAND_SYNC && command.id != BOT_COMMAND_ADD && command.id != BOT_COMMAND_REMOVE && command.id != BOT_COMMAND_ENABLE && command.id != BOT_COMMAND_DISABLE && command.id != BOT_COMMAND_NOTES && command.id != BOT_COMMAND_PASSWORD && command.id != BOT_COMMAND_SAVE && command.id != BOT_COMMAND_MOON && command.id != BOT_COMMAND_WIKI) return false;
   (void)message;
   (void)direct_recipient;
   bot_stats.ignored_messages++;
@@ -1639,9 +1685,20 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
   const bool parsed=FirmwareBot::parseAddressedCommand(message.text,message.text_len,
     message.channel_kind==BOT_CHANNEL_DM ? nullptr : _prefs.node_name,&command,
     BotPolicy::isPrefixlessCommandAllowed(message.channel_kind));
+  // Count a recognized command once if it exits without being accepted.
+  // Slot NONE was unused in both rolling and persisted activity counters.
+  struct CountIgnoredCommand {
+    MyMesh& mesh;uint32_t acceptedBefore;bool recognized;
+    ~CountIgnoredCommand() {
+      if(recognized && mesh.bot_stats.eligible_messages==acceptedBefore)
+        mesh.recordBotCommandStats(BOT_COMMAND_NONE);
+    }
+  } activity{*this,bot_stats.eligible_messages,parsed && command.id!=BOT_COMMAND_NONE &&
+      command.id!=BOT_COMMAND_UNKNOWN && command.id!=BOT_COMMAND_UNSUPPORTED &&
+      BotPolicy::decide(message.channel_kind)!=BOT_POLICY_EMERGENCY_FORWARD};
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
   BotCommandTrace trace(bot_reply_history_id,message,direct_recipient ? direct_recipient->id.pub_key : nullptr,
-    parsed ? command.id : BOT_COMMAND_UNKNOWN,bot_dm_request_repeated);
+    parsed ? command.id : BOT_COMMAND_UNKNOWN,bot_dm_request_repeated,FirmwareBot::hasBotMention(message.text,message.text_len,_prefs.node_name));
 #endif
 
   BotPolicyDecision decision = BotPolicy::decide(message.channel_kind);
@@ -1678,10 +1735,24 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
     trace.stage("Ignored: NTP unconfirmed");
 #endif
     ++bot_stats.ignored_messages;return;}
+  if((message.channel_kind==BOT_CHANNEL_BOT || message.channel_kind==BOT_CHANNEL_TESTING) &&
+      message.reply_scope==BOT_REPLY_UNSCOPED && !FirmwareBot::hasBotMention(message.text,message.text_len,_prefs.node_name)) {
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+    trace.stage("Ignored: mention or scope required");
+#endif
+    ++bot_stats.ignored_messages;return;
+  }
+  if((message.channel_kind==BOT_CHANNEL_BOT || message.channel_kind==BOT_CHANNEL_TESTING) &&
+      message.reply_scope==BOT_REPLY_UNKNOWN) {
+#if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+    trace.stage("Ignored: unrecognized request scope");
+#endif
+    ++bot_stats.ignored_messages;return;
+  }
   if(message.channel_kind==BOT_CHANNEL_FAIRFIELD && !message.fairfield_scope_valid) {
     if(fairfield_scope_notices.accept(message.sender_name,_ms->getMillis())) {
       char notice[BOT_MAX_RESPONSE_LEN+1];
-      const auto result=executeBotHelloCommand(message,notice,sizeof(notice));
+      const auto result=executeBotHelloCommand(message,notice,sizeof(notice),true);
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
       const uint32_t noticeId=trace.historyId() ? trace.historyId() :
         BotPathLookup::recordEvent(message.sender_name,"Unscoped Fairfield notice",message.channel_name);
@@ -1724,7 +1795,7 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
   }
 
   if(command.id==BOT_COMMAND_PATH && message.channel_kind!=BOT_CHANNEL_FAIRFIELD &&
-      message.path_is_inbound && message.path_hash_count>10 &&
+      message.path_is_inbound && message.path_hash_count>10 && message.reply_scope==BOT_REPLY_UNSCOPED &&
       !FirmwareBot::hasBotMention(message.text,message.text_len,_prefs.node_name)) {
     char notice[BOT_MAX_RESPONSE_LEN+1],formatted[BOT_MAX_RESPONSE_LEN+1];size_t written=0;
     const bool all=command.args_len==3 && !strcasecmp(command.args,"all");
@@ -1768,7 +1839,7 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
 #endif
     if(command.id==BOT_COMMAND_USER)bot_top_users.snapshot(_ms->getMillis(),q.snapshot);
     else bot_stats_window.snapshot(_ms->getMillis(),q.snapshot);
-    q.command=command.id;q.notification=false;q.adminOnly=false;q.kind=message.channel_kind;q.channel=channel_idx;
+    q.command=command.id;q.notification=false;q.adminOnly=false;q.kind=message.channel_kind;q.channel=channel_idx;q.reply_scope=message.reply_scope;
     q.next=0;q.part=1;q.failures=0;
     if(direct_recipient)memcpy(q.key,direct_recipient->id.pub_key,PUB_KEY_SIZE);
     q.deadline=_ms->getMillis();q.expires=q.deadline+600000;q.active=true;
@@ -1777,12 +1848,10 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
     return;
   }
   const bool neighborsAll = command.id == BOT_COMMAND_NEIGHBORS && command.args_len == 3 && !strcasecmp(command.args, "all");
-  const bool scopedList=command.id==BOT_COMMAND_LIST && message.channel_kind==BOT_CHANNEL_FAIRFIELD;
+  const bool scopedList=command.id==BOT_COMMAND_LIST;
   const bool scopedListAll=scopedList && command.args_len==3 && !strcasecmp(command.args,"all");
-  const bool listLow = command.args_len == 3 &&
-    (command.args[0]=='l' || command.args[0]=='L') &&
-    (command.args[1]=='o' || command.args[1]=='O') &&
-    (command.args[2]=='w' || command.args[2]=='W');
+  const bool battery=command.id==BOT_COMMAND_BATTERY;
+  const bool batteryLow=battery && command.args_len==3 && !strcasecmp(command.args,"low");
   // Keep the single DM acknowledgement slot intact while a list is being sent.
   if (pending_voltage_list.active && message.channel_kind == BOT_CHANNEL_DM) {
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
@@ -1791,7 +1860,7 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
     bot_stats.ignored_messages++; return;
   }
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
-  if (((command.id == BOT_COMMAND_LIST && (scopedList ? command.args_len>0 : !command.args_len || listLow) && repeaterMonitor) || neighborsAll) &&
+  if (((((scopedList && command.args_len>0) || (battery && (!command.args_len || batteryLow))) && repeaterMonitor) || neighborsAll) &&
       !pending_voltage_list.active && !pending_bot_dm_ack.active) {
     pending_voltage_list.scopedNames.reset();
     if (neighborsAll) {
@@ -1826,14 +1895,14 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
         }
         pending_voltage_list.snapshot.count=1;
       } else BotScopedHashList::build(bot_scoped_repeaters.entries(),day,pending_voltage_list.snapshot);
-    } else repeaterMonitor->voltageList(pending_voltage_list.snapshot,listLow);
+    } else repeaterMonitor->voltageList(pending_voltage_list.snapshot,batteryLow);
     if (pending_voltage_list.snapshot.count) {
       auto& q=pending_voltage_list;
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
     q.historyId=trace.historyId();trace.stage("Reply waiting in multipart queue");
 #endif
       q.command=command.id; q.notification=false;q.adminOnly=false;
-      q.kind=message.channel_kind; q.channel=channel_idx; q.next=0; q.part=1; q.failures=0;
+      q.kind=message.channel_kind; q.channel=channel_idx; q.reply_scope=message.reply_scope; q.next=0; q.part=1; q.failures=0;
       if (direct_recipient) memcpy(q.key,direct_recipient->id.pub_key,PUB_KEY_SIZE);
       q.deadline=_ms->getMillis(); q.expires=q.deadline+600000; q.active=true;
       // Even a worst-case search (one long name per part) must have time to
@@ -1991,10 +2060,14 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
       case BOT_COMMAND_ID:
         result = executeBotIdCommand(message, response, sizeof(response));
         break;
+      case BOT_COMMAND_BATTERY:
+        result = botWriteText(response,sizeof(response),command.args_len && !batteryLow ? "Usage: battery [low]" :
+          pending_voltage_list.active || pending_bot_dm_ack.active ? "Bot busy; try battery again shortly" :
+          batteryLow ? BotVoltageList::EMPTY_LOW : "No repeater readings available");
+        break;
       case BOT_COMMAND_LIST:
-        result = botWriteText(response,sizeof(response),scopedList ?
-          (!command.args_len ? BotFairfieldHelp::listReply : "Bot busy; try list again shortly") : command.args_len && !listLow ? "Usage: list [low]" :
-          pending_voltage_list.active || pending_bot_dm_ack.active ? "Bot busy; try list again shortly" : listLow ? BotVoltageList::EMPTY_LOW : "No repeater readings available");
+        result = botWriteText(response,sizeof(response),!command.args_len ?
+          BotFairfieldHelp::listReply : "Bot busy; try list again shortly");
         break;
       case BOT_COMMAND_NEIGHBORS:
         result = command.args_len && !neighborsAll ? botWriteText(response,sizeof(response),"Usage: neighbors [all]") :
@@ -2031,7 +2104,7 @@ void MyMesh::recordBotObservation(const BotMessage &message, const ContactInfo *
 
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
   if(command.id!=BOT_COMMAND_PATH)trace.stage("Reply prepared");
-  else if(!trace.historyId())trace.stage("Immediate PATH reply prepared");
+  else if(!trace.hasHistory())trace.stage("Immediate PATH reply prepared");
 #endif
   if (!sendBotResponse(message, direct_recipient, channel_idx,
                        final_response, final_response_len)) {
@@ -2049,7 +2122,7 @@ bool MyMesh::sendBotGroupMessage(uint8_t channel_idx, const char *text, size_t t
   uint32_t timestamp = getRTCClock()->getCurrentTimeUnique();
   // Spread simultaneous bot replies without blocking the radio loop.
   // The packet queue and receive-before-send checks still control actual TX.
-  const uint32_t replyDelay=300U+getRNG()->nextInt(0,1201); // 300..1500 ms.
+  const uint32_t replyDelay=500U+getRNG()->nextInt(0,1001); // 500..1500 ms.
 
 
   if(unscoped) {
@@ -2134,9 +2207,15 @@ bool MyMesh::sendBotResponse(const BotMessage &message, const ContactInfo *direc
 
   if (channel_idx == 0xFF) return false;
 
-  if (!sendBotGroupMessage(channel_idx, text, text_len)) {
-    return false;
+  const TransportKey saved_scope=send_scope;const bool saved_unscoped=send_unscoped;
+  const bool match_scope=message.channel_kind==BOT_CHANNEL_BOT || message.channel_kind==BOT_CHANNEL_TESTING;
+  if(match_scope) {
+    if(message.reply_scope!=BOT_REPLY_UNSCOPED && !botReplyScopeKey(message.reply_scope,send_scope))return false;
+    send_unscoped=message.reply_scope==BOT_REPLY_UNSCOPED;
   }
+  const bool sent=sendBotGroupMessage(channel_idx,text,text_len);
+  send_scope=saved_scope;send_unscoped=saved_unscoped;
+  if(!sent)return false;
 
   bot_stats.sent_messages++;
   return true;
@@ -2309,10 +2388,68 @@ void MyMesh::observeBotReplyPacket(mesh::Packet* packet,unsigned event) {
   // DM delivery is confirmed by its ACK, never by a flood echo.
   if(event==BotReplyTracker<MAX_HASH_SIZE>::Repeated && packet->getPayloadType()!=PAYLOAD_TYPE_GRP_TXT)return;
   uint8_t hash[MAX_HASH_SIZE];packet->calculatePacketHash(hash);
+  for(auto& retry:channel_reply_retries)if(retry.historyId && !memcmp(retry.hash,hash,MAX_HASH_SIZE)) {
+    if(event==BotReplyTracker<MAX_HASH_SIZE>::Repeated) {
+      retry.packet.reset();retry.historyId=0; // A heard repeat cancels the pending retry.
+    } else if(retry.queued && (event==BotReplyTracker<MAX_HASH_SIZE>::Transmitted || event==BotReplyTracker<MAX_HASH_SIZE>::Failed)) {
+      if(event==BotReplyTracker<MAX_HASH_SIZE>::Transmitted) {
+        bot_reply_tracker.extendChannel(hash,_ms->getMillis());
+        if(retry.notice)fairfield_scope_notices.extendPending(retry.historyId,_ms->getMillis());
+      }
+      BotPathLookup::recordReply(retry.historyId,event==BotReplyTracker<MAX_HASH_SIZE>::Transmitted ?
+        "Reply retry transmitted" : "Reply retry TX failed");
+      retry.historyId=0;
+    }
+  }
   bot_reply_tracker.observe(hash,static_cast<BotReplyTracker<MAX_HASH_SIZE>::Event>(event),_ms->getMillis(),
-    [this](const BotReplyTracker<MAX_HASH_SIZE>::Entry& e,BotReplyTracker<MAX_HASH_SIZE>::Event outcome) {
+    [this,packet](const BotReplyTracker<MAX_HASH_SIZE>::Entry& e,BotReplyTracker<MAX_HASH_SIZE>::Event outcome) {
       recordBotReplyEvent(e,unsigned(outcome));
+      if(!e.ack && outcome==BotReplyTracker<MAX_HASH_SIZE>::Transmitted && packet->getPayloadType()==PAYLOAD_TYPE_GRP_TXT) {
+        bot_reply_tracker.extendChannel(e.hash,_ms->getMillis());
+        if(e.notice)fairfield_scope_notices.extendPending(e.historyId,_ms->getMillis());
+        rememberChannelReplyRetry(packet,e.historyId,e.notice);
+      }
     });
+}
+
+void MyMesh::FreeRetryPacket::operator()(mesh::Packet* packet) const {
+  if(packet){packet->~Packet();std::free(packet);}
+}
+
+void MyMesh::rememberChannelReplyRetry(const mesh::Packet* packet,uint32_t historyId,bool notice) {
+  const uint32_t now=_ms->getMillis();
+  for(auto& retry:channel_reply_retries)if(!retry.historyId || int32_t(now-retry.expires)>=0) {
+    retry.packet.reset();retry.historyId=0;
+    void* memory=BotPathLookup::allocateBulk(sizeof(mesh::Packet));
+    if(!memory){BotPathLookup::recordCommandStage(historyId,"Channel retry unavailable: memory");return;}
+    retry.packet.reset(new(memory) mesh::Packet(*packet));
+    packet->calculatePacketHash(retry.hash);retry.historyId=historyId;retry.queued=false;retry.notice=notice;
+    retry.due=now+5000UL;retry.expires=now+115000UL;return;
+  }
+  BotPathLookup::recordCommandStage(historyId,"Channel retry unavailable: queue full");
+}
+
+void MyMesh::pollChannelReplyRetries() {
+  const uint32_t now=_ms->getMillis();
+  if(channel_reply_retry_due && int32_t(now-channel_reply_retry_due)>=0)channel_reply_retry_due=0;
+  for(auto& retry:channel_reply_retries) {
+    if(!retry.historyId)continue;
+    if(!bot_prefs.enabled || !botNtpReady() || int32_t(now-retry.expires)>=0) {
+      retry.packet.reset();retry.historyId=0;continue;
+    }
+    if(retry.queued || !retry.packet || int32_t(now-retry.due)<0 || channel_reply_retry_due)continue;
+    auto* packet=obtainNewPacket();
+    if(!packet){retry.due=now+5000UL;return;}
+    *packet=*retry.packet;
+    // Identical encrypted payload/hash and transport codes: no new command,
+    // lookup, multipart page or confirmation counter. Never re-arm on retry TX.
+    retry.queued=true;retry.packet.reset();retry.expires=now+120000UL;
+    bot_reply_tracker.extendChannel(retry.hash,now);
+    if(retry.notice)fairfield_scope_notices.extendPending(retry.historyId,now);
+    channel_reply_retry_due=now+5000UL;
+    BotPathLookup::recordReply(retry.historyId,"Reply retry queued: no repeat heard");
+    sendPacket(packet,1,500U+getRNG()->nextInt(0,1001));return;
+  }
 }
 #endif
 
@@ -2462,6 +2599,25 @@ bool MyMesh::sendAdminCheckResult(const uint8_t* key, const char* text) {
   return true; // Existing DM ACK/retry machinery owns delivery once queued.
 }
 
+bool MyMesh::sendMentionAnnouncement(BotChannelKind kind) {
+  if(!bot_prefs.enabled || !botNtpReady() ||
+      (kind!=BOT_CHANNEL_BOT && kind!=BOT_CHANNEL_TESTING))return false;
+  uint8_t channel;
+  if(!findBotChannel(kind,channel))return false;
+  static const char text[]="Hello, this is @[Fairfield 🤖]. I'll respond if mentioned or scoped with ct-ffc, ct, or li.";
+  static_assert(sizeof(text)-1<=BOT_MAX_GROUP_RESPONSE_LEN,"Mention announcement must fit one message");
+  return sendBotGroupMessage(channel,text,sizeof(text)-1);
+}
+
+bool MyMesh::sendAdminCommandResult(const uint8_t* key,const char* text) {
+  if(!bot_prefs.enabled || pending_voltage_list.active || pending_bot_dm_ack.active)return false;
+  if(!repeaterMonitor || !repeaterMonitor->botAdmins().allows(key,BotAdminContacts::Commands))return true;
+  auto* recipient=lookupContactByPubKey(key,PUB_KEY_SIZE);
+  if(!recipient)return true;
+  BotMessage message{};message.channel_kind=BOT_CHANNEL_DM;
+  return sendBotResponse(message,recipient,0xFF,text,strlen(text));
+}
+
 bool MyMesh::sendStartupNotification(const uint8_t* key, const char* text) {
   if (!bot_prefs.enabled || pending_voltage_list.active || pending_bot_dm_ack.active) return false;
   if (!repeaterMonitor || !repeaterMonitor->botAdmins().allows(key, BotAdminContacts::Notifications)) return true;
@@ -2525,7 +2681,7 @@ void MyMesh::sendNextVoltageListPart() {
     q.active=false;
   };
   char body[BOT_MAX_RESPONSE_LEN+1],formatted[BOT_MAX_RESPONSE_LEN+1];size_t next=q.next,written=0;
-  const bool scopedList=q.command==BOT_COMMAND_LIST && q.kind==BOT_CHANNEL_FAIRFIELD && !q.notification;
+  const bool scopedList=q.command==BOT_COMMAND_LIST && !q.notification;
   if(!scopedList)q.scopedNames.reset();
   const bool scopedHashes=scopedList && !q.scopedNames;
   // Users may use the full reply budget; keep other list/report budgets unchanged.
@@ -2546,7 +2702,7 @@ void MyMesh::sendNextVoltageListPart() {
     if(!BotVoltageList::page(*q.scopedNames,next,q.part,body,bodyCapacity)) {formattingFailed();q.scopedNames.reset();return;}
   } else if(!BotVoltageList::page(q.snapshot,next,q.part,body + headingLen,bodyCapacity - headingLen,
       q.command==BOT_COMMAND_NOTES,scopedHashes ? ',' : '\n')) {formattingFailed();return;}
-  BotMessage message{};message.channel_kind=q.kind;
+  BotMessage message{};message.channel_kind=q.kind;message.reply_scope=q.reply_scope;
   if(!botFormatResponseForChannel(message,body,strlen(body),formatted,sizeof(formatted),&written) ||
      !sendBotResponse(message,recipient,q.channel,formatted,written)) {
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
@@ -2560,8 +2716,10 @@ void MyMesh::sendNextVoltageListPart() {
 }
 
 void MyMesh::recordBotCommandStats(BotCommandId id) {
+  // Preserve the stored history layout; voltage listings remain in the list category.
+  if(id==BOT_COMMAND_BATTERY)id=BOT_COMMAND_LIST;
   // Reuse the existing admin bucket without changing persisted history layout.
-  if(id==BOT_COMMAND_SAVE || id==BOT_COMMAND_MOON)id=BOT_COMMAND_NOTES;
+  if(id==BOT_COMMAND_SAVE || id==BOT_COMMAND_MOON || id==BOT_COMMAND_WIKI)id=BOT_COMMAND_NOTES;
   bot_stats_window.accepted(id,_ms->getMillis());
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
   const uint32_t utc=getRTCClock()->getCurrentTime();
@@ -2571,6 +2729,9 @@ void MyMesh::recordBotCommandStats(BotCommandId id) {
 
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
 void MyMesh::exportBotStats(JsonObject out) {
+  out["channelRepliesTransmitted"]=bot_reply_tracker.transmittedCount();
+  out["channelRepliesRepeated"]=bot_reply_tracker.repeatedCount();
+  out["channelRepliesUntracked"]=bot_reply_tracker.untrackedCount();
   out["unexpectedTxIrqs"]=radio_driver.getUnexpectedTxIrqs();
   out["lastUnexpectedTxIrq"]=radio_driver.getLastUnexpectedTxIrq();
   const BotTopUsers::User* topUsers[10]{};uint32_t userCounts[10]{};
@@ -2593,6 +2754,7 @@ void MyMesh::exportBotStats(JsonObject out) {
     if(!meta || (meta->visibility!=BOT_COMMAND_VISIBILITY_DISCOVERABLE && i!=BOT_COMMAND_ADVERT))continue;
     categories.add(i==BOT_COMMAND_ADVERT ? "admin" : meta->name);ids[count++]=i;
   }
+  categories.add("ignored");ids[count++]=BOT_COMMAND_NONE;
   uint64_t rolling[BotStatsHistory::COMMANDS]{};bot_stats_window.totals(ticks,rolling);
   for(size_t i=0;i<BotStatsHistory::COMMANDS;++i) {
     const auto* meta=BotCommandRegistry::findById((BotCommandId)i);
@@ -2777,6 +2939,7 @@ void MyMesh::tickBot() {
   pollAdminAdvert();
   pollBotPath();
 #if defined(ESP32) && defined(BOT_REPEATER_MONITOR)
+  pollChannelReplyRetries();
   pollScopedRepeaterLookup();
 #endif
   sendNextVoltageListPart();

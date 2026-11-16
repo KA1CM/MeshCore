@@ -405,6 +405,11 @@ void recordCommand(uint32_t id,BotCommandId command) {
   for(auto& e:lookupHistory)if(id && e.id==id){e.command=command;break;}
   portEXIT_CRITICAL(&statusMux);
 }
+void recordRequestContext(uint32_t id,BotReplyScope scope,bool mentioned) {
+  portENTER_CRITICAL(&statusMux);
+  for(auto& e:lookupHistory)if(id && e.id==id){e.requestScope=scope;e.mentioned=mentioned;break;}
+  portEXIT_CRITICAL(&statusMux);
+}
 void recordCommandStage(uint32_t id,const char* stage) {
   portENTER_CRITICAL(&statusMux);
   for(auto& e:lookupHistory)if(id && e.id==id){e.stage=stage;break;}

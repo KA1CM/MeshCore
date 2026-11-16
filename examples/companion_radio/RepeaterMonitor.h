@@ -92,12 +92,38 @@ class RepeaterMonitor {
   void sendRepeaterAdvert(bool flood);
   void retryRepeaterAdvert();
   void pollRepeaterAdvert();
-  bool busy() const { return running || syncPhase != SyncIdle || advertPhase != AdvertIdle || moonPhase!=MoonIdle; }
+  struct BatchRow { uint8_t key[32]; char name[33], result[192]; bool retryable; };
+  struct FreeBatch { void operator()(BatchRow* rows) const; };
+  std::unique_ptr<BatchRow[],FreeBatch> batchRows;
+  enum BatchPhase {BatchIdle,BatchNext,BatchLogin,BatchReady,BatchReply} batchPhase=BatchIdle;
+  size_t batchCount=0,batchIndex=0;
+  int batchOnly=-1;
+  uint32_t batchRevision=0;
+  bool batchCancel=false;
+  char batchCommand[96]{},batchPrefix[4]{};
+  uint32_t batchDeadline=0,batchExpires=0;
+  uint32_t batchLoginSentUtc=0,batchLoginSentMillis=0;
+  bool batchLoginFlood=false;
+  void sendBatchLogin(bool flood);
+  uint8_t batchToken=0;
+  void pollBatch();
+  void finishBatchRow(const char* result,bool retryable=false);
+  void exportBatch(JsonObject out);
+  bool busy() const { return batchPhase!=BatchIdle || running || syncPhase != SyncIdle || advertPhase != AdvertIdle || moonPhase!=MoonIdle; }
   bool syncTimeReady() const { return synced && (uint32_t)(millis() - lastNtpSync) < 21600000UL; }
   void pollClockSync();
   void pollAutomaticClockSync();
   void pollAnalyzerClocks();
   void pollPiPublisher();
+  void pollWikiReply();
+  void pollMentionAnnouncements();
+  bool mentionScheduleLoaded=false;
+  uint8_t mentionNextChannel=0;
+  uint32_t mentionLastSent[2]{},mentionNoticeDue=30000;
+  bool wikiReplyPending=false,wikiReplyReady=false;
+  uint8_t wikiReplyKey[32]{};
+  char wikiReplyText[145]{};
+  uint32_t wikiReplyDue=0,wikiReplyExpires=0;
   std::unique_ptr<JsonDocument> piSnapshot;
   bool piLookupRunning=false;
   uint32_t piLookupSequence=0,piLookupDue=0,piPreparationStarted=0;
@@ -172,6 +198,7 @@ class RepeaterMonitor {
   ContactInfo* contact();
   void poll();
 public:
+  const char* requestWikiUpdate(const uint8_t* requester=nullptr);
   const char* adminMoon(const uint8_t* sender,const char* args);
   const char* adminPassword(const uint8_t* sender, const char* args);
   const char* adminNotes(const uint8_t* sender, const char* args, BotVoltageList::Snapshot& out);

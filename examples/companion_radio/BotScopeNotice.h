@@ -35,6 +35,11 @@ public:
       return; // Duplicate repeats never extend an existing cooldown.
     }
   }
+  void extendPending(uint32_t requestId,uint32_t now) {
+    age(now);
+    for(auto& e:entries)if(e.remaining && e.pending && e.requestId==requestId)
+      e.remaining=120000UL; // Await confirmation; do not start the hour cooldown.
+  }
   void failed(uint32_t requestId) {
     if(!requestId)return;
     for(auto& e:entries)if(e.pending && e.requestId==requestId)e.remaining=0;

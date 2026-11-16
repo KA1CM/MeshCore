@@ -533,6 +533,8 @@ void RepeaterMonitor::routes() {
     mesh.exportScopedRepeaters(doc["ctFfcRepeaters"].to<JsonObject>());
     doc["clockSyncRunning"] = syncPhase != SyncIdle;
     doc["moonRunning"]=moonPhase!=MoonIdle;
+    doc["batchRunning"]=batchPhase!=BatchIdle;
+    if(requestIsAdmin)exportBatch(doc["batchCli"].to<JsonObject>());
     doc["clockSyncResult"] = syncResult;
     if (syncTarget >= 0 && syncTarget < (int)count) {
       char key[65]; formatKey(entries[syncTarget].key, key); doc["clockSyncKey"] = key;
@@ -585,6 +587,7 @@ void RepeaterMonitor::routes() {
       row["channel"]=lookupEntry.channel;row["requester"]=lookupEntry.requester;row["timestamp"]=lookupEntry.timestamp;
       row["stage"]=lookupEntry.stage;row["detail"]=lookupEntry.detail;
       row["reply"]=lookupEntry.reply;
+      row["requestScope"]=uint8_t(lookupEntry.requestScope);row["mentioned"]=lookupEntry.mentioned;
       const auto* command=BotCommandRegistry::findById(lookupEntry.command);
       row["command"]=command ? command->name : "";
       if(lookupEntry.dmSenderKey[0]) {
@@ -745,6 +748,68 @@ void RepeaterMonitor::routes() {
     }
     server.send(404,"text/plain","Repeater is no longer in the list.");
   });
+  server.on("/api/batch-cli",HTTP_POST,[this]() {
+    if(!authorized(true))return;
+    JsonDocument doc;String body=server.arg("plain");
+    if(body.length()>4096 || deserializeJson(doc,body)) {
+      server.send(400,"text/plain","Invalid batch request.");return;
+    }
+    if(doc["cancel"]==true) {
+      batchCancel=true;server.send(200,"application/json","{\"ok\":true}");return;
+    }
+    if(!synced || !storageOK || busy() || adminCheckPending || BotPathLookup::inProgress()) {
+      server.send(409,"text/plain","Wait for NTP, storage and current operations.");return;
+    }
+    if(!doc["retry"].isNull()) {
+      uint8_t key[32];
+      if(!parseKey(doc["retry"] | "",key) || !doc["revision"].is<uint32_t>() ||
+          doc["revision"].as<uint32_t>()!=batchRevision) {
+        server.send(409,"text/plain","Batch results changed; refresh before retrying.");return;
+      }
+      int row=-1;for(size_t i=0;i<batchCount;++i)if(!memcmp(batchRows[i].key,key,32)){row=i;break;}
+      if(row<0 || !batchRows[row].retryable){server.send(409,"text/plain","Only timed-out rows can be retried.");return;}
+      bool enabled=false;for(size_t i=0;i<count;++i)if(entries[i].enabled && !memcmp(entries[i].key,key,32)){enabled=true;break;}
+      if(!enabled){server.send(409,"text/plain","Repeater is disabled or removed.");return;}
+      batchOnly=row;batchIndex=row;batchCancel=false;batchRows[row].retryable=false;
+      snprintf(batchRows[row].result,sizeof(BatchRow::result),"Queued for retry using existing session");
+      // An explicit manual retry sends only the CLI command, without login.
+      ++batchRevision;batchPhase=BatchReady;batchExpires=millis()+1800000UL;
+      // Preserve any remaining inter-repeater pacing from the previous run.
+      if(elapsed(millis(),batchDeadline))batchDeadline=millis();
+      server.send(202,"application/json","{\"queued\":true}");return;
+    }
+    JsonString command=doc["command"].as<JsonString>();
+    if(!command.c_str() || !command.size() || command.size()>=sizeof(batchCommand)) {
+      server.send(400,"text/plain","Enter one command of 1 to 95 bytes.");return;
+    }
+    for(size_t i=0;i<command.size();++i)if((uint8_t)command.c_str()[i]<32 || command.c_str()[i]=='|' || command.c_str()[i]==127) {
+      server.send(400,"text/plain","Use one command without control characters or |.");return;
+    }
+    JsonArrayConst keys=doc["keys"].as<JsonArrayConst>();
+    if(keys.size()==0 || keys.size()>MAX_REPEATERS){server.send(400,"text/plain","Select at least one managed repeater.");return;}
+    uint8_t selected[MAX_REPEATERS];size_t selectedCount=0;
+    for(JsonVariantConst value:keys) {
+      uint8_t key[32];int index=-1;
+      if(parseKey(value | "",key))for(size_t i=0;i<count;++i)if(entries[i].enabled && !memcmp(entries[i].key,key,32)){index=i;break;}
+      if(index<0){server.send(409,"text/plain","Selected repeater is disabled or removed; preview again.");return;}
+      for(size_t i=0;i<selectedCount;++i)if(selected[i]==index){server.send(400,"text/plain","Duplicate batch target.");return;}
+      selected[selectedCount++]=index;
+    }
+    std::unique_ptr<BatchRow[],FreeBatch> rows(static_cast<BatchRow*>(BotPathLookup::allocateBulk(selectedCount*sizeof(BatchRow))));
+    if(!rows){server.send(503,"text/plain","Not enough memory for batch results.");return;}
+    for(size_t n=0;n<selectedCount;++n) {
+      const auto& entry=entries[selected[n]];
+      auto& row=rows[n];row=BatchRow{};memcpy(row.key,entry.key,32);
+      auto* contact=mesh.lookupContactByPubKey(row.key,32);
+      snprintf(row.name,sizeof(row.name),"%s",contact && contact->name[0] ? contact->name : entry.learnedName[0] ? entry.learnedName : entry.name);
+      snprintf(row.result,sizeof(row.result),"Queued");
+    }
+    if(!batchCount)batchToken=uint8_t(esp_random());
+    batchRows=std::move(rows);batchCount=selectedCount;batchIndex=0;batchCancel=false;batchOnly=-1;++batchRevision;
+    memcpy(batchCommand,command.c_str(),command.size());batchCommand[command.size()]=0;
+    batchPhase=BatchNext;batchDeadline=millis();batchExpires=millis()+1800000UL;
+    server.send(202,"application/json","{\"queued\":true}");
+  });
   server.on("/api/moon",HTTP_POST,[this]() {
     if(!authorized(true))return;
     if(!synced || !storageOK || busy() || BotPathLookup::inProgress()) {
@@ -792,10 +857,7 @@ void RepeaterMonitor::routes() {
   });
   server.on("/api/pi-publish", HTTP_POST, [this]() {
     if(!authorized(true))return;
-    if(!synced || now()<VALID_TIME || !storageOK) {
-      server.send(409,"text/plain","Wait for NTP confirmation and working storage.");return;
-    }
-    if(const char* error=BotPiPublisher::requestManual(easternDay(now()),millis())) {
+    if(const char* error=requestWikiUpdate()) {
       server.send(409,"text/plain",error);return;
     }
     server.send(202,"application/json","{\"queued\":true}");
@@ -1524,6 +1586,23 @@ void RepeaterMonitor::completeReading() {
 }
 
 bool RepeaterMonitor::onResponse(const ContactInfo& from, const uint8_t* data, size_t len) {
+  if(batchPhase==BatchLogin && batchIndex<batchCount && !elapsed(millis(),batchDeadline) &&
+      !memcmp(from.id.pub_key,batchRows[batchIndex].key,32) && modernLoginOK(data,len)) {
+    if(data[6]!=1)finishBatchRow("No admin permission");
+    else {
+      int64_t offset;uint32_t uncertainty;
+      if(syncTimeReady() && loginClock(data,len,batchLoginSentUtc,
+          uint32_t(millis()-batchLoginSentMillis),offset,uncertainty)) {
+        for(size_t i=0;i<count;++i)if(entries[i].enabled && !memcmp(entries[i].key,from.id.pub_key,32)) {
+          entries[i].clockCheckedAt=now();entries[i].clockOffset=offset;entries[i].clockUncertainty=uncertainty;
+          // Persist from the main loop, outside the radio receive callback.
+          storageSaveDeferred=true;BotPathLookup::setStoragePending(true);break;
+        }
+      }
+      batchPhase=BatchReady;batchDeadline=millis()+5000;
+    }
+    return true;
+  }
   if(moonPhase==MoonLogin && moonTarget>=0 && !elapsed(millis(),moonDeadline) &&
       !memcmp(from.id.pub_key,entries[moonTarget].key,32) && modernLoginOK(data,len)) {
     if(data[6]!=1)finishMoon(3);
@@ -1578,7 +1657,7 @@ bool RepeaterMonitor::onResponse(const ContactInfo& from, const uint8_t* data, s
 }
 
 void RepeaterMonitor::poll() {
-  if (!synced || !storageOK || syncPhase != SyncIdle || advertPhase != AdvertIdle || moonPhase!=MoonIdle) return;
+  if (!synced || !storageOK || batchPhase!=BatchIdle || syncPhase != SyncIdle || advertPhase != AdvertIdle || moonPhase!=MoonIdle) return;
   if (!running) {
     for (size_t i = 0; i < count; ++i) if (due(entries[i], now())) { startRun(true); break; }
   }
@@ -1643,6 +1722,30 @@ void RepeaterMonitor::onVerifiedAdvert(const uint8_t* key, uint32_t timestamp, u
     }
     return;
   }
+}
+
+const char* RepeaterMonitor::requestWikiUpdate(const uint8_t* requester) {
+  if(!synced || now()<VALID_TIME || !storageOK)return "Wait for NTP confirmation and working storage.";
+  if(requester && wikiReplyPending)return "Previous wiki update result is still pending.";
+  if(const char* error=BotPiPublisher::requestManual(easternDay(now()),millis()))return error;
+  if(requester){memcpy(wikiReplyKey,requester,32);wikiReplyPending=true;wikiReplyReady=false;}
+  return nullptr;
+}
+
+void RepeaterMonitor::pollWikiReply() {
+  using BotPiPublisher::Completion;
+  const char* reason=nullptr;const Completion result=BotPiPublisher::takeCompletion(reason);
+  if(wikiReplyPending && !wikiReplyReady && result!=Completion::None) {
+    if(result==Completion::Published)snprintf(wikiReplyText,sizeof(wikiReplyText),"ct-ffc wiki updated. Confirmed by Pi.");
+    else if(result==Completion::Unchanged)snprintf(wikiReplyText,sizeof(wikiReplyText),"ct-ffc wiki already up to date. Confirmed by Pi.");
+    else snprintf(wikiReplyText,sizeof(wikiReplyText),"ct-ffc wiki update failed: %.112s",reason ? reason : "Unknown error");
+    wikiReplyReady=true;wikiReplyDue=millis()+5000;wikiReplyExpires=millis()+600000;
+  }
+  if(!wikiReplyPending || !wikiReplyReady)return;
+  if(elapsed(millis(),wikiReplyExpires)){wikiReplyPending=false;return;}
+  if(busy() || !elapsed(millis(),wikiReplyDue))return;
+  wikiReplyDue=millis()+5000;
+  if(mesh.sendAdminCommandResult(wikiReplyKey,wikiReplyText))wikiReplyPending=false;
 }
 
 void RepeaterMonitor::pollPiPublisher() {
@@ -1881,6 +1984,12 @@ void RepeaterMonitor::recordClockSample(uint32_t remoteMinute) {
 }
 
 bool RepeaterMonitor::onCommandResponse(const ContactInfo& from, const char* text) {
+  if(batchPhase==BatchReply && batchIndex<batchCount && !elapsed(millis(),batchDeadline) &&
+      !memcmp(from.id.pub_key,batchRows[batchIndex].key,32) && !strncmp(text,batchPrefix,3)) {
+    char result[192];snprintf(result,sizeof(result),"%.178s%s",
+      text+3,strlen(text+3)>178 ? " [truncated]" : "");
+    finishBatchRow(result);return true;
+  }
   if(moonPhase==MoonReply && moonTarget>=0 && !elapsed(millis(),moonDeadline) &&
       !memcmp(from.id.pub_key,entries[moonTarget].key,32) && !strncmp(text,moonPrefix,3)) {
     if(!strcmp(text+3,moonOn ? "OK - repeat is now ON" : "OK - repeat is now OFF"))finishMoon(2);
@@ -2135,6 +2244,129 @@ void RepeaterMonitor::pollSunriseNotification() {
   sunriseNotificationPending = false;
 }
 
+
+void RepeaterMonitor::FreeBatch::operator()(BatchRow* rows) const { std::free(rows); }
+
+void RepeaterMonitor::exportBatch(JsonObject out) {
+  out["running"]=batchPhase!=BatchIdle;out["cancelPending"]=batchCancel;
+  out["revision"]=batchRevision;
+  out["command"]=batchCommand;
+  JsonArray rows=out["rows"].to<JsonArray>();
+  for(size_t i=0;i<batchCount;++i) {
+    auto row=rows.add<JsonObject>();char key[65];formatKey(batchRows[i].key,key);
+    row["key"]=key;row["name"]=batchRows[i].name;row["result"]=batchRows[i].result;row["retryable"]=batchRows[i].retryable;
+  }
+}
+
+void RepeaterMonitor::finishBatchRow(const char* result,bool retryable) {
+  if(batchIndex<batchCount) {
+    auto& row=batchRows[batchIndex];snprintf(row.result,sizeof(row.result),"%s",result);row.retryable=retryable;
+    batchIndex=batchOnly>=0 ? batchCount : batchIndex+1;
+  }
+  batchPhase=BatchNext;batchDeadline=millis()+10000;
+}
+
+void RepeaterMonitor::sendBatchLogin(bool flood) {
+  auto* contact=mesh.lookupContactByPubKey(batchRows[batchIndex].key,32);
+  if(!contact){finishBatchRow("Skipped: contact unavailable");return;}
+  const char* password=credentials.password(contact->id.pub_key);
+  if(!password[0]){finishBatchRow("Skipped: no saved password");return;}
+  ContactInfo target=*contact;
+  batchLoginFlood=flood || target.out_path_len==OUT_PATH_UNKNOWN;
+  if(batchLoginFlood)target.out_path_len=OUT_PATH_UNKNOWN;
+  batchLoginSentUtc=now();batchLoginSentMillis=millis();
+  uint32_t estimate=0;
+  const bool sent=mesh.sendLogin(target,password,estimate)!=MSG_SEND_FAILED;
+  if(!sent && batchLoginFlood){finishBatchRow("Login could not be queued");return;}
+  snprintf(batchRows[batchIndex].result,sizeof(BatchRow::result),"Authenticating (%s)",batchLoginFlood ? "flood" : "known route");
+  batchPhase=BatchLogin;
+  const uint32_t wait=timeout(estimate);
+  // A local queue failure on the known route also permits one flood fallback.
+  batchDeadline=millis()+(sent ? (wait>45000 ? 45000 : wait) : 0);
+}
+
+void RepeaterMonitor::pollBatch() {
+  if(batchPhase==BatchIdle)return;
+  const uint32_t ms=millis();
+  if(elapsed(ms,batchExpires) || !synced || !storageOK) {
+    // A sent command may still execute; never imply cancellation undid it.
+    if(batchPhase==BatchReply)finishBatchRow("Reply unconfirmed; batch stopped");
+    while(batchIndex<batchCount)finishBatchRow("Skipped: batch stopped");
+    batchPhase=BatchIdle;return;
+  }
+  if(batchIndex>=batchCount){batchPhase=BatchIdle;return;}
+  int index=-1;for(size_t i=0;i<count;++i)if(!memcmp(entries[i].key,batchRows[batchIndex].key,32)){index=i;break;}
+  if(index<0 || !entries[index].enabled){finishBatchRow("Skipped: disabled or removed");return;}
+  // Cancel waits only for an already-sent CLI command, not for login/preparation.
+  if(batchCancel && batchPhase!=BatchReply) {
+    while(batchIndex<batchCount)finishBatchRow("Cancelled");
+    batchPhase=BatchIdle;return;
+  }
+  if(!elapsed(ms,batchDeadline))return;
+  if(batchPhase==BatchLogin){
+    if(!batchLoginFlood)sendBatchLogin(true);
+    else finishBatchRow("Login timed out",true);
+    return;
+  }
+  if(batchPhase==BatchReply){finishBatchRow("Timed out; command may have executed",true);return;}
+  if(batchPhase==BatchReady && storageSaveDeferred)return;
+  if(batchPhase==BatchNext){sendBatchLogin(false);return;}
+  auto* contact=mesh.lookupContactByPubKey(batchRows[batchIndex].key,32);
+  if(!contact){finishBatchRow("Skipped: contact unavailable");return;}
+  ContactInfo target=*contact;target.out_path_len=OUT_PATH_UNKNOWN;
+  uint32_t estimate=0;
+  {
+    const uint32_t utc=now(),stamp=mesh.getRTCClock()->getCurrentTimeUnique();
+    if(stamp<utc || stamp-utc>5){finishBatchRow("Skipped: clock unavailable");return;}
+    snprintf(batchPrefix,sizeof(batchPrefix),"%02X|",(unsigned)++batchToken);
+    char command[100];snprintf(command,sizeof(command),"%s%s",batchPrefix,batchCommand);
+    if(mesh.sendCommandData(target,stamp,0,command,estimate)==MSG_SEND_FAILED){finishBatchRow("Command could not be queued");return;}
+    // These commands terminate execution before the repeater can send a CLI
+    // response. Queue acceptance does not confirm execution or reboot.
+    if(!strcmp(batchCommand,"clkreboot") || !strcmp(batchCommand,"reboot") ||
+        !strcmp(batchCommand,"poweroff") || !strcmp(batchCommand,"shutdown")) {
+      finishBatchRow("Queued; no reply expected");
+      batchDeadline=ms+10000;return;
+    }
+    snprintf(batchRows[batchIndex].result,sizeof(BatchRow::result),"Sent; waiting for reply");batchPhase=BatchReply;
+  }
+  const uint32_t wait=timeout(estimate);batchDeadline=ms+(wait>45000 ? 45000 : wait);
+}
+
+void RepeaterMonitor::pollMentionAnnouncements() {
+  const uint32_t ms=millis(),utc=now();
+  if(!synced || utc<VALID_TIME || !storageOK || !mesh.hasSentBotAdvert() || busy() ||
+      BotPathLookup::inProgress() || BotPathLookup::storagePending() || storageSaveDeferred ||
+      mesh.hasPendingPathReplies() || !elapsed(ms,mentionNoticeDue))return;
+  mentionNoticeDue=ms+10000;
+  const uint32_t day=easternDay(utc);
+  if(utc<sunrise(day)+2UL*3600UL)return;
+  static const char* keys[]={"bot","test"};
+  if(!mentionScheduleLoaded) {
+    Preferences prefs;
+    if(!prefs.begin("bot-mentions",false)){mentionNoticeDue=ms+300000;return;}
+    for(size_t i=0;i<2;++i)mentionLastSent[i]=prefs.getULong(keys[i],0);
+    prefs.end();mentionScheduleLoaded=true;
+  }
+  for(size_t offset=0;offset<2;++offset) {
+    const size_t i=(mentionNextChannel+offset)%2;
+    const uint32_t previous=mentionLastSent[i];
+    if(previous && easternDay(previous)>=day)continue;
+    Preferences prefs;
+    if(!prefs.begin("bot-mentions",false)){mentionNoticeDue=ms+300000;return;}
+    // Reserve before enqueueing so a reset cannot replay an announcement.
+    if(prefs.putULong(keys[i],utc)!=sizeof(uint32_t)){prefs.end();mentionNoticeDue=ms+300000;return;}
+    mentionLastSent[i]=utc;
+    mentionNextChannel=(i+1)%2;
+    if(!mesh.sendMentionAnnouncement(i==0 ? BOT_CHANNEL_BOT : BOT_CHANNEL_TESTING)) {
+      // Retry a local queue/channel failure later, if rollback was durable.
+      if(prefs.putULong(keys[i],previous)==sizeof(uint32_t))mentionLastSent[i]=previous;
+      mentionNoticeDue=ms+300000;
+    }
+    prefs.end();return; // At most one announcement; channels are paced apart.
+  }
+}
+
 void RepeaterMonitor::loop() {
   if(batterySignature && elapsed(millis(),nextBatterySample)) {
     // Battery voltage cannot establish USB presence. Sample only for an
@@ -2174,6 +2406,7 @@ void RepeaterMonitor::loop() {
   restartHistory.poll(now(),synced);
   if (elapsed(millis(), nextNameCheck)) { nextNameCheck = millis() + 10000; rememberNames(); }
   if (synced && elapsed(millis(), nextPrune)) { prune(now()); nextPrune = millis() + 60000; }
+  pollBatch();
   pollRepeaterAdvert();
   pollMoon(); // Daytime repeat-on waits for the completed morning voltage check.
   pollClockSync();
@@ -2184,6 +2417,8 @@ void RepeaterMonitor::loop() {
   pollSunriseNotification();
   pollConnectivity();
   pollPiPublisher();
+  pollWikiReply();
+  pollMentionAnnouncements();
   pollAnalyzerClocks();
   pollConnectivityNotifications();
 }

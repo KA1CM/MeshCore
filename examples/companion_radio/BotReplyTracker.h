@@ -14,19 +14,29 @@ public:
     bool acknowledged=false;
     bool notice=false, transmitted=false, repeated=false, failed=false;
   };
+  uint64_t transmittedCount() const {return channelTransmitted;}
+  uint64_t repeatedCount() const {return channelRepeated;}
+  uint32_t untrackedCount() const {return channelUntracked;}
+  void extendChannel(const uint8_t* hash,uint32_t now) {
+    for(auto& e:entries)if(e.historyId && !e.ack && !e.repeated && !e.failed &&
+        int32_t(now-e.expires)<0 && !memcmp(e.hash,hash,HashSize))e.expires=now+120000UL;
+  }
   bool add(const uint8_t* hash,uint32_t id,bool notice,uint32_t now,uint32_t ack=0,uint32_t tag=0) {
     for(auto& e:entries) if(!e.historyId || int32_t(now-e.expires)>=0) {
       e=Entry{};memcpy(e.hash,hash,HashSize);e.historyId=id;
       e.notice=notice;e.ack=ack;e.tag=tag;e.expires=now+120000UL;return true;
     }
+    if(!ack && channelUntracked!=UINT32_MAX)++channelUntracked;
     return false; // Never overwrite a live packet or interfere with sending.
   }
   template<class Callback> void observe(const uint8_t* hash,Event event,uint32_t now,Callback callback) {
     for(auto& e:entries) {
       if(!e.historyId || e.acknowledged || int32_t(now-e.expires)>=0 || memcmp(e.hash,hash,HashSize))continue;
       if(event==Transmitted && !e.transmitted && !e.failed) {
+        if(!e.ack)++channelTransmitted;
         e.transmitted=true;callback(e,event);
       } else if(event==Repeated && e.transmitted && !e.repeated && !e.failed) {
+        if(!e.ack)++channelRepeated;
         e.repeated=true;callback(e,event);
       } else if(event==Failed && !e.transmitted && !e.failed) {
         e.failed=true;callback(e,event);
@@ -43,5 +53,8 @@ public:
     }
   }
 private:
+  // Cumulative RAM counters survive diagnostic-row eviction, reset on reboot.
+  uint64_t channelTransmitted=0,channelRepeated=0;
+  uint32_t channelUntracked=0;
   Entry entries[32];
 };

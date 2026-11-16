@@ -296,7 +296,7 @@ bool parseCommand(const char* text, size_t text_len, BotCommand* command, bool a
   const BotCommandMetadata* metadata = name_len > BOT_MAX_COMMAND_NAME_LEN ? NULL : BotCommandRegistry::findByName(command->name, copy_name_len);
   command->id = metadata ? metadata->id : BOT_COMMAND_UNKNOWN;
   if (!has_prefix && (!metadata || (metadata->visibility != BOT_COMMAND_VISIBILITY_DISCOVERABLE &&
-                                   metadata->id != BOT_COMMAND_ADVERT && metadata->id != BOT_COMMAND_CHECK && metadata->id != BOT_COMMAND_SYNC && metadata->id != BOT_COMMAND_ADD && metadata->id != BOT_COMMAND_REMOVE && metadata->id != BOT_COMMAND_ENABLE && metadata->id != BOT_COMMAND_DISABLE && metadata->id != BOT_COMMAND_NOTES && metadata->id != BOT_COMMAND_PASSWORD && metadata->id != BOT_COMMAND_SAVE && metadata->id != BOT_COMMAND_MOON))) return false;
+                                   metadata->id != BOT_COMMAND_ADVERT && metadata->id != BOT_COMMAND_CHECK && metadata->id != BOT_COMMAND_SYNC && metadata->id != BOT_COMMAND_ADD && metadata->id != BOT_COMMAND_REMOVE && metadata->id != BOT_COMMAND_ENABLE && metadata->id != BOT_COMMAND_DISABLE && metadata->id != BOT_COMMAND_NOTES && metadata->id != BOT_COMMAND_PASSWORD && metadata->id != BOT_COMMAND_SAVE && metadata->id != BOT_COMMAND_MOON && metadata->id != BOT_COMMAND_WIKI))) return false;
 
   while (pos < normalized_len && isCommandDelimiter(normalized[pos])) pos++;
   // Notes and passwords are copied verbatim from the original DM.

@@ -1,3 +1,4 @@
+#include "BotFairfieldHelp.h"
 #include "BotCommands.h"
 
 #include "BotCommandRegistry.h"
@@ -177,21 +178,19 @@ void formatQuarters(int8_t quarters, char* output, size_t output_len) {
 
 BotCommandResult executeCmd(const BotCommand& command, char* output, size_t output_len) {
   return writeText(output, output_len,
-                   "help  cmd  hello  about  version  time  status  stats  users  air  ping  test  path  snr  channels  lora  id  neighbors  list");
+                   "help cmd hello about version time status stats users air ping test path snr channels lora id neighbors list battery");
 }
 
 BotCommandResult executeHelp(const BotCommand& command, char* output, size_t output_len) {
   if (command.args_len == 0) {
     return writeText(output, output_len,
-                     "help  cmd  hello  about  version  time  status  stats  users  air  ping  test  path  snr  channels  lora  id  neighbors  list");
+                     "help cmd hello about version time status stats users air ping test path snr channels lora id neighbors list battery");
   }
 
-  if (command.args_len == 4 && !strcmp(command.args,"list"))
+  if(const char* help=BotFairfieldHelp::listDetails(command.args))return writeText(output,output_len,help);
+  if(!strcmp(command.args,"battery") || !strcmp(command.args,"battery low"))
     return writeText(output,output_len,
-      "list: list of all managed repeaters with last saved voltage\n"
-      "list low: list of repeaters with voltage below 3.6V or N/A");
-  if (command.args_len == 8 && !strcmp(command.args,"list low"))
-    return writeText(output,output_len,"list low: list of repeaters with voltage below 3.6V or N/A");
+      "battery: saved managed repeater voltages\nbattery low: below 3.6V or unavailable");
   if (command.args_len == 8 && !strcmp(command.args,"path all"))
     return writeText(output,output_len,"path all: response in multiple messages if needed.");
   const BotCommandMetadata* metadata = BotCommandRegistry::findByName(command.args, command.args_len);

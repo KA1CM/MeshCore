@@ -24,6 +24,8 @@ struct Settings {
 Preferences prefs;
 bool ready=false,active=false,manual=false,preparing=false,pending=false;
 const char* status="Disabled";
+Completion completion=Completion::None;
+const char* completionReason=nullptr;
 uint32_t retryAt=0,nextPoll=0,started=0,snapshotDay=0;
 char* payload=nullptr;
 size_t payloadLength=0;
@@ -157,6 +159,9 @@ bool begin() {
 }
 bool busy(){return active;}
 bool manualPending(){return manual;}
+Completion takeCompletion(const char*& reason) {
+  const Completion result=completion;reason=completionReason;completion=Completion::None;return result;
+}
 bool configure(bool enabled,const char* host,uint16_t port,const char* token) {
   if(!ready || active || pending || preparing || manual || !validHost(host) || !port || !token)return false;
   Settings candidate=settings;candidate.enabled=enabled;candidate.port=port;strcpy(candidate.host,host);
@@ -174,7 +179,7 @@ const char* requestManual(uint32_t day,uint32_t ms) {
   if(active || pending || preparing || manual)return "Pi update already running or queued.";
   if(settings.attemptDay==day && settings.attempts>=3)return "Daily limit reached (three update attempts).";
   if(retryAt && int32_t(ms-retryAt)<0)return "Wait for the five-minute update cooldown.";
-  manual=true;status="Manual Pi update queued";return nullptr;
+  completion=Completion::None;manual=true;status="Manual Pi update queued";return nullptr;
 }
 bool due(uint32_t day,uint32_t ms) {
   return configured() && day && !active && !pending &&
@@ -191,7 +196,7 @@ bool beginPreparation(uint32_t day) {
   if(ok){preparing=true;status="Checking all ct-ffc names";}
   return ok;
 }
-void preparationFailed(const char* reason,uint32_t ms){release();status=reason;retryAt=ms+300000UL;}
+void preparationFailed(const char* reason,uint32_t ms){release();status=reason;retryAt=ms+300000UL;completion=Completion::Failed;completionReason=reason;}
 void resolvingNames(){status="Resolving ct-ffc names for Pi";}
 bool start(char* body,size_t length,uint32_t day,uint32_t ms) {
   if(!preparing || active || pending || !body || !length || length>SnapshotLimit)return false;
@@ -210,6 +215,7 @@ void poll(uint32_t utc,uint32_t ms,bool networkIdle) {
     if((result.http==200 || result.http==202) && result.state!=Invalid) {
       strcpy(jobId,result.id);
       if(result.state==Published || result.state==Unchanged) {
+        completion=result.state==Published ? Completion::Published : Completion::Unchanged;completionReason=nullptr;
         Settings candidate=settings;candidate.completedDay=snapshotDay;candidate.completedAt=utc;
         const bool saved=save(candidate);
         settings.completedDay=candidate.completedDay;settings.completedAt=candidate.completedAt;

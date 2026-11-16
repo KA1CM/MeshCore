@@ -7,6 +7,7 @@
 // Calendar-day counters, independent of the rolling 24-hour window.
 class BotStatsHistory {
 public:
+  // NONE (slot 0) stores ignored commands; keep the existing on-disk layout.
   static constexpr size_t DAYS=30, COMMANDS=BOT_COMMAND_PASSWORD+1;
   struct Day {uint32_t day=0;uint32_t counts[COMMANDS]{};};
   struct Store {uint32_t version=1,startedDay=0,latestDay=0;Day days[DAYS];};
